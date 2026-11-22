@@ -1,0 +1,30 @@
+# rime-neural integration patch for rime-ice (Full Pinyin)
+# Copy to %APPDATA%\Rime\rime_ice.custom.yaml (or merge into your existing custom.yaml)
+patch:
+  # 1. Expose Rime's top-8 sentence beam candidates to the neural reranker
+  translator/max_sentences: 8
+  translator/sentence_cutoff_threshold: 0.3
+
+  # 2. Mount rime_neural filter FIRST (before simplifier / OpenCC)
+  engine/filters/@before 0: lua_filter@*rime_neural
+
+  # 3. Optional F4 toggle switch (defaults to ON)
+  switches/+:
+    - name: neural_rerank
+      states: [ 统计, 神经 ]
+      reset: 1
+
+  # 4. Neural reranker settings
+  rime_neural:
+    option_name: neural_rerank
+    pinyin_layout: auto          # auto -> full
+    max_candidates: 8
+    fusion_weights: [1.0, -1.4, 0.05, 0.15, 0.0]
+    p2c_verify_margin: 0.20
+    p2c_top1_logit_diff: 2.0
+    p2c_top1_min_gram_diff: -2.0
+    p2c_top2_logit_diff: 0.5
+    enable_uia_context: true
+    threads: 0                   # 0 = auto-detect (clamped 4..8)
+    log_feedback: true
+    sync_init: false

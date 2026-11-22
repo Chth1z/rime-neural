@@ -1,0 +1,25 @@
+# rime-neural integration patch for rime-wanxiang (万象拼音)
+# Copy to %APPDATA%\Rime\wanxiang.custom.yaml
+# NOTE: If you use Double Pinyin in rime-wanxiang (which keeps schema_id `wanxiang`),
+#       set `pinyin_layout` explicitly to zrm / flypy / mspy / sogou / abc / ziguang / jiajia.
+patch:
+  translator/max_sentences: 8
+  translator/sentence_cutoff_threshold: 0.3
+  engine/filters/@before 0: lua_filter@*rime_neural
+  switches/+:
+    - name: neural_rerank
+      states: [ 统计, 神经 ]
+      reset: 1
+  rime_neural:
+    option_name: neural_rerank
+    pinyin_layout: full          # change to flypy / zrm / mspy / etc. if using Double Pinyin
+    max_candidates: 8
+    fusion_weights: [1.0, -1.4, 0.05, 0.15, 0.0]
+    p2c_verify_margin: 0.20
+    p2c_top1_logit_diff: 2.0
+    p2c_top1_min_gram_diff: -2.0
+    p2c_top2_logit_diff: 0.5
+    enable_uia_context: true
+    threads: 0
+    log_feedback: true
+    sync_init: false
