@@ -20,7 +20,7 @@ Official Weasel (`librime >= 1.17.0`, Lua 5.4.8) exports the Lua 5.4 C API direc
 4. **Zero-Extra-RAM `.gram` Fusion (`src/gram.rs`)**: Memory-maps `Rime::Grammar/1.0` (e.g., `wanxiang-lts-zh-hans.gram`) read-only via Win32 `CreateFileMappingW`, sharing the OS page cache with `rime.dll` (`0 MB` extra physical RAM, `~0.01 ms`/sentence, zero per-char heap allocations). Reads `grammar/collocation_penalty` and `grammar/non_collocation_penalty` directly from the active schema.
 5. **5-Feature Cross-Domain Linear Fusion**:
    $$s_i = w_0 \cdot \log\operatorname{softmax}(\text{logit})_i + w_1 \cdot \ln(i + 1) + w_2 \cdot \Delta_{\text{gram}, i} + w_3 \cdot \Delta_{\text{char\_lp}, i} + w_4 \cdot \mathbb{1}_{\text{ctx}} \cdot \log\operatorname{softmax}(\text{logit})_i$$
-   Default OOD-audited prior: `[1.0, -1.4, 0.05, 0.15, 0.0]` (`w_ctx_lp = 0.0` explicitly disables the interaction term that showed slight domain overfitting on unseen prose/news).
+   Default weights: `[1.0, -1.4, 0.05, 0.15, 0.0]`.
 6. **KV-Cached Pass-2 Verified P2C Synthesis**: Decodes `char_logits` from Pass-1 (`0 ms` extra forward, zero `HashMap` allocations via sorted `syl_to_cids` binary search). Only when the synthesized string is novel (not in Rime's top-K) and beats Rime's best `char_logits` margin by `verify_margin` (~7% of sentences), runs a lightweight 3-candidate Pass-2 check reusing the warm prefix KV-cache and `.gram` floor (`top1_logit_diff > 2.0` and `gram_delta > -2.0` for #1; `top2_logit_diff > 0.5` for #2).
 
 ## 3. Universal Pinyin Recovery (`src/pinyin.rs`)
@@ -39,5 +39,5 @@ Official Weasel (`librime >= 1.17.0`, Lua 5.4.8) exports the Lua 5.4 C API direc
 ## 5. Unbiased Feedback & Personal MAP Tuning (`src/feedback.rs` + `scripts/tune-fusion.py`)
 
 - Captures pre-OpenCC genuine Simplified candidate text (so Taiwan Traditional `s2twp` wording changes still match cleanly), redacts digits (>= 4 chars), emails, URLs, and long ASCII tokens to `<REDACTED>`, truncates context to 64 chars, and caps local storage at 5 MiB with automatic rotation.
-- Logs 100% of multi-candidate commits (`sample_weight = 1.0`) to eliminate selection bias.
+- Logs every multi-candidate commit with `sample_weight = 1.0`.
 - `scripts/tune-fusion.py` runs exact damped Newton-Raphson MAP shrinkage around `W_PRIOR`, picks regularization `lambda` by 5-fold out-of-fold weighted log-loss (NLL), and gates updates on `N >= 100` plus a one-sided paired 95% CI test (`z >= 1.645`, Kish effective `N_eff`) and non-decreasing Top-1 accuracy.

@@ -228,10 +228,14 @@ try {
     }
 
     if ($wasRunning -and $serverExe) {
-        Start-Process -FilePath $serverExe
-        Start-Sleep -Milliseconds 500
-        $procs = Get-Process -Name WeaselServer -ErrorAction SilentlyContinue
-        Write-Output "Restarted WeaselServer (count=$($procs.Count) PID=$($procs.Id))."
+        try {
+            Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = "`"$serverExe`"" } | Out-Null
+        } catch {
+            Start-Process -FilePath $serverExe
+        }
+        Start-Sleep -Milliseconds 700
+        $procs = @(Get-Process -Name WeaselServer -ErrorAction SilentlyContinue)
+        Write-Output "Restarted WeaselServer (count=$($procs.Count) PID=$(($procs | ForEach-Object { $_.Id }) -join ','))."
     }
 }
 finally {

@@ -2,216 +2,241 @@
 
 # rime-neural
 
-**Zero-patch, in-process ONNX neural sentence reranker for official Windows Rime / Weasel**
+**Windows Rime / 小狼毫（Weasel）本地 ONNX 神经整句重排插件**
 
 [![CI & Release](https://github.com/Chth1z/rime-neural/actions/workflows/ci-release.yml/badge.svg)](https://github.com/Chth1z/rime-neural/actions/workflows/ci-release.yml)
 [![Release](https://img.shields.io/github/v/release/Chth1z/rime-neural?label=release)](https://github.com/Chth1z/rime-neural/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20(Weasel%20%E2%89%A5%200.17.4)-0078D6.svg)](https://github.com/rime/weasel)
 
-**English** | [简体中文](README.zh-CN.md)
+**简体中文** | [English](README.en.md)
 
 </div>
 
 ---
 
-## Overview
+## 简介
 
-Statistical N-gram models (such as 400 MB `.gram` language models) already give Rime strong sentence decoding, yet they remain fundamentally limited by local 2–5 character windows and cannot use long-range semantics, preceding sentence context, or neural cross-candidate comparison.
+`rime-neural` 是面向 Windows 官方小狼毫（Weasel `>= 0.17.4`，`librime >= 1.17.0`）的进程内 ONNX 神经整句重排插件，由 Lua 5.4 滤镜和 Rust 原生模块组成，直接挂载在现有 Rime 输入方案中运行。
 
-**`rime-neural`** bridges this gap as a drop-in Lua 5.4 + Rust native plugin for **official, unmodified Weasel** (`librime >= 1.17.0`):
+### 特性
 
-- **Zero Custom Weasel / `librime` Build**: Dynamically resolves Lua 5.4 C API symbols from Weasel's loaded `rime.dll` and pins itself in process so Rime redeploys never crash or reload ONNX Runtime (`0 ms` redeploy reuse, `0 ms` startup blocking via `init_async`).
-- **Offline & Lightweight**: Runs 100% locally on CPU via ONNX Runtime int8/w4 quantized models with a 16-slot prefix KV-cache — `~2.0 ms` average per keystroke on AC (~4.1 ms on battery), zero cloud dependency, zero GPU wakeup stutter.
-- **Universal Schema Support**: Auto-detects **Full Pinyin** and **all 7 major Rime Double Pinyin layouts** (Natural/ZRM, Flypy/小鹤, MSPY/微软, Sogou/搜狗, ABC/智能ABC, Ziguang/紫光, Jiajia/PYJJ/拼音加加). Exhaustively verified against all 3,008 derived 2-key codes in official `rime-ice` / `rime-frost` schemas (**0 mismatches**). Works seamlessly with `rime-ice`, `rime-frost`, `rime-wanxiang`, and custom schemas.
-- **Dynamic Model Introspection**: Reads model layer/head geometry and `choice_compact` format directly from the ONNX graph and `unified_vocab.json`, supporting both high-accuracy 12-layer **`ML-pumpkin-1103`** (default) and lightweight 8-layer **`zhen-feather-preview-1121`** with the same DLL.
-- **Zero-Extra-RAM `.gram` Fusion + Pass-2 Verified P2C**: Memory-maps your existing Rime `.gram` file read-only (`0 MB` extra physical RAM, `~0.01 ms`/sentence) using your schema's actual grammar penalties, and validates novel high-potential OOV `char_logits` candidates via KV-cached Pass-2 cross-encoder + `.gram` checks.
-- **Privacy-Hardened, Non-Blocking UIA Context**: Reads up to 64 characters strictly before the caret on a dedicated background STA thread (`< 2 µs` hot path, keystroke-1 pre-warm). Clamps `TextPattern` ranges to `RangeFromChild(focused)` and `U+FFFC` so Chromium/Electron apps never bleed toolbar chrome, isolates foreground `HWND` to block cross-app bleed, and hard-blocks password fields and password managers.
-- **Strict Dictionary Protection**: Only reranks `sentence` candidates (`cand:get_genuine().type == "sentence"`), never overriding exact dictionary hits, userdb phrases, English words, dates, numbers, or punctuation.
+- **与 `.gram` 语言模型协同**：支持单独运行，也支持搭配中文统计语法模型（推荐 [`wanxiang-lts-zh-hans.gram`](https://github.com/amzxyz/rime-wanxiang-data/releases/tag/LTS)）。Rime 借助 `.gram` 生成 Top-8 整句候选，插件通过 Win32 共享内存以只读方式映射同一份 `.gram` 文件（零额外物理内存），联合融合神经模型分数、`.gram` 搭配分与候选位置先验，并对高置信度未登录整句执行 KV 缓存 Pass-2 校验合成。
+- **仅作用于整句候选**：仅重排 `cand:get_genuine().type == "sentence"` 的整句候选，词典精确词条、用户词典、英文混输、日期、数字与标点保持原序。
+- **全拼与 7 套双拼**：自动识别全拼以及自然码（ZRM）、小鹤（Flypy）、微软（MSPY，含 `; = ing`）、搜狗（Sogou，含 `; = ing`）、智能 ABC、紫光（含 `; = ing`）、拼音加加（PYJJ），适配雾凇、白霜、万象及自定义方案。
+- **本地 CPU 推理与进程内复用**：基于 ONNX Runtime 量化模型与 16 槽前缀 KV-cache 在 CPU 离线运行；启动阶段异步加载模型，模块通过 `GetModuleHandleExA(PIN)` 钉驻小狼毫进程，重新部署时直接复用已加载实例。
+- **多模型自动识别**：启动时读取 ONNX 图结构与 `unified_vocab.json`，同一份 `rime_neural.dll` 支持 12 层 `ML-pumpkin-1103`（默认，约 82 MB）与 8 层 `zhen-feather-preview-1121`（约 38 MB）。
+- **跨应用前文读取与隐私保护**：独立后台 STA 线程通过 Windows UIA 读取光标前最多 64 字（按键热路径 `< 2 µs`），读取范围限制在当前焦点控件（`RangeFromChild`）与 `U+FFFC` 之内；切换前台窗口时隔离旧上文；遇到密码控件及常见密码管理器时返回空上文并停止记录日志。
 
-## Architecture
+### 运行要求与限制
+
+- **平台**：Windows 10 / 11 (x64)，官方小狼毫 `>= 0.17.4`（`librime >= 1.17.0`）。暂不支持 macOS（鼠须管）与 Linux。
+- **内存占用**：默认 12 层模型 `ML-pumpkin-1103` 连同 ONNX Runtime 约占用 150–250 MB 内存；对内存或续航敏感的设备可选用 8 层模型 `zhen-feather`（权重约 38 MB）。
+- **上下文窗口**：前文窗口上限 128 字，在 300 字以上的超长前文场景中，准确率低于运行在 GPU 上的 1–2 GB 通用大语言模型。
+
+---
+
+## 安装与配置
+
+### 方式一：由 AI Agent 自动安装
+
+将以下指令发送给支持终端操作的 AI Agent（如 Claude Code、Codex、Cursor、Antigravity、Gemini CLI 等），Agent 会读取仓库内的安装指引与辅助脚本，依次完成环境检测、配置备份、下载校验、`*.custom.yaml` 合并、部署及日志验证：
 
 ```text
-Official Weasel (WeaselServer.exe / rime.dll, librime >= 1.17.0, Lua 5.4)
-  ├── lua/rime_neural.lua                # Universal Lua filter: auto layout, sentence-only gate, UIA pre-warm
-  └── neural/rime_neural.dll (Rust)      # Dynamic Lua C API binding via GetModuleHandleA("rime.dll") + module pin
-        ├── engine.rs                    # ONNX Runtime dynamic introspection, selective output fetch,
-        │                                # 16-slot LRU KV-cache, 256-slot eval LRU, Pass-2 verified P2C
-        ├── gram.rs                      # Zero-extra-RAM Win32 CreateFileMappingW reader for Rime::Grammar/1.0
-        ├── pinyin.rs                    # Full Pinyin (O(N*L) memoized) + 7 Double Pinyin layouts (3,008/3,008)
-        ├── uia.rs                       # Non-blocking background STA UIA reader (RangeFromChild + password block)
-        └── feedback.rs                  # Local redacted unbiased commit log (5 MiB auto-rotation)
+请阅读 https://raw.githubusercontent.com/Chth1z/rime-neural/main/skills/rime-neural-setup/SKILL.md，按其中的步骤为本机的小狼毫安装并配置 rime-neural，完成后执行部署并验证结果。
 ```
 
-For full implementation details, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+### 方式二：手动安装
 
-## Requirements
+确认本机已安装官方 [小狼毫 Nightly `0.17.4+`](https://github.com/rime/weasel/releases)（`librime >= 1.17.0`）。
 
-- **OS**: Windows 10 / 11 (x64)
-- **IME**: Official [Weasel](https://github.com/rime/weasel/releases) with `librime >= 1.17.0` (e.g. Weasel Nightly `0.17.4+`)
-- **Optional (Recommended)**: A Rime `.gram` language model such as [`wanxiang-lts-zh-hans.gram`](https://github.com/amzxyz/rime-wanxiang-data/releases/tag/LTS) (works without `.gram` too — automatically falls back to pure neural reranking)
+#### 1. 安装插件、ONNX Runtime 与模型
 
-## Quick Start
-
-### Step 1: Install DLL, Lua Filter, ONNX Runtime & Model
-
-Run from PowerShell (no Rust toolchain required when using `-Prebuilt`):
+在 PowerShell 中执行（加 `-Prebuilt` 下载预编译包，无需 Rust 工具链）：
 
 ```powershell
-# Default: 12-layer ML-pumpkin-1103 (best Chinese accuracy)
+# 默认：12 层 ML-pumpkin-1103（约 82 MB）
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Prebuilt
 
-# Optional: 8-layer zhen-feather (lighter / faster on low-power CPUs)
+# 可选：8 层 zhen-feather（约 38 MB）
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Prebuilt -Model feather
 ```
 
-The installer automatically:
-1. Downloads the official prebuilt `rime-neural-*-win-x64.zip` from GitHub Releases and verifies `SHA256SUMS.txt`.
-2. Downloads and SHA-256 verifies the selected Apache-2.0 ONNX model from `dd1000001000/zhiyi_models`.
-3. Locates or fetches official `onnxruntime.dll` (win-x64) from Microsoft NuGet.
-4. Safely stops Weasel, installs files into `%APPDATA%\Rime\neural\` and `%APPDATA%\Rime\lua\rime_neural.lua`, and restarts Weasel.
+安装脚本会依次完成：
+1. 从 GitHub Releases 下载预编译 `rime-neural-*-win-x64.zip` 并核对 `SHA256SUMS.txt`；
+2. 从 `dd1000001000/zhiyi_models` 下载所选 Apache-2.0 ONNX 模型并校验 SHA-256；
+3. 复用本机或从 Microsoft NuGet 获取官方 `onnxruntime.dll`（win-x64）；
+4. 停止小狼毫，将文件安装至 `%APPDATA%\Rime\neural\` 与 `%APPDATA%\Rime\lua\rime_neural.lua`，随后重启小狼毫。
 
-If you prefer building from source (Rust 1.80+):
+从源码编译（需 Rust 1.80+）时，省略 `-Prebuilt` 直接执行 `scripts\install.ps1`。
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\install.ps1
-```
+> **推荐配套语言模型**：从 [amzxyz/rime-wanxiang-data (LTS)](https://github.com/amzxyz/rime-wanxiang-data/releases/tag/LTS) 下载 `wanxiang-lts-zh-hans.gram` 放入 Rime 用户目录，并在方案中启用 `grammar/language: wanxiang-lts-zh-hans`。
 
-### Step 2: Mount in Your Schema's `*.custom.yaml`
+#### 2. 在方案的 `*.custom.yaml` 中挂载滤镜
 
-Ready-to-copy templates are in [`examples/`](examples/) (`rime_ice`, `double_pinyin_flypy`, `double_pinyin_mspy`, `rime_frost_double_pinyin`, `wanxiang`). Minimal patch:
+仓库 [`examples/`](examples/) 提供了雾凇全拼、小鹤双拼、微软双拼、白霜自然码双拼与万象拼音的补丁模板。最小配置如下：
 
 ```yaml
 patch:
-  # 1. Expose Rime's top-8 sentence beam candidates to the neural reranker
+  # 放宽 Rime 整句 beam 输出数量，向神经重排提供 Top-8 候选
   translator/max_sentences: 8
   translator/sentence_cutoff_threshold: 0.3
 
-  # 2. Mount rime_neural FIRST (before simplifier / OpenCC filters)
+  # 挂载于 filters 首位（位于简繁转换 / OpenCC 之前）
   engine/filters/@before 0: lua_filter@*rime_neural
 
-  # 3. Optional F4 toggle switch (defaults to ON)
+  # 可选：在 F4 菜单中添加「统计 / 神经」切换开关
   switches/+:
     - name: neural_rerank
       states: [ 统计, 神经 ]
       reset: 1
 
-  # 4. Configuration (all fields optional; defaults shown)
+  # 以下均为默认值，可按需省略或覆写
   rime_neural:
     option_name: neural_rerank
     pinyin_layout: auto          # auto | full | zrm | flypy | mspy | sogou | abc | ziguang | jiajia
     max_candidates: 8
     fusion_weights: [1.0, -1.4, 0.05, 0.15, 0.0]
-    p2c_verify_margin: 0.20      # <= 0 disables Pass-2 P2C synthesis
-    p2c_top1_logit_diff: 2.0
-    p2c_top1_min_gram_diff: -2.0
-    p2c_top2_logit_diff: 0.5
+    p2c_verify_margin: 0.20      # <= 0 关闭 Pass-2 P2C 合成
     enable_uia_context: true
-    threads: 0                   # 0 = auto-detect (clamped 4..8)
-    log_feedback: true           # %APPDATA%\Rime\neural\feedback.jsonl (5 MiB cap)
-    sync_init: false             # async background init -> 0 ms startup delay
+    threads: 0                   # 0 = 自动适配 CPU 核数（限幅 4..8）
+    log_feedback: true           # 本地脱敏选词日志（上限 5 MiB）
+    sync_init: false             # 异步加载
 ```
 
-Save and click **Weasel Deploy (重新部署)**. If the DLL/model is missing or `neural_rerank` is toggled off, the filter degrades to a zero-overhead pass-through.
+保存后执行小狼毫 **「重新部署」**。
 
-> **Note for `rime-wanxiang` Double Pinyin users**: Because `rime-wanxiang` keeps `schema_id: wanxiang` when switching double pinyin layouts via `speller/algebra`, set `pinyin_layout` explicitly (e.g. `flypy` or `zrm`).
+> **万象拼音（`rime-wanxiang`）双拼用户**：万象切换双拼时 `schema_id` 通常保持为 `wanxiang`，`auto` 会识别为全拼，需将 `pinyin_layout` 显式设为对应的双拼布局（如 `flypy`、`zrm`、`mspy`）。
 
-## Configuration Reference
+---
 
-| Key (`rime_neural/...`) | Default | Description |
-| :--- | :--- | :--- |
-| `option_name` | `neural_rerank` | Rime boolean switch name that toggles neural reranking |
-| `pinyin_layout` | `auto` | `auto`, `full`, `zrm`, `flypy`, `mspy`, `sogou`, `abc`, `ziguang`, `jiajia` (`pyjj`) |
-| `max_candidates` | `8` | Max leading `sentence` candidates sent to the reranker |
-| `fusion_weights` | `[1.0, -1.4, 0.05, 0.15, 0.0]` | 5D linear prior `[logit_lp, ln(rank+1), gram_delta, char_lp, logit_lp*has_ctx]` |
-| `p2c_verify_margin` | `0.20` | Pass-1 `char_logits` margin to trigger KV-cached Pass-2 P2C check (`<= 0` disables P2C) |
-| `p2c_top1_logit_diff` | `2.0` | Min Pass-2 logit lead over Rime's best candidate to promote P2C to #1 |
-| `p2c_top1_min_gram_diff` | `-2.0` | Min `.gram` per-char score floor for #1 P2C promotion |
-| `p2c_top2_logit_diff` | `0.5` | Min Pass-2 logit lead to safely insert P2C at #2 |
-| `enable_uia_context` | `true` | Non-blocking Windows UIA before-caret context (per-schema setting) |
-| `threads` | `0` | ONNX Runtime intra-op CPU threads (`0` = auto-detect clamped to `4..8`) |
-| `min_input_len` | `4` (DP) / `6` (Full) | Min pinyin key count before invoking neural reranking |
-| `model_file` | `""` (auto) | Optional explicit ONNX filename under `%APPDATA%\Rime\neural\` |
-| `log_feedback` | `true` | Record unbiased, redacted multi-candidate commits locally for MAP tuning |
-| `sync_init` | `false` | `false` = async background load (`0 ms` startup); `true` = blocking load (for benchmarks) |
+## 评测数据
 
-## Benchmarks
+### 测试环境
 
-All evaluations below were measured end-to-end through official unmodified `rime.dll` (`Weasel 0.17.4`, `librime 1.17.0`, `enable_user_dict: false` strict isolation, [`gaboolic/rime-schema-compare`](https://github.com/gaboolic/rime-schema-compare) normalization protocol) on an Intel Core Ultra 7 255HX laptop.
+- **运行环境**：官方小狼毫 `0.17.4`（`librime 1.17.0`），测试期间关闭用户词库（`enable_user_dict: false`）与 UIA 读屏；硬件为 Intel Core Ultra 7 255HX。
+- **方案与词库基线**：端到端评测配置见 [`Chth1z/rime-chth1z`](https://github.com/Chth1z/rime-chth1z)（上游 `gaboolic/rime-frost` 词库 + `wanxiang-lts-zh-hans.gram`，注释 `41448` 与 `GB18030-2022` 生僻字表，`grammar/collocation_penalty: -15.5`）。下表同时列出同环境关闭 `rime-neural` 的统计基线及 `-14` 惩罚参数对照。
 
-### 1. Horizontal Comparison vs. Major Rime Schemas (Public `public_articles_2026-11-19.txt`, Full Pinyin)
+### 1. Rime 主流方案对比（`gaboolic/rime-schema-compare/report/latest.md`）
 
-Same public corpus file (SHA-256 `1a8edab3...`) and same `wanxiang-lts-zh-hans.gram` (SHA-256 `e9ddd501...`) as [`rime-schema-compare/report/latest.md`](https://github.com/gaboolic/rime-schema-compare/blob/main/report/latest.md):
+语料为 [`rime-schema-compare`](https://github.com/gaboolic/rime-schema-compare/blob/main/report/latest.md) 的 `public_articles_2026-11-19.txt`（阮一峰科技爱好者周刊正文）与同版 `wanxiang-lts-zh-hans.gram`。
 
-| Schema / Engine | Sentence Acc | Char Acc | Delta vs. Pure N-gram Leader |
-| :--- | :---: | :---: | :---: |
-| `mingyuepinyin` (no model) | `63.32%` | `92.15%` | `-19.59%` |
-| `luna_pinyin_with_octagram` (stock Luna + essay-bgw) | `66.83%` | `93.78%` | `-16.08%` |
-| `rime_ice` (no model) | `69.35%` | `93.93%` | `-13.56%` |
-| `wanxiang` (no model) | `69.35%` | `94.02%` | `-13.56%` |
-| `rime_frost` (no model) | `70.85%` | `94.27%` | `-12.06%` |
-| `rime_ice_with_gram` (+ Wanxiang 400 MB) | `74.37%` | `95.95%` | `-8.54%` |
-| `rime_wanxiang_with_gram` (+ Wanxiang 400 MB) | `78.89%` | `96.84%` | `-4.02%` |
-| `rime_wubi_sentens_wubi86_with_gram` (Wubi + Wanxiang) | `79.40%` | `96.99%` | `-3.51%` |
-| `rime_frost_with_gram` (pure N-gram leader) | `82.91%` | `97.38%` | baseline |
-| **`rime_frost` + `rime-neural v1.0.0` (strict zero-context)** | **`89.50%`** | **`98.42%`** | **`+6.59%`** |
-| **`rime_frost` + `rime-neural v1.0.0` (live `commit_history`)** | **`91.00%`** | **`98.72%`** | **`+8.09%`** |
+| 方案 / 组合 | 整句正确率 | 文字正确率 | 说明 |
+| :--- | :---: | :---: | :--- |
+| `mingyuepinyin`（明月，无模型） | `63.32%` | `92.15%` | 上游报告（199 句） |
+| `luna_pinyin_with_octagram`（朙月 + 八股文） | `66.83%` | `93.78%` | 上游报告 |
+| `rime_ice`（雾凇，无模型） | `69.35%` | `93.93%` | 上游报告 |
+| `wanxiang`（万象，无模型） | `69.35%` | `94.02%` | 上游报告 |
+| `rime_frost`（白霜，无模型） | `70.85%` | `94.27%` | 上游报告 |
+| `rime_ice_with_gram`（雾凇 + 万象 `.gram`） | `74.37%` | `95.95%` | 上游报告 |
+| `rime_wanxiang_with_gram`（万象 + 万象 `.gram`） | `78.89%` | `96.84%` | 上游报告 |
+| `rime_wubi_sentens_wubi86_with_gram`（五笔整句 + 万象） | `79.40%` | `96.99%` | 上游报告 |
+| `rime_frost_with_gram`（白霜 + 万象 `.gram`） | `82.91%` | `97.38%` | 上游报告（`collocation_penalty: -14`） |
+| 本机对照：白霜 + 万象 `.gram`（关 `rime-neural`，`-14`） | `83.00%` | `97.39%` | 200 句，复现上游统计基线 |
+| 本机 `rime-chth1z`：白霜 + 万象 `.gram`（关 `rime-neural`，`-15.5`） | `80.50%` | `96.95%` | 同配置关闭神经重排 |
+| **白霜 + 万象 `.gram` + `rime-neural v1.0.0`（全拼·严格零上文）** | **`89.50%`** | **`98.42%`** | `-14` 与 `-15.5` 均为 179/200（`+6.50%`） |
+| **白霜 + 万象 `.gram` + `rime-neural v1.0.0`（双拼·严格零上文）** | **`90.00%`** | **`98.52%`** | 自然码双拼 180/200 |
+| **白霜 + 万象 `.gram` + `rime-neural v1.0.0`（全拼 / 双拼·段落上文）** | **`91.00%`** | **`98.67%`** | 按段落保留 `commit_history`（182/200） |
 
-### 2. Multi-Model Horizontal Comparison (1,600 Sentences, Double Pinyin, Same Rime Top-8 Beam)
+### 2. 跨领域 246 句商业输入法参考（`rime-schema-compare/report/other_latest.md`）
 
-| Reranker Model | Size | All 1,600 (Sent / Char) | Tech 200 | Zhihu Holdout 1,000 |
-| :--- | :---: | :---: | :---: | :---: |
-| Pure Statistical (`rime_frost` + Wanxiang `.gram`) | — | `75.12%` / `95.51%` | `81.00%` | `75.80%` |
-| `msime-4M` (neural LM, offline optimal) | 4.5 MB | `76.12%` (`+1.00%`) | — | — |
-| `msime-25M` (neural LM, offline optimal) | 25.5 MB | `78.81%` (`+3.69%`) | — | — |
-| `Zhiyi 1.4V2-Long-L12` (no KV-cache, live `commit_history`) | 84 MB | `81.31%` / `96.83%` | `90.50%` | `80.00%` |
-| `zhen-feather-preview-1121` (8L compact KV-cache, live) | 38 MB | — | `88.50%` | — |
-| **`rime-neural v1.0.0` (`ML-pumpkin-1103`, live `commit_history`)** | **82 MB** | **`82.19%` / `97.05%`** | **`91.00%`** | **`81.40%`** |
-| **`rime-neural v1.0.0` (with punctuated UIA-like context)** | **82 MB** | **`85.19%`** | **`92.00%`** | **`84.60%`** |
+语料为 [`other_latest.md`](https://github.com/gaboolic/rime-schema-compare/blob/main/report/other_latest.md) 对应的 246 句（commit `99da339a`：`news 36`、`novel 136`、`prose 38`、`tech 31`、`test 5`），同义词归一化规则与原报告一致。
 
-### 3. Never-Before-Seen Cross-Domain OOD Blind Audit (840 Sentences, 5 Untouched Domains)
+| 输入法 / 方案 | 总整句 (246句) | 总字正确率 | `news` | `novel` | `prose` | `tech` | `test` |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| 微信输入法（原报告 Notepad 黑盒） | `51.63%` | `89.18%` | `61.11%` | `47.79%` | `50.00%` | `58.06%` | `60.0%` |
+| 搜狗拼音（原报告 Notepad 黑盒） | `54.47%` | `77.02%` | `77.78%` | `45.59%` | `50.00%` | `74.19%` | `40.0%` |
+| 微软拼音（原报告 Notepad 黑盒） | `67.89%` | `92.71%` | `83.33%` | `63.24%` | `63.16%` | `74.19%` | `80.0%` |
+| 手心输入法（原报告 Notepad 黑盒） | `71.14%` | `94.48%` | `86.11%` | `66.18%` | `65.79%` | `80.65%` | `80.0%` |
+| 原报告 `rime_frost_with_gram`（2026-04-25） | `71.54%` | `95.45%` | `88.89%` | `67.65%` | `55.26%` | `83.87%` | `100%` |
+| 本机 `rime-chth1z` 纯统计（白霜 + 万象，关 neural） | `76.02%` | `95.85%` | `97.22%` | `69.12%` | `71.05%` | `83.87%` | `100%` |
+| **白霜 + 万象 `.gram` + `rime-neural`（全拼·严格零上文）** | **`81.30%`** | **`97.29%`** | **`97.22%`** | `77.21%` | `68.42%` | **`93.55%`** | **`100%`** |
+| **白霜 + 万象 `.gram` + `rime-neural`（双拼·严格零上文）** | **`81.71%`** | `97.37%` | **`97.22%`** | **`77.94%`** | `68.42%` | **`93.55%`** | **`100%`** |
+| **白霜 + 万象 `.gram` + `rime-neural`（双拼·段落上文）** | **`81.71%`** | **`97.51%`** | **`97.22%`** | `76.47%` | **`76.32%`** | `90.32%` | **`100%`** |
 
-Zero parameter tuning on any of these 5 corpora (`news`, `novel`, `prose`, `old tech`, `2026-08-30 Zhihu`):
+> 商业输入法数据引自 `rime-schema-compare/report/other_latest.md`（Notepad 前台自动化黑盒采集，受系统环境、默认设置与联网状态影响）。
 
-| Configuration | OOD 840 All (Sent / Char) | News (152) | Novel (40) | Prose (211) | Tech Old (137) | Zhihu 08-30 (300) |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| Pure Statistical (`wanxiang` `.gram`) | `60.48%` / `90.94%` | `70.4%` | `65.0%` | `37.0%` | `66.4%` | `68.7%` |
-| **`rime-neural v1.0.0` (`[1.0, -1.4, 0.05, 0.15, 0.0]`)** | **`68.57%` / `93.52%`** (`+8.09%`) | **`78.3%`** | **`70.0%`** | **`46.4%`** | **`75.9%`** | **`75.7%`** |
+### 3. 开源神经重排器同池对比（`metasequoiaime/chinese-ime-lm` `sentences-ctx-v1`）
 
-### 4. Keystroke Latency (Ultra 7 255HX, Isolated `rime.dll` Benchmark)
+使用正式版 `rime_neural.dll v1.0.0` 直接在 [`metasequoiaime/chinese-ime-lm`](https://github.com/metasequoiaime/chinese-ime-lm/blob/main/docs/measurements.md) 的公开固定候选池 `eval/sentences-ctx-v1/pool.jsonl`（2026 年 9–10 月政府公文与 KdConv / CrossWOZ / RiSAWOZ 对话，共 1,631 条整句，候选由 MSIME 生成）上逐条打分：
 
-| Mode | AC (1st-key / rest avg / peak) | Battery (1st-key / rest avg / peak) |
+| 打分器 | 权重体积 | 有上文 (1,196) | 无上文 (435) | 总计 (1,631) | 运行环境 |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| MSIME 引擎原序 | — | `70.1%` (838) | `67.4%` (293) | `69.34%` | — |
+| `msime-4M` | 4.5 MB | `81.9%` (979) | `77.5%` (337) | `80.69%` | CPU 1T |
+| `msime-25M` | 25.5 MB | `87.0%` (1041) | `86.0%` (374) | `86.76%` | CPU 1T |
+| 青简 `含章·通变` | 46 MB | `92.1%` (1102) | `81.4%` (354) | `89.27%` | Apple GPU |
+| 青简 `含章·知微` | 56 MB | `91.2%` (1091) | `88.3%` (384) | `90.44%` | Apple GPU |
+| 知意 `1.4V2-Long-L12 int8` | 84 MB | `93.8%` (1122) | `87.8%` (382) | `92.21%` | CPU 4T |
+| 知意 `ML-pumpkin-1026 int8` | 92 MB | `94.6%` (1131) | `86.9%` (378) | `92.52%` | CPU 4T |
+| **`rime-neural`（纯 `ML-pumpkin-1103`，无先验）** | **82 MB** | **`95.15%`** (1138) | `87.13%` (379) | `93.01%` | CPU 4T（8 / 17 ms） |
+| **`rime-neural`（`ML-pumpkin-1103` + 万象 `.gram`，无引擎先验）** | **82 MB** | **`95.15%`** (1138) | **`88.28%`** (384) | **`93.32%`** | CPU 4T |
+| **`rime-neural v1.0.0` 默认全融合** | **82 MB** | `94.98%` (1136) | **`88.51%`** (385) | `93.26%` | CPU 4T |
+| *参考：`Qwen2.5-0.5B-Instruct-4bit`* | *278 MB* | *`96.2%` (1150)* | *`85.5%` (372)* | *`93.32%`* | *Apple GPU (mlx)* |
+| *参考：`Qwen3-0.6B-8bit`* | *633 MB* | *`96.5%` (1154)* | *`78.9%` (343)* | *`91.78%`* | *Apple GPU (mlx)* |
+| *参考：`Qwen3.5-0.8B-8bit`* | *1.0 GB* | *`97.3%` (1164)* | *`87.4%` (380)* | *`94.67%`* | *Apple GPU (mlx)* |
+| *参考：`Qwen3.5-2B-4bit`* | *1.7 GB* | *`97.7%` (1169)* | *`89.7%` (390)* | *`95.59%`* | *Apple GPU (mlx)* |
+
+### 4. 按键延迟
+
+Intel Core Ultra 7 255HX，隔离 `rime.dll` 基准实测：
+
+| 模式 | 插电（首键 / 后续键均值 / 长句峰值） | 电池（首键 / 后续键均值 / 长句峰值） |
 | :--- | :---: | :---: |
-| Pure Statistical (Double Pinyin) | `0.1 ms / 0.4 ms / 0.9 ms` | `0.4 ms / 1.6 ms / 5.2 ms` |
-| **`rime-neural v1.0.0` (Double Pinyin)** | **`0.1 ms / 2.0 ms / 11.5 ms`** | **`0.4 ms / ~4.1 ms / ~22 ms`** |
-| **`rime-neural v1.0.0` (Full Pinyin)** | **`0.2 ms / 4.7 ms / 14.7 ms`** | **`0.3 ms / ~9.2 ms / ~28 ms`** |
+| 纯统计（自然码双拼 + 万象 `.gram`） | `0.1 ms / 0.4 ms / 0.9 ms` | `0.4 ms / 1.6 ms / 5.2 ms` |
+| **`rime-neural v1.0.0`（双拼）** | **`0.1 ms / 2.0 ms / 11.5 ms`** | **`0.4 ms / ~4.1 ms / ~22 ms`** |
+| **`rime-neural v1.0.0`（全拼）** | **`0.2 ms / 4.7 ms / 14.7 ms`** | **`0.3 ms / ~9.2 ms / ~28 ms`** |
 
-## Privacy & Security Guarantees
+---
 
-- **100% Local Execution**: No network calls at runtime; models and DLLs are downloaded only during explicit installation with SHA-256 verification.
-- **Hard Password Blocking**: Controls reporting `IsPassword == true` or hosted by password managers / credential UIs (`KeePass`, `KeePassXC`, `1Password`, `Bitwarden`, `Enpass`, `LastPass`, `Dashlane`, `RoboForm`, `NordPass`, `ProtonPass`, `CredentialUIBroker`, `consent.exe`, `LockApp`, `mstsc.exe`) return empty context and suppress feedback logging.
-- **No Chrome Bleed & No Cross-App Bleed**: UIA `TextPattern` ranges are clamped strictly within `RangeFromChild(&focused)` and `U+FFFC` separators, and switching foreground `HWND` immediately invalidates the prior window's `commit_history`.
-- **Redacted, Bounded Feedback**: Local `feedback.jsonl` redacts 4+ digit numbers, emails, URLs, and 12+ char ASCII tokens to `<REDACTED>`, truncates context to 64 chars, and caps disk usage at 5 MiB. Set `log_feedback: false` to disable completely.
+## 架构与配置项
 
-## Optional: Personal Weight Calibration
-
-After accumulating daily commits in `%APPDATA%\Rime\neural\feedback.jsonl`, run:
-
-```powershell
-python scripts\tune-fusion.py
+```text
+官方小狼毫 (WeaselServer.exe / rime.dll, librime >= 1.17.0, Lua 5.4)
+  ├── lua/rime_neural.lua            # Lua 滤镜：方案布局识别、整句门控、UIA 预热、脱敏反馈记录
+  └── neural/rime_neural.dll (Rust)  # 动态解析 rime.dll Lua C API，进程内钉驻
+        ├── engine.rs                # ONNX 结构自省、选择性输出裁剪、16 槽 KV-cache、Pass-2 P2C
+        ├── gram.rs                  # Win32 共享内存只读映射 Rime::Grammar/1.0
+        ├── pinyin.rs                # 记忆化全拼对齐 + 7 套双拼码表
+        ├── uia.rs                   # 后台 STA UIA 读取（RangeFromChild 钳制 + 密码屏蔽）
+        └── feedback.rs              # 本地脱敏日志（5 MiB 自动轮转）
 ```
 
-The tuner solves exact damped Newton-Raphson MAP shrinkage around `[1.0, -1.4, 0.05, 0.15, 0.0]`, picks regularization via 5-fold out-of-fold weighted log-loss (NLL), and only recommends new weights when `N >= 100` AND improvement passes a one-sided paired 95% confidence test (`z >= 1.645`, Kish effective `N_eff`) with non-decreasing Top-1 accuracy (verified `0/25` false positives under null, `88%–100%` power under true preference shift).
+实现细节见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
-## FAQ / Troubleshooting
+| 配置键（`rime_neural/...`） | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `option_name` | `neural_rerank` | 控制重排开关的 Rime 布尔选项名 |
+| `pinyin_layout` | `auto` | `auto` / `full` / `zrm` / `flypy` / `mspy` / `sogou` / `abc` / `ziguang` / `jiajia`（`pyjj`） |
+| `max_candidates` | `8` | 参与重排的头部 `sentence` 候选数量上限 |
+| `fusion_weights` | `[1.0, -1.4, 0.05, 0.15, 0.0]` | 5 维线性融合权重 `[logit_lp, ln(rank+1), gram_delta, char_lp, logit_lp*has_ctx]` |
+| `p2c_verify_margin` | `0.20` | 触发 KV 缓存 Pass-2 P2C 校验的裕度阈值（`<= 0` 关闭） |
+| `p2c_top1_logit_diff` | `2.0` | Pass-2 候选升至首选所需的最小 logit 领先值 |
+| `p2c_top1_min_gram_diff` | `-2.0` | Pass-2 升至首选时的 `.gram` 逐字分差底线 |
+| `p2c_top2_logit_diff` | `0.5` | Pass-2 候选插入次选所需的最小 logit 领先值 |
+| `enable_uia_context` | `true` | 非阻塞后台 Windows UIA 前文读取（按方案独立生效） |
+| `threads` | `0` | ONNX Runtime CPU 线程数（`0` 自动适配并限幅 `4..8`） |
+| `min_input_len` | 双拼 `4` / 全拼 `6` | 触发神经重排的最小有效拼音按键数 |
+| `model_file` | `""`（自动探测） | 可选：显式指定 `%APPDATA%\Rime\neural\` 下的 `.onnx` 文件名 |
+| `log_feedback` | `true` | 本地脱敏日志开关（供可选的个人权重校准脚本使用） |
+| `sync_init` | `false` | `false` 后台异步加载；`true` 同步加载（离线评测脚本用） |
 
-- **Nothing happens after deploy**: Check `%TEMP%\rime.weasel\*WARNING*` logs and confirm `%APPDATA%\Rime\neural\` contains `rime_neural.dll`, `onnxruntime.dll`, `laya.one.fused.int8g.onnx` (or `laya.one.w4.onnx`), `tokenizer.json`, and `unified_vocab.json`, and `%APPDATA%\Rime\lua\rime_neural.lua` exists.
-- **Weasel version requirement**: Requires official Weasel with `librime >= 1.17.0` (Lua 5.4 C API exported from `rime.dll`). Older Weasel builds without exported Lua C symbols will safely fall back to statistical pass-through.
-- **How to disable UIA context or feedback**: Set `enable_uia_context: false` and/or `log_feedback: false` under `rime_neural:` in your `*.custom.yaml`, then redeploy.
+## 隐私与安全边界
 
-## License & Credits
+- **本地离线推理**：推理阶段无网络请求；下载行为仅发生在执行安装脚本时，且对二进制与模型均执行 SHA-256 校验。
+- **密码场景屏蔽**：控件报告 `IsPassword == true`，或前台窗口 / 焦点控件进程属于密码管理器与系统凭据界面（`KeePass`、`KeePassXC`、`1Password`、`Bitwarden`、`Enpass`、`LastPass`、`Dashlane`、`RoboForm`、`NordPass`、`ProtonPass`、`CredentialUIBroker`、`consent.exe`、`LockApp`、`mstsc.exe`）时，返回空上文并停止记录反馈。
+- **脱敏本地日志**：`%APPDATA%\Rime\neural\feedback.jsonl` 将 4 位以上数字、邮箱、URL 及 12 位以上 ASCII Token 脱敏为 `<REDACTED>`，上文截断至 64 字，文件总大小上限为 5 MiB；设置 `log_feedback: false` 可禁用。
+- **可选个人权重校准**：积累 100 条以上本地选词记录后，可运行 `python scripts\tune-fusion.py`；仅在 5 折交叉验证与单侧 95% 置信检验均通过且 Top-1 准确率不下降时输出新权重建议。
 
-- **`rime-neural`** is licensed under [Apache-2.0](LICENSE).
-- Supported ONNX models (`ML-pumpkin-1103`, `zhen-feather-preview-1121`) are published by [dd1000001000/zhiyi_models](https://github.com/dd1000001000/zhiyi_models) (Apache-2.0), downloaded on demand with SHA-256 verification.
-- `.gram` memory-mapped fusion supports [`Rime::Grammar/1.0`](https://github.com/lotem/librime-octagram) models such as [amzxyz/rime-wanxiang-data](https://github.com/amzxyz/rime-wanxiang-data).
-- Built for [rime/weasel](https://github.com/rime/weasel) and [rime/librime](https://github.com/rime/librime).
+## 常见问题
+
+- **部署后未生效**：检查 `%TEMP%\rime.weasel\*WARNING*` 日志；确认 `%APPDATA%\Rime\neural\` 下包含 `rime_neural.dll`、`onnxruntime.dll`、`.onnx` 模型、`tokenizer.json`、`unified_vocab.json`，且 `%APPDATA%\Rime\lua\rime_neural.lua` 存在；确认 `F4` 菜单中 `neural_rerank` 处于开启状态。
+- **小狼毫版本不兼容**：旧版小狼毫（如 `0.16.x`）的 `rime.dll` 未导出 Lua 5.4 C API 符号，滤镜会自动透传至统计模式，升级至小狼毫 `0.17.4+` 即可启用。
+- **卸载**：移除 `*.custom.yaml` 中的 `rime_neural` 相关配置，退出小狼毫后删除 `lua\rime_neural.lua` 与 `neural\` 目录，重新部署即可。
+
+## 协议与致谢
+
+- 源码基于 [Apache-2.0](LICENSE) 协议开源。
+- 默认支持的 ONNX 重排模型（`ML-pumpkin-1103`、`zhen-feather-preview-1121`）来自 [dd1000001000/zhiyi_models](https://github.com/dd1000001000/zhiyi_models)（Apache-2.0），按需下载并校验 SHA-256。
+- 推荐配套的中文语法模型来自 [amzxyz/rime-wanxiang-data](https://github.com/amzxyz/rime-wanxiang-data)（`wanxiang-lts-zh-hans.gram`）；端到端评测基线基于 [gaboolic/rime-frost](https://github.com/gaboolic/rime-frost) 与 [iDvel/rime-ice](https://github.com/iDvel/rime-ice)；评测口径与语料参考 [gaboolic/rime-schema-compare](https://github.com/gaboolic/rime-schema-compare) 及 [metasequoiaime/chinese-ime-lm](https://github.com/metasequoiaime/chinese-ime-lm)。
+- 面向 [rime/weasel](https://github.com/rime/weasel) 与 [rime/librime](https://github.com/rime/librime) 生态构建。
