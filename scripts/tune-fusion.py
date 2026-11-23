@@ -56,9 +56,17 @@ def log_softmax(xs: List[float]) -> np.ndarray:
 def load_samples(
     path: pathlib.Path,
     top1_sample_rate: float = 1.0,
-) -> Tuple[List[np.ndarray], List[int], np.ndarray]:
+) -> Tuple[List[np.ndarray], List[int], np.ndarray, dict]:
+    summary = {
+        "total_lines": 0,
+        "matched": 0,
+        "p2c_accepted": 0,
+        "disagreed": 0,
+        "neural_win": 0,
+        "rime_revert": 0,
+    }
     if not path.is_file():
-        return [], [], np.array([], dtype=np.float64)
+        return [], [], np.array([], dtype=np.float64), summary
     X_list: List[np.ndarray] = []
     y_list: List[int] = []
     w_list: List[float] = []
@@ -72,13 +80,25 @@ def load_samples(
             rec = json.loads(line)
         except json.JSONDecodeError:
             continue
+        summary["total_lines"] += 1
         cands = rec.get("cands") or []
         logits = rec.get("logits") or []
         grams = rec.get("gram_deltas") or [0.0] * len(cands)
         clps = rec.get("char_lps") or [0.0] * len(cands)
         chosen = rec.get("chosen_text") or ""
+        shown_top1 = rec.get("shown_top1") or ""
+        p2c_cand = rec.get("p2c_cand") or ""
+        if p2c_cand and chosen == p2c_cand and chosen not in cands:
+            summary["p2c_accepted"] += 1
         if len(cands) < 2 or len(logits) != len(cands) or chosen not in cands:
             continue
+        summary["matched"] += 1
+        if shown_top1 and shown_top1 != cands[0]:
+            summary["disagreed"] += 1
+            if chosen == shown_top1:
+                summary["neural_win"] += 1
+            elif chosen == cands[0]:
+                summary["rime_revert"] += 1
         y = cands.index(chosen)
         lp = log_softmax(logits)
         has_ctx = 1.0 if len((rec.get("context") or "").strip()) >= 2 else 0.0
@@ -98,7 +118,25 @@ def load_samples(
         y_list.append(y)
         w_list.append(sw)
 
-    return X_list, y_list, np.array(w_list, dtype=np.float64)
+    return X_list, y_list, np.array(w_list, dtype=np.float64), summary
+
+
+def eval_penalized_obj(
+    X_list: List[np.ndarray],
+    y_list: List[int],
+    weights: np.ndarray,
+    tot_w: float,
+    lam: float,
+    w_prior: np.ndarray,
+    w: np.ndarray,
+) -> float:
+    nll = 0.0
+    for X, y, wt in zip(X_list, y_list, weights):
+        s = X @ w
+        s -= float(np.max(s))
+        nll += (float(wt) / tot_w) * (math.log(float(np.sum(np.exp(s)))) - float(s[y]))
+    delta = w - w_prior
+    return nll + 0.5 * lam * float(delta @ delta)
 
 
 def fit_newton_offset_ridge(
@@ -107,9 +145,10 @@ def fit_newton_offset_ridge(
     weights: np.ndarray,
     lam: float,
     w_prior: np.ndarray = W_PRIOR,
-    max_iters: int = 15,
+    max_iters: int = 20,
 ) -> np.ndarray:
-    """Exact Newton-Raphson solver for weighted listwise NLL + 0.5 * lam * ||w - w_prior||^2."""
+    """Damped Newton-Raphson solver with Armijo backtracking line search for weighted
+    listwise NLL + 0.5 * lam * ||w - w_prior||^2."""
     d = len(w_prior)
     w = w_prior.copy()
     tot_w = float(np.sum(weights))
@@ -120,12 +159,15 @@ def fit_newton_offset_ridge(
     for _ in range(max_iters):
         grad = lam * (w - w_prior)
         hess = lam * eye
+        obj_cur = 0.5 * lam * float((w - w_prior) @ (w - w_prior))
         for X, y, wt in zip(X_list, y_list, weights):
             s = X @ w
             s -= float(np.max(s))
-            p = np.exp(s)
-            p /= float(np.sum(p))
+            exp_s = np.exp(s)
+            sum_exp = float(np.sum(exp_s))
+            p = exp_s / sum_exp
             c = float(wt) / tot_w
+            obj_cur += c * (math.log(sum_exp) - float(s[y]))
             diff = p.copy()
             diff[y] -= 1.0
             grad += c * (X.T @ diff)
@@ -133,8 +175,20 @@ def fit_newton_offset_ridge(
             Xc = X - mu
             hess += c * ((Xc * p[:, None]).T @ Xc)
         step = np.linalg.solve(hess + 1e-8 * eye, grad)
-        w -= step
-        if float(np.linalg.norm(step)) < 1e-7:
+        dir_deriv = -float(grad @ step)
+        if dir_deriv >= 0.0:
+            break
+        alpha = 1.0
+        for _ in range(10):
+            w_cand = w - alpha * step
+            obj_cand = eval_penalized_obj(X_list, y_list, weights, tot_w, lam, w_prior, w_cand)
+            if obj_cand <= obj_cur + 1e-4 * alpha * dir_deriv:
+                w = w_cand
+                break
+            alpha *= 0.5
+        else:
+            w = w - alpha * step
+        if alpha * float(np.linalg.norm(step)) < 1e-7:
             break
     return w
 
@@ -187,15 +241,20 @@ def main() -> None:
     args = ap.parse_args()
 
     log_path = pathlib.Path(args.log)
-    X_list, y_list, weights = load_samples(log_path, args.top1_sample_rate)
+    X_list, y_list, weights, summary = load_samples(log_path, args.top1_sample_rate)
     n = len(X_list)
     n_accepts = sum(1 for X, y in zip(X_list, y_list) if int(np.argmax(X @ W_PRIOR)) == y)
     n_corrections = n - n_accepts
     n_eff = kish_effective_n(weights)
 
     print(
-        f"Loaded {n} valid records from {log_path} "
+        f"Loaded {n}/{summary['total_lines']} matched records from {log_path} "
         f"(corrections={n_corrections}, accepts={n_accepts}, Kish N_eff={n_eff:.1f})"
+    )
+    print(
+        f"Rerank breakdown: disagreements={summary['disagreed']} "
+        f"(neural_win={summary['neural_win']}, rime_revert={summary['rime_revert']}), "
+        f"p2c_accepted={summary['p2c_accepted']}"
     )
     if n < args.min_samples or n_corrections < args.min_corrections or n_accepts < args.min_accepts:
         print(

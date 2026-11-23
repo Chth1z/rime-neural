@@ -250,7 +250,7 @@ unsafe extern "C" fn lua_set_uia_enabled(l: LuaState) -> c_int {
     1
 }
 
-/// query_uia_context(live_preedit, raw_input) -> (status_str, text_str, hwnd_int)
+/// query_uia_context(live_preedit, raw_input, [cand_preview]) -> (status_str, text_str, hwnd_int)
 unsafe extern "C" fn lua_query_uia_context(l: LuaState) -> c_int {
     let Ok(api) = get_api() else {
         return 0;
@@ -258,7 +258,8 @@ unsafe extern "C" fn lua_query_uia_context(l: LuaState) -> c_int {
     let res = catch_unwind(AssertUnwindSafe(|| {
         let preedit = read_str(api, l, 1).unwrap_or_default();
         let raw_input = read_str(api, l, 2).unwrap_or_default();
-        let ctx = uia::query_context(&preedit, &raw_input);
+        let cand_preview = read_str(api, l, 3).unwrap_or_default();
+        let ctx = uia::query_context(&preedit, &raw_input, &cand_preview);
         let hwnd = uia::foreground_hwnd();
         (ctx, hwnd)
     }));
@@ -293,6 +294,12 @@ unsafe extern "C" fn lua_query_uia_context(l: LuaState) -> c_int {
 /// kick_uia_refresh() -> nil (non-blocking background refresh hint)
 unsafe extern "C" fn lua_kick_uia_refresh(_l: LuaState) -> c_int {
     let _ = catch_unwind(AssertUnwindSafe(uia::kick_refresh));
+    0
+}
+
+/// kick_uia_after_commit() -> nil (post-commit background refresh after brief settle delay)
+unsafe extern "C" fn lua_kick_uia_after_commit(_l: LuaState) -> c_int {
+    let _ = catch_unwind(AssertUnwindSafe(uia::kick_after_commit));
     0
 }
 
@@ -409,7 +416,7 @@ unsafe extern "C" fn lua_stats(l: LuaState) -> c_int {
         return 0;
     };
     let st = engine::get_stats();
-    (api.createtable)(l, 0, 12);
+    (api.createtable)(l, 0, 13);
     (api.pushboolean)(l, if st.ready { 1 } else { 0 });
     (api.setfield)(l, -2, c"ready".as_ptr());
     (api.pushinteger)(l, st.calls as LuaInteger);
@@ -434,6 +441,12 @@ unsafe extern "C" fn lua_stats(l: LuaState) -> c_int {
     (api.setfield)(l, -2, c"choice_compact".as_ptr());
     push_str(api, l, &st.model_name);
     (api.setfield)(l, -2, c"model_name".as_ptr());
+    if let Some(ref err) = st.last_error {
+        push_str(api, l, err);
+    } else {
+        (api.pushnil)(l);
+    }
+    (api.setfield)(l, -2, c"last_error".as_ptr());
     1
 }
 
@@ -447,7 +460,7 @@ pub unsafe extern "C" fn luaopen_rime_neural(l: LuaState) -> c_int {
     let Ok(api) = get_api() else {
         return 0;
     };
-    (api.createtable)(l, 0, 10);
+    (api.createtable)(l, 0, 11);
 
     macro_rules! export_fn {
         ($name:literal, $func:ident) => {
@@ -463,6 +476,7 @@ pub unsafe extern "C" fn luaopen_rime_neural(l: LuaState) -> c_int {
     export_fn!("set_uia_enabled", lua_set_uia_enabled);
     export_fn!("query_uia_context", lua_query_uia_context);
     export_fn!("kick_uia_refresh", lua_kick_uia_refresh);
+    export_fn!("kick_uia_after_commit", lua_kick_uia_after_commit);
     export_fn!("rerank", lua_rerank);
     export_fn!("log_feedback", lua_log_feedback);
     export_fn!("stats", lua_stats);

@@ -1,4 +1,4 @@
--- rime-neural (v1.0.0): Universal ONNX neural sentence reranker filter for Rime / Weasel.
+-- rime-neural (v1.1.0): Universal ONNX neural sentence reranker filter for Rime / Weasel.
 -- Loads `neural/rime_neural.dll` in-process via official Weasel's exported Lua 5.4 C API.
 -- Features:
 --   * Zero custom rime.dll required; works on official unmodified Weasel (librime >= 1.17.0).
@@ -8,10 +8,10 @@
 --   * Dynamic KV-cache ONNX architecture introspection (supports 12L ML-pumpkin-1103, 8L zhen-feather, etc.)
 --     + selective ORT output fetching + direct mmap `.gram` score fusion + KV-cached Pass-2 verified P2C.
 --   * Non-blocking background Windows UIA preceding-text context (clamped to focused control,
---     keystroke-1 pre-warm, window-isolated against cross-app bleed, hard password blocking).
+--     keystroke-1 pre-warm, settled post-commit refresh, window isolation, hard password blocking).
 --   * Strict dictionary protection: only reranks `sentence` candidates, never overrides exact
 --     dictionary/userdb hits (`phrase`, `user_phrase`, `table`, `completion`, etc.).
---   * Traditional-to-Simplified context normalization (`t2s.json`) + pre-OpenCC genuine commit capture.
+--   * Traditional-to-Simplified context normalization (`tw2sp.json` / `t2s.json`) + pre-OpenCC commit capture.
 --   * Optional privacy-first unbiased local feedback logger (`neural/feedback.jsonl`) for MAP tuning.
 --   * Graceful zero-cost pass-through if DLL/model is absent or `neural_rerank` option is off.
 
@@ -20,6 +20,7 @@ local M = {}
 local native_mod = nil
 local native_loaded = false
 local native_attempted = false
+local logged_init_error = false
 
 local function join_path(a, b)
     if a:sub(-1) == "\\" or a:sub(-1) == "/" then
@@ -174,11 +175,54 @@ local function append_commit_history(parts, context)
     end
 end
 
+local function utf8_tail_bytes(text, max_bytes)
+    if #text <= max_bytes then
+        return text
+    end
+    local cut = #text - max_bytes + 1
+    while cut <= #text and (string.byte(text, cut) >= 0x80 and string.byte(text, cut) < 0xC0) do
+        cut = cut + 1
+    end
+    return string.sub(text, cut)
+end
+
+local function is_traditional_mode(ctx)
+    return (ctx:get_option("traditionalization") == true) or (ctx:get_option("zh_trad") == true)
+end
+
+--- Normalize preceding text or fallback commit text to Mainland Simplified for the neural model.
+--- Applies Taiwan phrase + variant reversal (`tw2sp.json`) only when Traditional mode is active
+--- or Traditional characters are present, preserving Mainland Simplified phrasing (`程序`, `文件`).
+local function normalize_to_simplified(text, prefer_tw2sp, env)
+    if not text or #text == 0 then
+        return ""
+    end
+    if env.t2s_override then
+        local ok, conv = pcall(env.t2s_override.convert, env.t2s_override, text)
+        return (ok and conv) or text
+    end
+    local t2s_out = text
+    if env.t2s then
+        local ok, conv = pcall(env.t2s.convert, env.t2s, text)
+        if ok and conv then
+            t2s_out = conv
+        end
+    end
+    if env.tw2sp and (prefer_tw2sp or t2s_out ~= text) then
+        local ok, conv = pcall(env.tw2sp.convert, env.tw2sp, text)
+        if ok and conv then
+            return conv
+        end
+    end
+    return t2s_out
+end
+
 --- Resolve preceding context with strict cross-app isolation & password protection.
---- Returns `(normalized_ctx_str, is_password_blocked)`.
-local function get_preceding_context(context, segment_start, first_preedit, raw_seg, env)
-    local parts = {}
+--- Returns `(normalized_ctx_str, is_password_blocked, comp_prefix)`.
+local function get_preceding_context(context, segment_start, first_preedit, raw_seg, first_cand_text, env)
     local comp_prefix = collect_composition_prefix(context, segment_start)
+    local is_trad = is_traditional_mode(context)
+    local base_ctx = ""
 
     if env.enable_uia and native_mod and type(native_mod.query_uia_context) == "function" then
         local full_preedit = first_preedit or ""
@@ -186,54 +230,39 @@ local function get_preceding_context(context, segment_start, first_preedit, raw_
         if ok_p and pre and pre.text and #pre.text > #full_preedit then
             full_preedit = pre.text
         end
-        local status, uia_text = native_mod.query_uia_context(full_preedit, raw_seg or "")
+        local status, uia_text = native_mod.query_uia_context(full_preedit, raw_seg or "", first_cand_text or "")
         if status == "blocked" then
-            return "", true
+            return "", true, comp_prefix
         elseif status == "text" then
             if uia_text and #uia_text > 0 then
-                parts[#parts + 1] = uia_text
-                -- Avoid doubling confirmed multi-segment prefix if inline preedit already echoed it
-                if #comp_prefix > 0 and uia_text:sub(-#comp_prefix) ~= comp_prefix then
-                    parts[#parts + 1] = comp_prefix
-                end
-            elseif #comp_prefix > 0 then
-                parts[#parts + 1] = comp_prefix
+                base_ctx = normalize_to_simplified(utf8_tail_bytes(uia_text, 384), is_trad, env)
             end
         elseif status == "window_changed" then
-            if #comp_prefix > 0 then
-                parts[#parts + 1] = comp_prefix
-            end
+            base_ctx = ""
         else
-            append_commit_history(parts, context)
-            if #comp_prefix > 0 then
-                parts[#parts + 1] = comp_prefix
+            local hist_parts = {}
+            append_commit_history(hist_parts, context)
+            if #hist_parts > 0 then
+                base_ctx = normalize_to_simplified(utf8_tail_bytes(table.concat(hist_parts), 384), is_trad, env)
             end
         end
     else
-        append_commit_history(parts, context)
-        if #comp_prefix > 0 then
-            parts[#parts + 1] = comp_prefix
+        local hist_parts = {}
+        append_commit_history(hist_parts, context)
+        if #hist_parts > 0 then
+            base_ctx = normalize_to_simplified(utf8_tail_bytes(table.concat(hist_parts), 384), is_trad, env)
         end
     end
 
-    if #parts == 0 then
-        return "", false
+    if #base_ctx == 0 then
+        return utf8_tail_bytes(comp_prefix, 384), false, comp_prefix
     end
-    local text = table.concat(parts)
-    if #text > 384 then
-        local cut = #text - 384 + 1
-        while cut <= #text and (string.byte(text, cut) >= 0x80 and string.byte(text, cut) < 0xC0) do
-            cut = cut + 1
-        end
-        text = string.sub(text, cut)
+    -- Deduplicate confirmed multi-segment prefix after Simplified normalization so Traditional UIA
+    -- text (`我們`) and Simplified `comp_prefix` (`我们`) never double up.
+    if #comp_prefix > 0 and base_ctx:sub(-#comp_prefix) ~= comp_prefix then
+        return utf8_tail_bytes(base_ctx .. comp_prefix, 384), false, comp_prefix
     end
-    if env.t2s then
-        local ok, conv = pcall(env.t2s.convert, env.t2s, text)
-        if ok and conv then
-            text = conv
-        end
-    end
-    return text, false
+    return utf8_tail_bytes(base_ctx, 384), false, comp_prefix
 end
 
 --- Extract the pre-OpenCC genuine Simplified committed text when available so `s2twp` phrasing
@@ -263,11 +292,8 @@ local function extract_genuine_commit(ctx, env)
     end
 
     local committed = ctx:get_commit_text() or ""
-    if env.t2s and #committed > 0 then
-        local ok_c, conv = pcall(env.t2s.convert, env.t2s, committed)
-        if ok_c and conv then
-            return conv
-        end
+    if #committed > 0 then
+        return normalize_to_simplified(committed, is_traditional_mode(ctx), env)
     end
     return committed
 end
@@ -381,13 +407,28 @@ function M.init(env)
         native_mod.set_uia_enabled(true)
     end
 
-    local ok_occ, occ = pcall(Opencc, "t2s.json")
-    env.t2s = (ok_occ and occ) or nil
+    local t2s_override = cfg:get_string(ns .. "/t2s_config") or ""
+    if #t2s_override > 0 then
+        local ok_ov, occ_ov = pcall(Opencc, t2s_override)
+        env.t2s_override = (ok_ov and occ_ov) or nil
+        env.t2s = nil
+        env.tw2sp = nil
+    else
+        env.t2s_override = nil
+        local ok_occ, occ = pcall(Opencc, "t2s.json")
+        env.t2s = (ok_occ and occ) or nil
+        local ok_tw, occ_tw = pcall(Opencc, "tw2sp.json")
+        env.tw2sp = (ok_tw and occ_tw) or nil
+    end
 
     if (env.log_feedback or env.enable_uia) and env.engine.context and env.engine.context.commit_notifier then
         env.commit_conn = env.engine.context.commit_notifier:connect(function(ctx)
-            if env.enable_uia and native_mod and type(native_mod.kick_uia_refresh) == "function" then
-                native_mod.kick_uia_refresh()
+            if env.enable_uia and native_mod then
+                if type(native_mod.kick_uia_after_commit) == "function" then
+                    native_mod.kick_uia_after_commit()
+                elseif type(native_mod.kick_uia_refresh) == "function" then
+                    native_mod.kick_uia_refresh()
+                end
             end
 
             if not env.log_feedback then
@@ -403,6 +444,11 @@ function M.init(env)
             end
 
             local norm_commit = extract_genuine_commit(ctx, env)
+            if snap.comp_prefix and #snap.comp_prefix > 0
+                and norm_commit:sub(1, #snap.comp_prefix) == snap.comp_prefix
+            then
+                norm_commit = norm_commit:sub(#snap.comp_prefix + 1)
+            end
             if #norm_commit < 6 then
                 return
             end
@@ -445,6 +491,17 @@ end
 function M.func(input, env)
     local ctx = env.engine.context
     if not env.ready or not native_mod or not ctx:get_option(env.option_name) or not native_mod.is_ready() then
+        if native_mod and not logged_init_error and type(native_mod.is_ready) == "function"
+            and not native_mod.is_ready() and type(native_mod.stats) == "function"
+        then
+            local st = native_mod.stats()
+            if type(st) == "table" and type(st.last_error) == "string" and #st.last_error > 0 then
+                logged_init_error = true
+                if log and log.warning then
+                    log.warning("rime_neural: async init failed: " .. st.last_error)
+                end
+            end
+        end
         for cand in input:iter() do
             yield(cand)
         end
@@ -482,7 +539,14 @@ function M.func(input, env)
             return
         end
         if #sent_cands >= 2 then
-            local pre_ctx, is_blocked = get_preceding_context(ctx, seg_start, first_preedit, raw_seg, env)
+            local pre_ctx, is_blocked, comp_prefix = get_preceding_context(
+                ctx,
+                seg_start,
+                first_preedit,
+                raw_seg,
+                sent_texts[1] or "",
+                env
+            )
             local res = native_mod.rerank(
                 pre_ctx,
                 raw_seg,
@@ -522,6 +586,7 @@ function M.func(input, env)
                     env.last_rerank = {
                         full_input = cur_input,
                         raw_seg = raw_seg,
+                        comp_prefix = comp_prefix,
                         pre_ctx = pre_ctx,
                         cands = sent_texts,
                         logits = res.logits or {},
@@ -574,7 +639,7 @@ function M.func(input, env)
                         key_cnt = key_cnt + 1
                     end
                 end
-                if (env.is_double_pinyin and has_non_pinyin)
+                if has_non_pinyin
                     or key_cnt < env.min_input_len
                     or (env.is_double_pinyin and (key_cnt % 2) == 1)
                 then
@@ -617,6 +682,8 @@ function M.fini(env)
     end
     env.last_rerank = nil
     env.t2s = nil
+    env.tw2sp = nil
+    env.t2s_override = nil
 end
 
 return M

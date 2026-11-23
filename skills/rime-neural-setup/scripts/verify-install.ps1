@@ -99,18 +99,34 @@ if ($SchemaId) {
     }
 }
 
-# 4. Scan latest Weasel warning/error logs from the last 10 minutes
+# 4. Scan latest Weasel warning/error logs (and W/E lines in recent INFO logs) from the last 10 minutes
 $logDir = Join-Path $env:TEMP "rime.weasel"
-$recentHits = @()
+$recentHits = [System.Collections.Generic.List[string]]::new()
+$seenLines  = [System.Collections.Generic.HashSet[string]]::new()
 if (Test-Path $logDir) {
     $cutoff = (Get-Date).AddMinutes(-10)
-    $logs = Get-ChildItem $logDir -File -ErrorAction SilentlyContinue |
+    $warnLogs = Get-ChildItem $logDir -File -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTime -ge $cutoff -and ($_.Name -match 'WARNING|ERROR') } |
         Sort-Object LastWriteTime -Descending | Select-Object -First 4
-    foreach ($lf in $logs) {
+    foreach ($lf in $warnLogs) {
         $hits = Select-String -Path $lf.FullName -Pattern 'rime_neural|lua_filter.*error|loadlib failed' -ErrorAction SilentlyContinue
         foreach ($h in $hits) {
-            $recentHits += "$($lf.Name):$($h.LineNumber): $($h.Line.Trim())"
+            $line = $h.Line.Trim()
+            if ($seenLines.Add($line)) {
+                $recentHits.Add("$($lf.Name):$($h.LineNumber): $line")
+            }
+        }
+    }
+    $infoLogs = Get-ChildItem $logDir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -ge $cutoff -and ($_.Name -match '\.INFO\.') } |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 2
+    foreach ($lf in $infoLogs) {
+        $hits = Select-String -Path $lf.FullName -Pattern '^[WE]\d{4}\b.*(rime_neural|lua_filter.*error|loadlib failed)' -ErrorAction SilentlyContinue
+        foreach ($h in $hits) {
+            $line = $h.Line.Trim()
+            if ($seenLines.Add($line)) {
+                $recentHits.Add("$($lf.Name):$($h.LineNumber): $line")
+            }
         }
     }
 }

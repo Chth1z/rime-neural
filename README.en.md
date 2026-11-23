@@ -218,6 +218,7 @@ Implementation details are documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECT
 | `threads` | `0` | ONNX Runtime CPU threads (`0` = auto `4..8`) |
 | `min_input_len` | `4` (DP) / `6` (Full) | Min pinyin key count before reranking |
 | `model_file` | `""` (auto) | Optional explicit `.onnx` filename under `%APPDATA%\Rime\neural\` |
+| `t2s_config` | `""` (auto `tw2sp` / `t2s`) | Optional explicit OpenCC config for Traditional-to-Simplified context normalization |
 | `log_feedback` | `true` | Local redacted commit log for optional personal tuning |
 | `sync_init` | `false` | `false` = async background load; `true` = blocking load (for benchmarks) |
 

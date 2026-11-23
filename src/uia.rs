@@ -30,8 +30,10 @@ pub enum UiaContext {
 }
 
 const MAX_UIA_CHARS: usize = 64;
+const MAX_VALUE_PATTERN_TAIL_CHARS: usize = 256;
 const SNAPSHOT_TTL: Duration = Duration::from_secs(4);
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(35);
+const POST_COMMIT_SETTLE_DELAY: Duration = Duration::from_millis(25);
 
 const DENIED_PROCESSES: &[&str] = &[
     "keepass.exe",
@@ -50,9 +52,36 @@ const DENIED_PROCESSES: &[&str] = &[
     "mstsc.exe",
 ];
 
-/// Strip embedded-object chrome (`\u{FFFC}`), live inline composition text, and control
-/// characters into a clean 64-char preceding-text tail.
-pub fn normalize_before_caret(raw: &str, live_preedit: &str, raw_input: &str) -> String {
+fn is_invisible_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}' // ZERO WIDTH SPACE (Electron / Chromium ProseMirror / Slate caret anchor)
+            | '\u{200C}' // ZERO WIDTH NON-JOINER
+            | '\u{200D}' // ZERO WIDTH JOINER
+            | '\u{2060}' // WORD JOINER
+            | '\u{FEFF}' // ZERO WIDTH NO-BREAK SPACE / BOM
+    )
+}
+
+fn tail_utf8_chars(s: &str, max_chars: usize) -> &str {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s;
+    }
+    match s.char_indices().nth(count - max_chars) {
+        Some((idx, _)) => &s[idx..],
+        None => s,
+    }
+}
+
+/// Strip embedded-object chrome (`\u{FFFC}`), zero-width format characters, live inline
+/// composition/preview text, and control characters into a clean 64-char preceding-text tail.
+pub fn normalize_before_caret(
+    raw: &str,
+    live_preedit: &str,
+    raw_input: &str,
+    cand_preview: &str,
+) -> String {
     // Chromium / Electron / Word insert U+FFFC (Object Replacement Character) at DOM widget /
     // toolbar / attachment boundaries. Never bleed across embedded UI elements.
     let base = match raw.rfind('\u{FFFC}') {
@@ -60,25 +89,55 @@ pub fn normalize_before_caret(raw: &str, live_preedit: &str, raw_input: &str) ->
         None => raw,
     };
 
-    let mut s = base.replace("\r\n", "\n").replace('\r', "\n");
+    // Strip invisible zero-width format anchors before suffix matching so Chromium/Electron
+    // editors wrapping composition ranges with U+200B do not defeat preedit stripping.
+    let mut s = String::with_capacity(base.len());
+    let mut prev_cr = false;
+    for c in base.chars() {
+        if is_invisible_format_char(c) {
+            continue;
+        }
+        if c == '\r' {
+            s.push('\n');
+            prev_cr = true;
+        } else if c == '\n' {
+            if !prev_cr {
+                s.push('\n');
+            }
+            prev_cr = false;
+        } else {
+            s.push(c);
+            prev_cr = false;
+        }
+    }
 
-    // Strip uncommitted inline composition echoed into the text control (longest match first, once)
+    // Strip uncommitted inline composition echoed into the text control (longest match first, once).
+    // Check pinyin preedit/raw input before inline `preedit_type: preview` candidate text.
     let trimmed_tail = s.trim_end_matches(' ');
     if trimmed_tail.len() != s.len() {
         s.truncate(trimmed_tail.len());
     }
     let lp = live_preedit.trim();
     let ri = raw_input.trim();
-    let suffixes = if lp.len() >= ri.len() {
+    let preedit_suffixes = if lp.len() >= ri.len() {
         [lp, ri]
     } else {
         [ri, lp]
     };
-    for suffix in suffixes {
+    let mut stripped = false;
+    for suffix in preedit_suffixes {
         if !suffix.is_empty() && s.ends_with(suffix) {
             let new_len = s.len().saturating_sub(suffix.len());
             s.truncate(new_len);
+            stripped = true;
             break;
+        }
+    }
+    if !stripped {
+        let cp = cand_preview.trim();
+        if cp.chars().count() >= 2 && s.ends_with(cp) {
+            let new_len = s.len().saturating_sub(cp.len());
+            s.truncate(new_len);
         }
     }
 
@@ -98,15 +157,7 @@ pub fn normalize_before_caret(raw: &str, live_preedit: &str, raw_input: &str) ->
         .collect();
     let trimmed = cleaned.trim_end();
 
-    let count = trimmed.chars().count();
-    if count <= MAX_UIA_CHARS {
-        return trimmed.to_string();
-    }
-    let skip = count - MAX_UIA_CHARS;
-    match trimmed.char_indices().nth(skip) {
-        Some((idx, _)) => trimmed[idx..].to_string(),
-        None => trimmed.to_string(),
-    }
+    tail_utf8_chars(trimmed, MAX_UIA_CHARS).to_string()
 }
 
 #[cfg(windows)]
@@ -152,6 +203,7 @@ mod win_impl {
     static LAST_DENIED_HWND: AtomicIsize = AtomicIsize::new(0);
     static LAST_DENIED_STATE: AtomicBool = AtomicBool::new(false);
     static ENABLED: AtomicBool = AtomicBool::new(false);
+    static POST_COMMIT_PENDING: AtomicBool = AtomicBool::new(false);
 
     fn is_denied_pid(pid: u32) -> bool {
         if pid == 0 {
@@ -351,11 +403,13 @@ mod win_impl {
                         .unwrap_or(true);
                     if !is_ro {
                         if let Ok(bstr) = unsafe { val_pat.CurrentValue() } {
+                            let full = bstr.to_string();
+                            let tail = tail_utf8_chars(&full, MAX_VALUE_PATTERN_TAIL_CHARS);
                             return UiaSnapshot {
                                 hwnd: hwnd_raw,
                                 is_password: false,
                                 readable: true,
-                                before_caret: bstr.to_string(),
+                                before_caret: tail.to_string(),
                                 updated_at: now,
                             };
                         }
@@ -405,9 +459,20 @@ mod win_impl {
                     let mut last_hwnd: isize = 0;
 
                     while rx.recv().is_ok() {
-                        let cur_hwnd = unsafe { GetForegroundWindow().0 as isize };
-                        if cur_hwnd == last_hwnd && last_probe.elapsed() < MIN_REFRESH_INTERVAL {
-                            continue;
+                        let post_commit = POST_COMMIT_PENDING.swap(false, Ordering::AcqRel);
+                        if post_commit {
+                            // Wait briefly off the main thread so TSF finishes inserting committed
+                            // text into Chromium / Electron / Word before probing UIA.
+                            thread::sleep(POST_COMMIT_SETTLE_DELAY);
+                            if !POST_COMMIT_PENDING.load(Ordering::Acquire) {
+                                while rx.try_recv().is_ok() {}
+                            }
+                        } else {
+                            let cur_hwnd = unsafe { GetForegroundWindow().0 as isize };
+                            if cur_hwnd == last_hwnd && last_probe.elapsed() < MIN_REFRESH_INTERVAL
+                            {
+                                continue;
+                            }
                         }
                         let snap = probe_once(&automation);
                         last_hwnd = snap.hwnd;
@@ -441,7 +506,7 @@ mod win_impl {
     }
 
     /// Non-blocking hot-path query (< 2 µs). Never waits on COM or UIA.
-    pub fn query_context(live_preedit: &str, raw_input: &str) -> UiaContext {
+    pub fn query_context(live_preedit: &str, raw_input: &str, cand_preview: &str) -> UiaContext {
         if !is_enabled() {
             return UiaContext::FallbackSameWindow;
         }
@@ -469,7 +534,12 @@ mod win_impl {
                     return UiaContext::Blocked;
                 }
                 if snap.readable && snap.updated_at.elapsed() <= SNAPSHOT_TTL {
-                    let clean = normalize_before_caret(&snap.before_caret, live_preedit, raw_input);
+                    let clean = normalize_before_caret(
+                        &snap.before_caret,
+                        live_preedit,
+                        raw_input,
+                        cand_preview,
+                    );
                     return UiaContext::Text(clean);
                 }
                 if prev_hwnd != 0 && prev_hwnd != cur_hwnd {
@@ -501,6 +571,16 @@ mod win_impl {
             let _ = rt.tx.try_send(());
         }
     }
+
+    /// Force a post-commit UIA probe on the background STA thread after a brief settle delay,
+    /// bypassing `MIN_REFRESH_INTERVAL` so newly committed text is captured reliably.
+    pub fn kick_after_commit() {
+        if is_enabled() {
+            let rt = ensure_started();
+            POST_COMMIT_PENDING.store(true, Ordering::Release);
+            let _ = rt.tx.try_send(());
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -510,16 +590,19 @@ mod win_impl {
     pub fn is_enabled() -> bool {
         false
     }
-    pub fn query_context(_live_preedit: &str, _raw_input: &str) -> UiaContext {
+    pub fn query_context(_live_preedit: &str, _raw_input: &str, _cand_preview: &str) -> UiaContext {
         UiaContext::FallbackSameWindow
     }
     pub fn foreground_hwnd() -> isize {
         0
     }
     pub fn kick_refresh() {}
+    pub fn kick_after_commit() {}
 }
 
-pub use win_impl::{foreground_hwnd, is_enabled, kick_refresh, query_context, set_enabled};
+pub use win_impl::{
+    foreground_hwnd, is_enabled, kick_after_commit, kick_refresh, query_context, set_enabled,
+};
 
 #[cfg(test)]
 mod tests {
@@ -528,27 +611,56 @@ mod tests {
     #[test]
     fn test_normalize_before_caret_strips_chrome_preedit_and_paragraph() {
         assert_eq!(
-            normalize_before_caret("第一段内容\n\n我们今天去公园玩jntm", "jntm", "jntm"),
+            normalize_before_caret("第一段内容\n\n我们今天去公园玩jntm", "jntm", "jntm", ""),
             "我们今天去公园玩"
         );
         assert_eq!(
-            normalize_before_caret("今天天气真好，wo men ", "wo men", "women"),
+            normalize_before_caret("今天天气真好，wo men ", "wo men", "women", ""),
             "今天天气真好，"
         );
         // Embedded object separator U+FFFC must block Chromium/Electron UI chrome bleed
         assert_eq!(
-            normalize_before_caret("No Project\u{FFFC}刚刚买了一个jwtyzu", "jw ty zu", "jwtyzu"),
+            normalize_before_caret(
+                "No Project\u{FFFC}刚刚买了一个jwtyzu",
+                "jw ty zu",
+                "jwtyzu",
+                ""
+            ),
             "刚刚买了一个"
         );
         // Must only strip once (longest match first), never double-strip matching suffix
-        assert_eq!(normalize_before_caret("ababc", "abc", "ab"), "ab");
+        assert_eq!(normalize_before_caret("ababc", "abc", "ab", ""), "ab");
+    }
+
+    #[test]
+    fn test_normalize_before_caret_strips_zwsp_and_inline_preview() {
+        // Electron/Chromium editors (ProseMirror/Slate) wrap composition ranges with U+200B/BOM
+        assert_eq!(
+            normalize_before_caret(
+                "\u{FEFF}请帮我检查\u{200B}wo men\u{200B}",
+                "wo men",
+                "women",
+                ""
+            ),
+            "请帮我检查"
+        );
+        // Weasel `preedit_type: preview` echoes top candidate inline instead of pinyin preedit
+        assert_eq!(
+            normalize_before_caret("我们正在讨论策略", "ce lue", "celue", "策略"),
+            "我们正在讨论"
+        );
+        // When pinyin preedit matches, candidate preview must not also be stripped
+        assert_eq!(
+            normalize_before_caret("策略ce lue", "ce lue", "celue", "策略"),
+            "策略"
+        );
     }
 
     #[test]
     fn test_normalize_before_caret_truncates_utf8_safely() {
         let long =
             "这是一段很长的中文前文测试内容，用来验证多字节字符截断不会发生越界崩溃。".repeat(3);
-        let out = normalize_before_caret(&long, "", "");
+        let out = normalize_before_caret(&long, "", "", "");
         assert_eq!(out.chars().count(), MAX_UIA_CHARS);
     }
 }

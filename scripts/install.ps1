@@ -178,13 +178,21 @@ try {
         $sumFile  = Join-Path $relEx "SHA256SUMS.txt"
         if (-not (Test-Path $builtDll)) { throw "rime_neural.dll missing from release bundle." }
         if (Test-Path $sumFile) {
-            $expected = (Get-Content $sumFile | Where-Object { $_ -match 'rime_neural\.dll$' } | Select-Object -First 1) -split '\s+' | Select-Object -First 1
-            if ($expected) {
-                $got = (Get-FileHash $builtDll -Algorithm SHA256).Hash.ToLowerInvariant()
-                if ($got -ne $expected.ToLowerInvariant()) {
-                    throw "SHA-256 mismatch on rime_neural.dll! Expected=$expected Got=$got"
+            foreach ($entry in @(
+                @{ File = "rime_neural.dll"; Path = $builtDll },
+                @{ File = "rime_neural.lua"; Path = $relLua }
+            )) {
+                if (-not (Test-Path $entry.Path)) { continue }
+                $pat = [regex]::Escape($entry.File) + '$'
+                $line = Get-Content $sumFile | Where-Object { $_ -match $pat } | Select-Object -First 1
+                if ($line) {
+                    $expected = ($line -split '\s+' | Select-Object -First 1)
+                    $got = (Get-FileHash $entry.Path -Algorithm SHA256).Hash.ToLowerInvariant()
+                    if ($got -ne $expected.ToLowerInvariant()) {
+                        throw "SHA-256 mismatch on $($entry.File)! Expected=$expected Got=$got"
+                    }
+                    Write-Output "Verified $($entry.File) (SHA-256: $($got.Substring(0,12))...)."
                 }
-                Write-Output "Verified rime_neural.dll (SHA-256: $($got.Substring(0,12))...)."
             }
         }
         if (Test-Path $relLua) { $luaSrc = $relLua }

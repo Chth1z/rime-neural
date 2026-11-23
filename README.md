@@ -218,6 +218,7 @@ Intel Core Ultra 7 255HX，隔离 `rime.dll` 基准实测：
 | `threads` | `0` | ONNX Runtime CPU 线程数（`0` 自动适配并限幅 `4..8`） |
 | `min_input_len` | 双拼 `4` / 全拼 `6` | 触发神经重排的最小有效拼音按键数 |
 | `model_file` | `""`（自动探测） | 可选：显式指定 `%APPDATA%\Rime\neural\` 下的 `.onnx` 文件名 |
+| `t2s_config` | `""`（自动 `tw2sp` / `t2s`） | 可选：显式指定繁体上文转简体的 OpenCC 配置文件（如 `t2s.json`） |
 | `log_feedback` | `true` | 本地脱敏日志开关（供可选的个人权重校准脚本使用） |
 | `sync_init` | `false` | `false` 后台异步加载；`true` 同步加载（离线评测脚本用） |
 
