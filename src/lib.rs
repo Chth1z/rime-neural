@@ -18,6 +18,7 @@ use pinyin::PinyinLayout;
 use uia::UiaContext;
 
 const MAX_LUA_ARRAY_LEN: usize = 256;
+const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 unsafe fn read_str_array(api: &LuaApi, l: LuaState, idx: c_int) -> Vec<String> {
     // SAFETY: Caller passes a valid `lua_State*`. Checks `LUA_TTABLE` before `lua_rawlen`/`lua_rawgeti`.
@@ -75,26 +76,28 @@ unsafe fn push_f32_array(api: &LuaApi, l: LuaState, vals: &[f32]) {
     }
 }
 
+/// Read up to 5 fusion weights directly as `f64` via `rawgeti` + `tonumberx`, preserving full
+/// `f64` precision and keeping `FusionWeights::default()` on `nil`, `NaN`, or non-numeric entries.
 unsafe fn read_weights(api: &LuaApi, l: LuaState, idx: c_int) -> FusionWeights {
     let mut w = FusionWeights::default();
     // SAFETY: Caller passes a valid `lua_State*`.
     unsafe {
         if (api.lua_type)(l, idx) == LUA_TTABLE {
-            let vals = read_f32_array(api, l, idx);
-            if !vals.is_empty() && vals[0].is_finite() {
-                w.w_logit = vals[0] as f64;
-            }
-            if vals.len() >= 2 && vals[1].is_finite() {
-                w.w_rank = vals[1] as f64;
-            }
-            if vals.len() >= 3 && vals[2].is_finite() {
-                w.w_gram = vals[2] as f64;
-            }
-            if vals.len() >= 4 && vals[3].is_finite() {
-                w.w_char_lp = vals[3] as f64;
-            }
-            if vals.len() >= 5 && vals[4].is_finite() {
-                w.w_ctx_lp = vals[4] as f64;
+            let fields: [&mut f64; 5] = [
+                &mut w.w_logit,
+                &mut w.w_rank,
+                &mut w.w_gram,
+                &mut w.w_char_lp,
+                &mut w.w_ctx_lp,
+            ];
+            for (i, slot) in fields.into_iter().enumerate() {
+                (api.rawgeti)(l, idx, (i + 1) as LuaInteger);
+                let mut isnum: c_int = 0;
+                let v = (api.tonumberx)(l, -1, &mut isnum);
+                pop(api, l, 1);
+                if isnum != 0 && v.is_finite() {
+                    *slot = v;
+                }
             }
             return w;
         }
@@ -112,13 +115,13 @@ unsafe fn read_weights(api: &LuaApi, l: LuaState, idx: c_int) -> FusionWeights {
     w
 }
 
-unsafe fn read_table_f32(
+unsafe fn read_table_f64(
     api: &LuaApi,
     l: LuaState,
     idx: c_int,
     field: &str,
-    default_val: f32,
-) -> f32 {
+    default_val: f64,
+) -> f64 {
     let tbl_idx = if idx < 0 { idx - 1 } else { idx };
     // SAFETY: Slot `idx` was checked to be `LUA_TTABLE`; `lua_rawget` avoids metamethod dispatch.
     unsafe {
@@ -128,7 +131,71 @@ unsafe fn read_table_f32(
         let v = (api.tonumberx)(l, -1, &mut isnum);
         pop(api, l, 1);
         if isnum != 0 && v.is_finite() {
-            v as f32
+            v
+        } else {
+            default_val
+        }
+    }
+}
+
+unsafe fn read_table_f32(
+    api: &LuaApi,
+    l: LuaState,
+    idx: c_int,
+    field: &str,
+    default_val: f32,
+) -> f32 {
+    // SAFETY: Delegates to `read_table_f64` with the same preconditions.
+    let v = unsafe { read_table_f64(api, l, idx, field, default_val as f64) };
+    if v.is_finite() { v as f32 } else { default_val }
+}
+
+unsafe fn read_table_str(api: &LuaApi, l: LuaState, idx: c_int, field: &str) -> Option<String> {
+    let tbl_idx = if idx < 0 { idx - 1 } else { idx };
+    // SAFETY: Slot `idx` was checked to be `LUA_TTABLE`; `lua_rawget` avoids metamethod dispatch.
+    unsafe {
+        push_str(api, l, field);
+        (api.rawget)(l, tbl_idx);
+        let res = read_str(api, l, -1);
+        pop(api, l, 1);
+        res.filter(|s| !s.is_empty())
+    }
+}
+
+unsafe fn read_table_bool(api: &LuaApi, l: LuaState, idx: c_int, field: &str) -> Option<bool> {
+    let tbl_idx = if idx < 0 { idx - 1 } else { idx };
+    // SAFETY: Slot `idx` was checked to be `LUA_TTABLE`; `lua_rawget` avoids metamethod dispatch.
+    unsafe {
+        push_str(api, l, field);
+        (api.rawget)(l, tbl_idx);
+        let ty = (api.lua_type)(l, -1);
+        let res = if ty == LUA_TBOOLEAN {
+            Some((api.toboolean)(l, -1) != 0)
+        } else {
+            None
+        };
+        pop(api, l, 1);
+        res
+    }
+}
+
+unsafe fn read_table_usize(
+    api: &LuaApi,
+    l: LuaState,
+    idx: c_int,
+    field: &str,
+    default_val: usize,
+) -> usize {
+    let tbl_idx = if idx < 0 { idx - 1 } else { idx };
+    // SAFETY: Slot `idx` was checked to be `LUA_TTABLE`; `lua_rawget` avoids metamethod dispatch.
+    unsafe {
+        push_str(api, l, field);
+        (api.rawget)(l, tbl_idx);
+        let mut isnum: c_int = 0;
+        let v = (api.tointegerx)(l, -1, &mut isnum);
+        pop(api, l, 1);
+        if isnum != 0 && v > 0 {
+            usize::try_from(v).unwrap_or(default_val)
         } else {
             default_val
         }
@@ -167,6 +234,69 @@ unsafe fn read_p2c_cfg(api: &LuaApi, l: LuaState, idx: c_int) -> P2cConfig {
     cfg
 }
 
+/// Resolve a `.gram` path from either a string or a list of candidate paths (`{ user, shared }`),
+/// picking the first existing file via UTF-16 `Path::is_file()`.
+fn pick_existing_gram_path(candidates: &[String]) -> Option<PathBuf> {
+    let mut first_non_empty: Option<PathBuf> = None;
+    for s in candidates {
+        if s.is_empty() {
+            continue;
+        }
+        let p = PathBuf::from(s);
+        if p.is_file() {
+            return Some(p);
+        }
+        if first_non_empty.is_none() {
+            first_non_empty = Some(p);
+        }
+    }
+    first_non_empty
+}
+
+unsafe fn read_gram_req(api: &LuaApi, l: LuaState, idx: c_int) -> GramRequest {
+    // SAFETY: Caller passes a valid `lua_State*`.
+    unsafe {
+        if (api.lua_type)(l, idx) != LUA_TTABLE {
+            return GramRequest::Default;
+        }
+        if read_table_bool(api, l, idx, "enabled") == Some(false) {
+            return GramRequest::Disabled;
+        }
+        let mut paths = Vec::with_capacity(2);
+        if let Some(p) = read_table_str(api, l, idx, "path") {
+            paths.push(p);
+        }
+        if let Some(p) = read_table_str(api, l, idx, "fallback_path") {
+            paths.push(p);
+        }
+        let Some(chosen) = pick_existing_gram_path(&paths) else {
+            return GramRequest::Disabled;
+        };
+        let col = read_table_f64(
+            api,
+            l,
+            idx,
+            "col_penalty",
+            gram::DEFAULT_COLLOCATION_PENALTY,
+        );
+        let non_col = read_table_f64(
+            api,
+            l,
+            idx,
+            "non_col_penalty",
+            gram::DEFAULT_NON_COLLOCATION_PENALTY,
+        );
+        let max_len = read_table_usize(
+            api,
+            l,
+            idx,
+            "max_length",
+            gram::DEFAULT_COLLOCATION_MAX_LENGTH,
+        );
+        GramRequest::custom(chosen, col, non_col, max_len)
+    }
+}
+
 unsafe fn read_layout(api: &LuaApi, l: LuaState, idx: c_int) -> PinyinLayout {
     // SAFETY: Caller passes a valid `lua_State*`.
     unsafe {
@@ -195,24 +325,36 @@ unsafe fn read_init_config(api: &LuaApi, l: LuaState) -> Result<InitConfig, Stri
         } else {
             0 // auto-detect
         };
-        let gram_path = read_str(api, l, 4)
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from);
+        let gram_path = if (api.lua_type)(l, 4) == LUA_TTABLE {
+            let candidates = read_str_array(api, l, 4);
+            pick_existing_gram_path(&candidates)
+        } else {
+            read_str(api, l, 4)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        };
         isnum = 0;
         let col_raw = (api.tonumberx)(l, 5, &mut isnum);
         let gram_collocation_penalty = if isnum != 0 && col_raw.is_finite() {
             col_raw
         } else {
-            -15.5
+            gram::DEFAULT_COLLOCATION_PENALTY
         };
         isnum = 0;
         let non_col_raw = (api.tonumberx)(l, 6, &mut isnum);
         let gram_non_collocation_penalty = if isnum != 0 && non_col_raw.is_finite() {
             non_col_raw
         } else {
-            -4.0
+            gram::DEFAULT_NON_COLLOCATION_PENALTY
         };
         let model_file = read_str(api, l, 7).filter(|s| !s.is_empty());
+        isnum = 0;
+        let max_len_raw = (api.tointegerx)(l, 8, &mut isnum);
+        let gram_max_length = if isnum != 0 && max_len_raw > 0 {
+            usize::try_from(max_len_raw).unwrap_or(gram::DEFAULT_COLLOCATION_MAX_LENGTH)
+        } else {
+            gram::DEFAULT_COLLOCATION_MAX_LENGTH
+        };
 
         Ok(InitConfig {
             model_dir: PathBuf::from(model_dir),
@@ -220,24 +362,26 @@ unsafe fn read_init_config(api: &LuaApi, l: LuaState) -> Result<InitConfig, Stri
             gram_path,
             gram_collocation_penalty,
             gram_non_collocation_penalty,
-            gram_max_length: gram::DEFAULT_COLLOCATION_MAX_LENGTH,
+            gram_max_length,
             model_file,
             threads,
         })
     }
 }
 
-/// init(model_dir, ort_dll, threads, [gram_path], [col_penalty], [non_col_penalty], [model_file])
-unsafe extern "C" fn lua_init(l: LuaState) -> c_int {
+/// init(model_dir, ort_dll, threads, [gram_path_or_tbl], [col_penalty], [non_col_penalty], [model_file], [gram_max_length])
+unsafe extern "C-unwind" fn lua_init(l: LuaState) -> c_int {
     // SAFETY: Invoked by Lua 5.4 host with valid `lua_State*`.
     let Ok(api) = (unsafe { get_api() }) else {
         return 0;
     };
-    let res = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
-        // SAFETY: `l` is valid for the duration of this Lua C call.
-        let cfg = unsafe { read_init_config(api, l) }?;
-        engine::init_engine(&cfg)
-    }));
+    // Read Lua arguments outside `catch_unwind` so Lua stack/GC calls never unwind through it.
+    // SAFETY: `l` is valid for the duration of this Lua C call.
+    let cfg_res = unsafe { read_init_config(api, l) };
+    let res = match cfg_res {
+        Ok(cfg) => catch_unwind(AssertUnwindSafe(|| engine::init_engine(&cfg))),
+        Err(e) => Ok(Err(e)),
+    };
     // SAFETY: Push at most 2 values to Lua stack; check stack headroom first.
     unsafe {
         if (api.checkstack)(l, 4) == 0 {
@@ -263,26 +407,46 @@ unsafe extern "C" fn lua_init(l: LuaState) -> c_int {
     }
 }
 
-/// init_async(model_dir, ort_dll, threads, [gram_path], [col_penalty], [non_col_penalty], [model_file])
-unsafe extern "C" fn lua_init_async(l: LuaState) -> c_int {
+/// init_async(model_dir, ort_dll, threads, [gram_path_or_tbl], [col_penalty], [non_col_penalty], [model_file], [gram_max_length])
+unsafe extern "C-unwind" fn lua_init_async(l: LuaState) -> c_int {
     // SAFETY: Invoked by Lua 5.4 host with valid `lua_State*`.
     let Ok(api) = (unsafe { get_api() }) else {
         return 0;
     };
-    let res = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
-        // SAFETY: `l` is valid for this C call.
-        let cfg = unsafe { read_init_config(api, l) }?;
-        engine::init_engine_async(cfg);
-        Ok(())
-    }));
-    // SAFETY: Push 1 boolean return value onto `l`.
+    // SAFETY: `l` is valid for this C call.
+    let cfg_res = unsafe { read_init_config(api, l) };
+    let res = match cfg_res {
+        Ok(cfg) => catch_unwind(AssertUnwindSafe(|| {
+            engine::init_engine_async(cfg);
+            Ok(())
+        })),
+        Err(e) => Ok(Err(e)),
+    };
+    // SAFETY: Push `(ok, [err])` onto `l`.
     unsafe {
-        (api.pushboolean)(l, if matches!(res, Ok(Ok(()))) { 1 } else { 0 });
+        if (api.checkstack)(l, 4) == 0 {
+            return 0;
+        }
+        match res {
+            Ok(Ok(())) => {
+                (api.pushboolean)(l, 1);
+                1
+            }
+            Ok(Err(e)) => {
+                (api.pushboolean)(l, 0);
+                push_str(api, l, &e);
+                2
+            }
+            Err(_) => {
+                (api.pushboolean)(l, 0);
+                push_str(api, l, "panic in rime_neural.init_async");
+                2
+            }
+        }
     }
-    1
 }
 
-unsafe extern "C" fn lua_is_ready(l: LuaState) -> c_int {
+unsafe extern "C-unwind" fn lua_is_ready(l: LuaState) -> c_int {
     // SAFETY: Invoked by Lua 5.4 host with valid `lua_State*`.
     let Ok(api) = (unsafe { get_api() }) else {
         return 0;
@@ -290,25 +454,28 @@ unsafe extern "C" fn lua_is_ready(l: LuaState) -> c_int {
     let ready = catch_unwind(AssertUnwindSafe(engine::is_ready)).unwrap_or(false);
     // SAFETY: Push 1 boolean return value onto `l`.
     unsafe {
+        if (api.checkstack)(l, 2) == 0 {
+            return 0;
+        }
         (api.pushboolean)(l, if ready { 1 } else { 0 });
     }
     1
 }
 
 /// resolve_layout(layout_opt, schema_id) -> (layout_name, is_dp, uses_semicolon)
-unsafe extern "C" fn lua_resolve_layout(l: LuaState) -> c_int {
+unsafe extern "C-unwind" fn lua_resolve_layout(l: LuaState) -> c_int {
     // SAFETY: Invoked by Lua 5.4 host with valid `lua_State*`.
     let Ok(api) = (unsafe { get_api() }) else {
         return 0;
     };
+    // SAFETY: `l` is valid for this C call.
+    let (opt, schema) = unsafe {
+        (
+            read_str(api, l, 1).unwrap_or_default(),
+            read_str(api, l, 2).unwrap_or_default(),
+        )
+    };
     let layout = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: `l` is valid for this C call.
-        let (opt, schema) = unsafe {
-            (
-                read_str(api, l, 1).unwrap_or_default(),
-                read_str(api, l, 2).unwrap_or_default(),
-            )
-        };
         PinyinLayout::from_name_or_schema(&opt, &schema)
     }))
     .unwrap_or(PinyinLayout::Full);
@@ -325,19 +492,22 @@ unsafe extern "C" fn lua_resolve_layout(l: LuaState) -> c_int {
 }
 
 /// set_uia_enabled(bool)
-unsafe extern "C" fn lua_set_uia_enabled(l: LuaState) -> c_int {
+unsafe extern "C-unwind" fn lua_set_uia_enabled(l: LuaState) -> c_int {
     // SAFETY: Invoked by Lua 5.4 host with valid `lua_State*`.
     let Ok(api) = (unsafe { get_api() }) else {
         return 0;
     };
+    // SAFETY: `l` is valid for this C call.
+    let enable = unsafe { (api.toboolean)(l, 1) != 0 };
     let ok = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: `l` is valid for this C call.
-        let enable = unsafe { (api.toboolean)(l, 1) != 0 };
         uia::set_enabled(enable);
     }))
     .is_ok();
     // SAFETY: Push 1 boolean onto `l`.
     unsafe {
+        if (api.checkstack)(l, 2) == 0 {
+            return 0;
+        }
         (api.pushboolean)(l, if ok { 1 } else { 0 });
     }
     1
@@ -345,20 +515,20 @@ unsafe extern "C" fn lua_set_uia_enabled(l: LuaState) -> c_int {
 
 /// query_uia_context(live_preedit, raw_input, [cand_preview])
 ///   -> (status_str, text_str, hwnd_int, preedit_stripped_bool)
-unsafe extern "C" fn lua_query_uia_context(l: LuaState) -> c_int {
+unsafe extern "C-unwind" fn lua_query_uia_context(l: LuaState) -> c_int {
     // SAFETY: Invoked by Lua 5.4 host with valid `lua_State*`.
     let Ok(api) = (unsafe { get_api() }) else {
         return 0;
     };
+    // SAFETY: `l` is valid for this C call.
+    let (preedit, raw_input, cand_preview) = unsafe {
+        (
+            read_str(api, l, 1).unwrap_or_default(),
+            read_str(api, l, 2).unwrap_or_default(),
+            read_str(api, l, 3).unwrap_or_default(),
+        )
+    };
     let res = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: `l` is valid for this C call.
-        let (preedit, raw_input, cand_preview) = unsafe {
-            (
-                read_str(api, l, 1).unwrap_or_default(),
-                read_str(api, l, 2).unwrap_or_default(),
-                read_str(api, l, 3).unwrap_or_default(),
-            )
-        };
         uia::query_context(&preedit, &raw_input, &cand_preview)
     }));
     // SAFETY: Push 4 return values onto `l` after ensuring stack capacity.
@@ -413,48 +583,47 @@ unsafe extern "C" fn lua_query_uia_context(l: LuaState) -> c_int {
 }
 
 /// kick_uia_refresh() -> nil (non-blocking background refresh hint)
-unsafe extern "C" fn lua_kick_uia_refresh(_l: LuaState) -> c_int {
+unsafe extern "C-unwind" fn lua_kick_uia_refresh(_l: LuaState) -> c_int {
     let _ = catch_unwind(AssertUnwindSafe(uia::kick_refresh));
     0
 }
 
 /// kick_uia_after_commit() -> nil (post-commit background refresh after brief settle delay)
-unsafe extern "C" fn lua_kick_uia_after_commit(_l: LuaState) -> c_int {
+unsafe extern "C-unwind" fn lua_kick_uia_after_commit(_l: LuaState) -> c_int {
     let _ = catch_unwind(AssertUnwindSafe(uia::kick_after_commit));
     0
 }
 
-/// rerank(context, raw_input, layout_str_or_bool, cands_tbl, weights_tbl, [p2c_cfg_tbl])
-unsafe extern "C" fn lua_rerank(l: LuaState) -> c_int {
+/// rerank(context, raw_input, layout_str_or_bool, cands_tbl, weights_tbl, [p2c_cfg_tbl], [gram_cfg_tbl])
+unsafe extern "C-unwind" fn lua_rerank(l: LuaState) -> c_int {
     // SAFETY: Invoked by Lua 5.4 host with valid `lua_State*`.
     let Ok(api) = (unsafe { get_api() }) else {
         return 0;
     };
+    // Extract all Lua arguments BEFORE `catch_unwind` (table lookups invoke `pushlstring`).
+    // SAFETY: `l` is valid for this C call; ensure stack headroom for table field lookups.
+    let args = unsafe {
+        if (api.checkstack)(l, 8) == 0 {
+            return 0;
+        }
+        (
+            read_str(api, l, 1).unwrap_or_default(),
+            read_str(api, l, 2).unwrap_or_default(),
+            read_layout(api, l, 3),
+            read_str_array(api, l, 4),
+            read_weights(api, l, 5),
+            read_p2c_cfg(api, l, 6),
+            read_gram_req(api, l, 7),
+        )
+    };
+    let (ctx, raw_input, layout, cands, weights, p2c_cfg, gram_req) = args;
     let res = catch_unwind(AssertUnwindSafe(
         || -> Result<engine::RerankResult, String> {
             if !engine::is_ready() {
                 return Err("not ready".to_string());
             }
-            // SAFETY: `l` is valid for this C call.
-            let (ctx, raw_input, layout, cands, weights, p2c_cfg) = unsafe {
-                (
-                    read_str(api, l, 1).unwrap_or_default(),
-                    read_str(api, l, 2).unwrap_or_default(),
-                    read_layout(api, l, 3),
-                    read_str_array(api, l, 4),
-                    read_weights(api, l, 5),
-                    read_p2c_cfg(api, l, 6),
-                )
-            };
-
             engine::rerank(
-                &ctx,
-                &raw_input,
-                layout,
-                &cands,
-                weights,
-                p2c_cfg,
-                &GramRequest::Default,
+                &ctx, &raw_input, layout, &cands, weights, p2c_cfg, &gram_req,
             )
         },
     ));
@@ -466,7 +635,7 @@ unsafe extern "C" fn lua_rerank(l: LuaState) -> c_int {
         }
         match res {
             Ok(Ok(rr)) => {
-                (api.createtable)(l, 0, 6);
+                (api.createtable)(l, 0, 8);
 
                 let order = rr.order;
                 rawset_field(api, l, "order", |api, l| {
@@ -509,70 +678,191 @@ unsafe extern "C" fn lua_rerank(l: LuaState) -> c_int {
                 });
                 drop(char_lps);
 
+                rawset_field(api, l, "has_ctx", |api, l| {
+                    (api.pushboolean)(l, if rr.has_ctx { 1 } else { 0 })
+                });
+                rawset_field(api, l, "has_gram", |api, l| {
+                    (api.pushboolean)(l, if rr.has_gram { 1 } else { 0 })
+                });
+
                 1
             }
-            _ => {
+            Ok(Err(e)) => {
                 (api.pushnil)(l);
-                1
+                push_str(api, l, &e);
+                2
             }
+            Err(_) => {
+                (api.pushnil)(l);
+                push_str(api, l, "panic in rime_neural.rerank");
+                2
+            }
+        }
+    }
+}
+
+enum ParsedFeedbackArgs {
+    V2 {
+        schema: String,
+        has_ctx: bool,
+        logits: Vec<f32>,
+        gram_deltas: Vec<f32>,
+        char_lps: Vec<f32>,
+        shown_top1_idx: i32,
+        chosen_idx: i32,
+        p2c_shown: bool,
+        p2c_chosen: bool,
+        chosen_rank: i32,
+        log_path: Option<PathBuf>,
+        has_gram_override: Option<bool>,
+    },
+    Legacy {
+        schema: String,
+        ctx: String,
+        cands: Vec<String>,
+        logits: Vec<f32>,
+        gram_deltas: Vec<f32>,
+        char_lps: Vec<f32>,
+        p2c_cand: Option<String>,
+        shown_top1: String,
+        chosen_text: String,
+        chosen_rank: i32,
+        log_path: Option<PathBuf>,
+    },
+}
+
+unsafe fn read_feedback_args(api: &LuaApi, l: LuaState) -> ParsedFeedbackArgs {
+    // SAFETY: Caller passes a valid `lua_State*`.
+    unsafe {
+        let nargs = (api.gettop)(l);
+        let schema = read_str(api, l, 1).unwrap_or_default();
+        let arg2_ty = (api.lua_type)(l, 2);
+        let arg3_ty = (api.lua_type)(l, 3);
+        let is_v2 = arg2_ty == LUA_TBOOLEAN
+            || (nargs <= 12 && (arg3_ty == LUA_TTABLE || arg2_ty != LUA_TSTRING));
+        if is_v2 {
+            let has_ctx = (api.toboolean)(l, 2) != 0;
+            let logits = read_f32_array(api, l, 3);
+            let gram_deltas = read_f32_array(api, l, 4);
+            let char_lps = read_f32_array(api, l, 5);
+
+            let mut isnum: c_int = 0;
+            let shown_raw = (api.tointegerx)(l, 6, &mut isnum);
+            let shown_top1_idx = if isnum != 0 {
+                i32::try_from(shown_raw).unwrap_or(-1)
+            } else {
+                -1
+            };
+            isnum = 0;
+            let chosen_raw = (api.tointegerx)(l, 7, &mut isnum);
+            let chosen_idx = if isnum != 0 {
+                i32::try_from(chosen_raw).unwrap_or(-1)
+            } else {
+                -1
+            };
+            let p2c_shown = (api.toboolean)(l, 8) != 0;
+            let p2c_chosen = (api.toboolean)(l, 9) != 0;
+            isnum = 0;
+            let rank_raw = (api.tointegerx)(l, 10, &mut isnum);
+            let chosen_rank = if isnum != 0 {
+                i32::try_from(rank_raw).unwrap_or(0)
+            } else {
+                0
+            };
+            let log_path = read_str(api, l, 11)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
+            let has_gram_override = if nargs >= 12 && (api.lua_type)(l, 12) == LUA_TBOOLEAN {
+                Some((api.toboolean)(l, 12) != 0)
+            } else {
+                None
+            };
+            return ParsedFeedbackArgs::V2 {
+                schema,
+                has_ctx,
+                logits,
+                gram_deltas,
+                char_lps,
+                shown_top1_idx,
+                chosen_idx,
+                p2c_shown,
+                p2c_chosen,
+                chosen_rank,
+                log_path,
+                has_gram_override,
+            };
+        }
+
+        let log_path = read_str(api, l, 13)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        let ctx = read_str(api, l, 3).unwrap_or_default();
+        let cands = read_str_array(api, l, 4);
+        let logits = read_f32_array(api, l, 5);
+        let gram_deltas = read_f32_array(api, l, 6);
+        let char_lps = read_f32_array(api, l, 7);
+        let p2c_cand = read_str(api, l, 8).filter(|s| !s.is_empty());
+        let shown_top1 = read_str(api, l, 9).unwrap_or_default();
+        let chosen_text = read_str(api, l, 10).unwrap_or_default();
+        let mut isnum: c_int = 0;
+        let rank_raw = (api.tointegerx)(l, 11, &mut isnum);
+        let chosen_rank = if isnum != 0 {
+            i32::try_from(rank_raw).unwrap_or(0)
+        } else {
+            0
+        };
+        ParsedFeedbackArgs::Legacy {
+            schema,
+            ctx,
+            cands,
+            logits,
+            gram_deltas,
+            char_lps,
+            p2c_cand,
+            shown_top1,
+            chosen_text,
+            chosen_rank,
+            log_path,
         }
     }
 }
 
 /// Zero-plaintext feedback logger.
 /// Supports both:
-/// - Numeric v2 signature (11 args):
-///   `log_feedback(schema, has_ctx_bool, logits_tbl, gram_tbl, char_tbl, shown_top1_idx, chosen_idx, p2c_shown, p2c_chosen, chosen_rank, [log_path])`
+/// - Numeric v2 signature (11–12 args):
+///   `log_feedback(schema, has_ctx_bool, logits_tbl, gram_tbl, char_tbl, shown_top1_idx, chosen_idx, p2c_shown, p2c_chosen, chosen_rank, [log_path], [has_gram_bool])`
 /// - Legacy 13-arg signature (for older Lua scripts): converts to zero-plaintext v2 in memory before writing.
-unsafe extern "C" fn lua_log_feedback(l: LuaState) -> c_int {
+unsafe extern "C-unwind" fn lua_log_feedback(l: LuaState) -> c_int {
     // SAFETY: Invoked by Lua 5.4 host with valid `lua_State*`.
     let Ok(api) = (unsafe { get_api() }) else {
         return 0;
     };
+    // SAFETY: Extract Lua arguments outside `catch_unwind`.
+    let parsed = unsafe { read_feedback_args(api, l) };
     let res = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
-        let (model_name, has_gram) = engine::active_feedback_meta();
-        // SAFETY: `l` is valid for this C call.
-        unsafe {
-            let nargs = (api.gettop)(l);
-            let schema = read_str(api, l, 1).unwrap_or_default();
-            let is_v2 = (api.lua_type)(l, 2) == LUA_TBOOLEAN
-                || (nargs <= 11 && (api.lua_type)(l, 3) == LUA_TTABLE);
-            if is_v2 {
-                let has_ctx = (api.toboolean)(l, 2) != 0;
-                let logits = read_f32_array(api, l, 3);
-                let gram_deltas = read_f32_array(api, l, 4);
-                let char_lps = read_f32_array(api, l, 5);
-
-                let mut isnum: c_int = 0;
-                let shown_raw = (api.tointegerx)(l, 6, &mut isnum);
-                let shown_top1_idx = if isnum != 0 {
-                    i32::try_from(shown_raw).unwrap_or(-1)
-                } else {
-                    -1
-                };
-                isnum = 0;
-                let chosen_raw = (api.tointegerx)(l, 7, &mut isnum);
-                let chosen_idx = if isnum != 0 {
-                    i32::try_from(chosen_raw).unwrap_or(-1)
-                } else {
-                    -1
-                };
-                let p2c_shown = (api.toboolean)(l, 8) != 0;
-                let p2c_chosen = (api.toboolean)(l, 9) != 0;
-                isnum = 0;
-                let rank_raw = (api.tointegerx)(l, 10, &mut isnum);
-                let chosen_rank = if isnum != 0 {
-                    i32::try_from(rank_raw).unwrap_or(0)
-                } else {
-                    0
-                };
-                let log_path = match read_str(api, l, 11).filter(|s| !s.is_empty()) {
-                    Some(p) => PathBuf::from(p),
+        let (model_name, engine_has_gram) = engine::active_feedback_meta();
+        match parsed {
+            ParsedFeedbackArgs::V2 {
+                schema,
+                has_ctx,
+                logits,
+                gram_deltas,
+                char_lps,
+                shown_top1_idx,
+                chosen_idx,
+                p2c_shown,
+                p2c_chosen,
+                chosen_rank,
+                log_path,
+                has_gram_override,
+            } => {
+                let log_path = match log_path {
+                    Some(p) => p,
                     None => engine::model_dir_path()
                         .ok_or("engine not ready")?
                         .join("feedback.jsonl"),
                 };
-                // Reverted = neural promoted another candidate (or P2C `-2`) to #1, and user chose Rime #1 (`0`).
+                let has_gram = has_gram_override.unwrap_or(engine_has_gram);
                 let reverted = (shown_top1_idx > 0 || shown_top1_idx == -2) && chosen_idx == 0;
                 let rec = feedback::FeedbackRecord::new_numeric(
                     &schema,
@@ -589,81 +879,93 @@ unsafe extern "C" fn lua_log_feedback(l: LuaState) -> c_int {
                     chosen_rank,
                     reverted,
                 );
-                return feedback::append_feedback(&log_path, &rec);
+                feedback::append_feedback(&log_path, &rec)
             }
-
-            // Legacy 13-arg compatibility: derive purely numeric indices in memory; never persist raw text
-            let log_path = match read_str(api, l, 13).filter(|s| !s.is_empty()) {
-                Some(p) => PathBuf::from(p),
-                None => engine::model_dir_path()
-                    .ok_or("engine not ready")?
-                    .join("feedback.jsonl"),
-            };
-            let ctx = read_str(api, l, 3).unwrap_or_default();
-            let cands = read_str_array(api, l, 4);
-            let logits = read_f32_array(api, l, 5);
-            let gram_deltas = read_f32_array(api, l, 6);
-            let char_lps = read_f32_array(api, l, 7);
-            let p2c_cand = read_str(api, l, 8).filter(|s| !s.is_empty());
-            let shown_top1 = read_str(api, l, 9).unwrap_or_default();
-            let chosen_text = read_str(api, l, 10).unwrap_or_default();
-            let mut isnum: c_int = 0;
-            let rank_raw = (api.tointegerx)(l, 11, &mut isnum);
-            let chosen_rank = if isnum != 0 {
-                i32::try_from(rank_raw).unwrap_or(0)
-            } else {
-                0
-            };
-
-            let has_ctx = ctx.trim().chars().count() >= 2;
-            let p2c_shown = p2c_cand.is_some();
-            let chosen_idx = cands
-                .iter()
-                .position(|c| c == &chosen_text)
-                .map(|i| i as i32)
-                .unwrap_or(-1);
-            let p2c_chosen = p2c_cand
-                .as_deref()
-                .is_some_and(|p| p == chosen_text && chosen_idx < 0);
-            let shown_top1_idx = if p2c_cand.as_deref().is_some_and(|p| p == shown_top1)
-                && !cands.iter().any(|c| c == &shown_top1)
-            {
-                -2
-            } else {
-                cands
-                    .iter()
-                    .position(|c| c == &shown_top1)
-                    .map(|i| i as i32)
-                    .unwrap_or(-1)
-            };
-            let reverted = (shown_top1_idx > 0 || shown_top1_idx == -2) && chosen_idx == 0;
-
-            let rec = feedback::FeedbackRecord::new_numeric(
-                &schema,
-                &model_name,
-                has_gram,
-                has_ctx,
-                &logits,
-                &gram_deltas,
-                &char_lps,
-                shown_top1_idx,
-                chosen_idx,
-                p2c_shown,
-                p2c_chosen,
+            ParsedFeedbackArgs::Legacy {
+                schema,
+                ctx,
+                cands,
+                logits,
+                gram_deltas,
+                char_lps,
+                p2c_cand,
+                shown_top1,
+                chosen_text,
                 chosen_rank,
-                reverted,
-            );
-            feedback::append_feedback(&log_path, &rec)
+                log_path,
+            } => {
+                let log_path = match log_path {
+                    Some(p) => p,
+                    None => engine::model_dir_path()
+                        .ok_or("engine not ready")?
+                        .join("feedback.jsonl"),
+                };
+                let has_ctx = ctx.trim().chars().count() >= 2;
+                let p2c_shown = p2c_cand.is_some();
+                let chosen_idx = cands
+                    .iter()
+                    .position(|c| c == &chosen_text)
+                    .map(|i| i as i32)
+                    .unwrap_or(-1);
+                let p2c_chosen = p2c_cand
+                    .as_deref()
+                    .is_some_and(|p| p == chosen_text && chosen_idx < 0);
+                let shown_top1_idx = if p2c_cand.as_deref().is_some_and(|p| p == shown_top1)
+                    && !cands.iter().any(|c| c == &shown_top1)
+                {
+                    -2
+                } else {
+                    cands
+                        .iter()
+                        .position(|c| c == &shown_top1)
+                        .map(|i| i as i32)
+                        .unwrap_or(-1)
+                };
+                let reverted = (shown_top1_idx > 0 || shown_top1_idx == -2) && chosen_idx == 0;
+                let rec = feedback::FeedbackRecord::new_numeric(
+                    &schema,
+                    &model_name,
+                    engine_has_gram,
+                    has_ctx,
+                    &logits,
+                    &gram_deltas,
+                    &char_lps,
+                    shown_top1_idx,
+                    chosen_idx,
+                    p2c_shown,
+                    p2c_chosen,
+                    chosen_rank,
+                    reverted,
+                );
+                feedback::append_feedback(&log_path, &rec)
+            }
         }
     }));
-    // SAFETY: Push 1 boolean onto `l`.
+    // SAFETY: Push `(ok, [err])` onto `l`.
     unsafe {
-        (api.pushboolean)(l, if matches!(res, Ok(Ok(()))) { 1 } else { 0 });
+        if (api.checkstack)(l, 4) == 0 {
+            return 0;
+        }
+        match res {
+            Ok(Ok(())) => {
+                (api.pushboolean)(l, 1);
+                1
+            }
+            Ok(Err(e)) => {
+                (api.pushboolean)(l, 0);
+                push_str(api, l, &e);
+                2
+            }
+            Err(_) => {
+                (api.pushboolean)(l, 0);
+                push_str(api, l, "panic in rime_neural.log_feedback");
+                2
+            }
+        }
     }
-    1
 }
 
-unsafe extern "C" fn lua_stats(l: LuaState) -> c_int {
+unsafe extern "C-unwind" fn lua_stats(l: LuaState) -> c_int {
     // SAFETY: Invoked by Lua 5.4 host with valid `lua_State*`.
     let Ok(api) = (unsafe { get_api() }) else {
         return 0;
@@ -683,7 +985,8 @@ unsafe extern "C" fn lua_stats(l: LuaState) -> c_int {
             (api.pushnil)(l);
             return 1;
         };
-        (api.createtable)(l, 0, 14);
+        (api.createtable)(l, 0, 15);
+        rawset_field(api, l, "version", |api, l| push_str(api, l, PKG_VERSION));
         rawset_field(api, l, "ready", |api, l| {
             (api.pushboolean)(l, if st.ready { 1 } else { 0 })
         });
@@ -739,47 +1042,325 @@ unsafe extern "C" fn lua_stats(l: LuaState) -> c_int {
 /// # Safety
 /// Must only be called by the host Lua 5.4 VM (`librime-lua` / `rime.dll`) with a valid `lua_State*`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn luaopen_rime_neural(l: LuaState) -> c_int {
-    catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: Pin module before spawning any threads or returning exported closures; refuse
-        // to load if pinning fails so `lua_close()` can never unload active ORT/UIA threads.
-        let pinned =
-            unsafe { lua_api::pin_self_module(luaopen_rime_neural as *const std::ffi::c_void) };
+pub unsafe extern "C-unwind" fn luaopen_rime_neural(l: LuaState) -> c_int {
+    // Resolve Lua 5.4 host symbols & verify ABI BEFORE pinning this DLL permanently in memory.
+    // SAFETY: Dynamic lookup against loaded host modules (`rime.dll` / `librime.dll` / `lua54.dll`).
+    let Ok(api) = (unsafe { get_api() }) else {
+        return 0;
+    };
+    // SAFETY: `l` is a valid `lua_State*` passed by `package.loadlib`.
+    unsafe {
+        if !check_lua54_abi(api, l) || (api.checkstack)(l, 8) == 0 {
+            return 0;
+        }
+        // Pin module before returning exported closures so `lua_close()` during Rime redeploys
+        // can never unload active ORT or UIA worker threads.
+        let pinned = lua_api::pin_self_module(luaopen_rime_neural as *const std::ffi::c_void);
         if !pinned {
-            return 0;
+            push_str(api, l, "failed to pin rime_neural.dll in host process");
+            return 1;
         }
-        // SAFETY: Resolve Lua 5.4 C API from host `rime.dll` and verify ABI compatibility.
-        let Ok(api) = (unsafe { get_api() }) else {
-            return 0;
-        };
-        // SAFETY: `l` is a valid `lua_State*` passed by `package.loadlib`.
-        unsafe {
-            if !check_lua54_abi(api, l) || (api.checkstack)(l, 6) == 0 {
-                return 0;
-            }
-            (api.createtable)(l, 0, 11);
 
-            macro_rules! export_fn {
-                ($name:literal, $func:ident) => {
-                    rawset_field(api, l, $name, |api, l| {
-                        (api.pushcclosure)(l, $func, 0);
-                    });
-                };
-            }
+        (api.createtable)(l, 0, 12);
 
-            export_fn!("init", lua_init);
-            export_fn!("init_async", lua_init_async);
-            export_fn!("is_ready", lua_is_ready);
-            export_fn!("resolve_layout", lua_resolve_layout);
-            export_fn!("set_uia_enabled", lua_set_uia_enabled);
-            export_fn!("query_uia_context", lua_query_uia_context);
-            export_fn!("kick_uia_refresh", lua_kick_uia_refresh);
-            export_fn!("kick_uia_after_commit", lua_kick_uia_after_commit);
-            export_fn!("rerank", lua_rerank);
-            export_fn!("log_feedback", lua_log_feedback);
-            export_fn!("stats", lua_stats);
+        macro_rules! export_fn {
+            ($name:literal, $func:ident) => {
+                rawset_field(api, l, $name, |api, l| {
+                    (api.pushcclosure)(l, $func, 0);
+                });
+            };
         }
+
+        rawset_field(api, l, "version", |api, l| push_str(api, l, PKG_VERSION));
+        export_fn!("init", lua_init);
+        export_fn!("init_async", lua_init_async);
+        export_fn!("is_ready", lua_is_ready);
+        export_fn!("resolve_layout", lua_resolve_layout);
+        export_fn!("set_uia_enabled", lua_set_uia_enabled);
+        export_fn!("query_uia_context", lua_query_uia_context);
+        export_fn!("kick_uia_refresh", lua_kick_uia_refresh);
+        export_fn!("kick_uia_after_commit", lua_kick_uia_after_commit);
+        export_fn!("rerank", lua_rerank);
+        export_fn!("log_feedback", lua_log_feedback);
+        export_fn!("stats", lua_stats);
         1
-    }))
-    .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::ffi::c_char;
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    enum MockVal {
+        Nil,
+        Bool(bool),
+        Num(f64),
+        Int(i64),
+        Str(String),
+        Arr(Vec<MockVal>),
+        Map(HashMap<String, MockVal>),
+    }
+
+    struct MockLua {
+        stack: Vec<MockVal>,
+    }
+
+    static MOCK_LOCK: Mutex<()> = Mutex::new(());
+
+    impl MockLua {
+        fn resolve(&self, idx: c_int) -> usize {
+            if idx < 0 {
+                (self.stack.len() as isize + idx as isize) as usize
+            } else {
+                (idx - 1) as usize
+            }
+        }
+    }
+
+    unsafe extern "C-unwind" fn m_version(_: LuaState) -> lua_api::LuaNumber {
+        504.0
+    }
+    unsafe extern "C-unwind" fn m_checkstack(_: LuaState, _: c_int) -> c_int {
+        1
+    }
+    unsafe extern "C-unwind" fn m_gettop(l: LuaState) -> c_int {
+        // SAFETY: `l` points to a test-owned `MockLua`.
+        unsafe { (*(l as *mut MockLua)).stack.len() as c_int }
+    }
+    unsafe extern "C-unwind" fn m_createtable(_: LuaState, _: c_int, _: c_int) {}
+    unsafe extern "C-unwind" fn m_pushcclosure(_: LuaState, _: lua_api::LuaCFunction, _: c_int) {}
+    unsafe extern "C-unwind" fn m_rawget(l: LuaState, idx: c_int) -> c_int {
+        // SAFETY: `l` points to a test-owned `MockLua`.
+        let st = unsafe { &mut *(l as *mut MockLua) };
+        let t_idx = st.resolve(idx);
+        let key = match st.stack.pop() {
+            Some(MockVal::Str(s)) => s,
+            _ => String::new(),
+        };
+        let val = match st.stack.get(t_idx) {
+            Some(MockVal::Map(m)) => m.get(&key).cloned().unwrap_or(MockVal::Nil),
+            _ => MockVal::Nil,
+        };
+        st.stack.push(val);
+        0
+    }
+    unsafe extern "C-unwind" fn m_rawset(_: LuaState, _: c_int) {}
+    unsafe extern "C-unwind" fn m_type(l: LuaState, idx: c_int) -> c_int {
+        // SAFETY: `l` points to a test-owned `MockLua`.
+        let st = unsafe { &*(l as *const MockLua) };
+        let pos = st.resolve(idx);
+        match st.stack.get(pos) {
+            Some(MockVal::Bool(_)) => LUA_TBOOLEAN,
+            Some(MockVal::Str(_)) => LUA_TSTRING,
+            Some(MockVal::Arr(_)) | Some(MockVal::Map(_)) => LUA_TTABLE,
+            Some(MockVal::Num(_)) | Some(MockVal::Int(_)) => 3,
+            _ => 0,
+        }
+    }
+    unsafe extern "C-unwind" fn m_tolstring(
+        l: LuaState,
+        idx: c_int,
+        out_len: *mut usize,
+    ) -> *const c_char {
+        // SAFETY: `l` points to a test-owned `MockLua`; string remains alive on stack.
+        let st = unsafe { &*(l as *const MockLua) };
+        let pos = st.resolve(idx);
+        if let Some(MockVal::Str(s)) = st.stack.get(pos) {
+            if !out_len.is_null() {
+                // SAFETY: Caller passes valid out pointer.
+                unsafe {
+                    *out_len = s.len();
+                }
+            }
+            s.as_ptr() as *const c_char
+        } else {
+            std::ptr::null()
+        }
+    }
+    unsafe extern "C-unwind" fn m_pushlstring(
+        l: LuaState,
+        s: *const c_char,
+        len: usize,
+    ) -> *const c_char {
+        // SAFETY: `s` points to `len` readable bytes passed from Rust `push_str`.
+        let bytes = unsafe { std::slice::from_raw_parts(s as *const u8, len) };
+        let owned = String::from_utf8_lossy(bytes).into_owned();
+        // SAFETY: `l` points to a test-owned `MockLua`.
+        let st = unsafe { &mut *(l as *mut MockLua) };
+        st.stack.push(MockVal::Str(owned));
+        std::ptr::null()
+    }
+    unsafe extern "C-unwind" fn m_pushboolean(_: LuaState, _: c_int) {}
+    unsafe extern "C-unwind" fn m_pushinteger(_: LuaState, _: LuaInteger) {}
+    unsafe extern "C-unwind" fn m_pushnumber(_: LuaState, _: lua_api::LuaNumber) {}
+    unsafe extern "C-unwind" fn m_pushnil(_: LuaState) {}
+    unsafe extern "C-unwind" fn m_toboolean(l: LuaState, idx: c_int) -> c_int {
+        // SAFETY: `l` points to a test-owned `MockLua`.
+        let st = unsafe { &*(l as *const MockLua) };
+        match st.stack.get(st.resolve(idx)) {
+            Some(MockVal::Bool(false)) | Some(MockVal::Nil) | None => 0,
+            _ => 1,
+        }
+    }
+    unsafe extern "C-unwind" fn m_tointegerx(
+        l: LuaState,
+        idx: c_int,
+        isnum: *mut c_int,
+    ) -> LuaInteger {
+        // SAFETY: `l` points to a test-owned `MockLua`.
+        let st = unsafe { &*(l as *const MockLua) };
+        let (ok, val) = match st.stack.get(st.resolve(idx)) {
+            Some(MockVal::Int(i)) => (1, *i),
+            Some(MockVal::Num(f)) if f.is_finite() && f.fract() == 0.0 => (1, *f as i64),
+            _ => (0, 0),
+        };
+        if !isnum.is_null() {
+            // SAFETY: Caller passes valid out pointer.
+            unsafe {
+                *isnum = ok;
+            }
+        }
+        val
+    }
+    unsafe extern "C-unwind" fn m_tonumberx(
+        l: LuaState,
+        idx: c_int,
+        isnum: *mut c_int,
+    ) -> lua_api::LuaNumber {
+        // SAFETY: `l` points to a test-owned `MockLua`.
+        let st = unsafe { &*(l as *const MockLua) };
+        let (ok, val) = match st.stack.get(st.resolve(idx)) {
+            Some(MockVal::Num(f)) => (1, *f),
+            Some(MockVal::Int(i)) => (1, *i as f64),
+            _ => (0, 0.0),
+        };
+        if !isnum.is_null() {
+            // SAFETY: Caller passes valid out pointer.
+            unsafe {
+                *isnum = ok;
+            }
+        }
+        val
+    }
+    unsafe extern "C-unwind" fn m_rawlen(l: LuaState, idx: c_int) -> u64 {
+        // SAFETY: `l` points to a test-owned `MockLua`.
+        let st = unsafe { &*(l as *const MockLua) };
+        match st.stack.get(st.resolve(idx)) {
+            Some(MockVal::Arr(v)) => v.len() as u64,
+            _ => 0,
+        }
+    }
+    unsafe extern "C-unwind" fn m_rawgeti(l: LuaState, idx: c_int, n: LuaInteger) -> c_int {
+        // SAFETY: `l` points to a test-owned `MockLua`.
+        let st = unsafe { &mut *(l as *mut MockLua) };
+        let pos = st.resolve(idx);
+        let val = match st.stack.get(pos) {
+            Some(MockVal::Arr(v)) if n >= 1 => {
+                v.get((n - 1) as usize).cloned().unwrap_or(MockVal::Nil)
+            }
+            _ => MockVal::Nil,
+        };
+        st.stack.push(val);
+        0
+    }
+    unsafe extern "C-unwind" fn m_rawseti(_: LuaState, _: c_int, _: LuaInteger) {}
+    unsafe extern "C-unwind" fn m_settop(l: LuaState, idx: c_int) {
+        // SAFETY: `l` points to a test-owned `MockLua`.
+        let st = unsafe { &mut *(l as *mut MockLua) };
+        let new_len = if idx < 0 {
+            (st.stack.len() as isize + idx as isize + 1).max(0) as usize
+        } else {
+            idx as usize
+        };
+        st.stack.truncate(new_len);
+    }
+
+    fn mock_lua_api() -> LuaApi {
+        LuaApi {
+            version: m_version,
+            checkstack: m_checkstack,
+            gettop: m_gettop,
+            createtable: m_createtable,
+            pushcclosure: m_pushcclosure,
+            rawget: m_rawget,
+            rawset: m_rawset,
+            lua_type: m_type,
+            tolstring: m_tolstring,
+            pushlstring: m_pushlstring,
+            pushboolean: m_pushboolean,
+            pushinteger: m_pushinteger,
+            pushnumber: m_pushnumber,
+            pushnil: m_pushnil,
+            toboolean: m_toboolean,
+            tointegerx: m_tointegerx,
+            tonumberx: m_tonumberx,
+            rawlen: m_rawlen,
+            rawgeti: m_rawgeti,
+            rawseti: m_rawseti,
+            settop: m_settop,
+        }
+    }
+
+    #[test]
+    fn test_read_weights_preserves_f64_precision_and_defaults_on_nil_or_nan() {
+        let _g = MOCK_LOCK.lock().unwrap();
+        let api = mock_lua_api();
+        let mut lua = MockLua {
+            stack: vec![MockVal::Arr(vec![
+                MockVal::Num(1.0),
+                MockVal::Nil,
+                MockVal::Num(0.05),
+                MockVal::Num(f64::NAN),
+                MockVal::Num(0.25),
+            ])],
+        };
+        let ptr = (&mut lua as *mut MockLua) as LuaState;
+        // SAFETY: `ptr` points to live `MockLua`.
+        let w = unsafe { read_weights(&api, ptr, 1) };
+        assert_eq!(w.w_logit, 1.0);
+        assert_eq!(w.w_rank, FusionWeights::default().w_rank);
+        assert_eq!(w.w_gram, 0.05); // exact f64 (no f32 drift)
+        assert_eq!(w.w_char_lp, FusionWeights::default().w_char_lp);
+        assert_eq!(w.w_ctx_lp, 0.25);
+        assert_eq!(lua.stack.len(), 1);
+    }
+
+    #[test]
+    fn test_read_gram_req_handles_disabled_and_custom_tables() {
+        let _g = MOCK_LOCK.lock().unwrap();
+        let api = mock_lua_api();
+        let mut disabled_map = HashMap::new();
+        disabled_map.insert("enabled".to_string(), MockVal::Bool(false));
+        let mut custom_map = HashMap::new();
+        custom_map.insert(
+            "path".to_string(),
+            MockVal::Str("C:\\fake.gram".to_string()),
+        );
+        custom_map.insert("col_penalty".to_string(), MockVal::Num(-14.0));
+        custom_map.insert("non_col_penalty".to_string(), MockVal::Num(-4.0));
+        custom_map.insert("max_length".to_string(), MockVal::Int(7));
+
+        let mut lua = MockLua {
+            stack: vec![
+                MockVal::Nil,
+                MockVal::Map(disabled_map),
+                MockVal::Map(custom_map),
+            ],
+        };
+        let ptr = (&mut lua as *mut MockLua) as LuaState;
+        // SAFETY: `ptr` points to live `MockLua`.
+        unsafe {
+            assert_eq!(read_gram_req(&api, ptr, 1), GramRequest::Default);
+            assert_eq!(read_gram_req(&api, ptr, 2), GramRequest::Disabled);
+            assert_eq!(
+                read_gram_req(&api, ptr, 3),
+                GramRequest::custom(PathBuf::from("C:\\fake.gram"), -14.0, -4.0, 7)
+            );
+            assert_eq!(lua.stack.len(), 3);
+        }
+    }
 }

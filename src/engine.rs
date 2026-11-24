@@ -140,10 +140,8 @@ pub enum GramRequest {
     /// Use the default `.gram` configured at engine initialization.
     Default,
     /// Explicitly disable `.gram` scoring for this schema.
-    #[allow(dead_code)]
     Disabled,
     /// Evaluate with an explicit `.gram` path and per-schema penalties / collocation window.
-    #[allow(dead_code)]
     Custom {
         path: PathBuf,
         collocation_penalty: u64,
@@ -153,7 +151,6 @@ pub enum GramRequest {
 }
 
 impl GramRequest {
-    #[allow(dead_code)]
     pub fn custom(
         path: PathBuf,
         collocation_penalty: f64,
@@ -178,9 +175,7 @@ pub struct RerankResult {
     pub logits: Vec<f32>,
     pub gram_deltas: Vec<f32>,
     pub char_lps: Vec<f32>,
-    #[allow(dead_code)]
     pub has_ctx: bool,
-    #[allow(dead_code)]
     pub has_gram: bool,
 }
 
