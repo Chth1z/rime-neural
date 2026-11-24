@@ -21,7 +21,7 @@ extern "system" {
 
 /// Pin `rime_neural.dll` for the lifetime of the host process (`WeaselServer.exe`) so that
 /// `lua_close()` during Rime redeploy (`FreeLibrary` on `_CLIBS`) never unmaps the DLL while
-/// ONNX Runtime thread pools, the async loader thread, or the UIA STA thread are active, and
+/// ONNX Runtime thread pools, the async loader thread, or the UIA worker thread are active, and
 /// subsequent redeploys reuse the already-warmed process singleton in 0 ms.
 pub unsafe fn pin_self_module(addr_inside_dll: *const c_void) {
     let mut hmod: *mut c_void = std::ptr::null_mut();
@@ -38,7 +38,7 @@ pub struct LuaApi {
     pub createtable: unsafe extern "C" fn(LuaState, c_int, c_int),
     pub pushcclosure: unsafe extern "C" fn(LuaState, LuaCFunction, c_int),
     pub setfield: unsafe extern "C" fn(LuaState, c_int, *const c_char),
-    pub getfield: unsafe extern "C" fn(LuaState, c_int, *const c_char) -> c_int,
+    pub rawget: unsafe extern "C" fn(LuaState, c_int) -> c_int,
     pub lua_type: unsafe extern "C" fn(LuaState, c_int) -> c_int,
     pub tolstring: unsafe extern "C" fn(LuaState, c_int, *mut usize) -> *const c_char,
     pub pushlstring: unsafe extern "C" fn(LuaState, *const c_char, usize) -> *const c_char,
@@ -49,7 +49,7 @@ pub struct LuaApi {
     pub toboolean: unsafe extern "C" fn(LuaState, c_int) -> c_int,
     pub tointegerx: unsafe extern "C" fn(LuaState, c_int, *mut c_int) -> LuaInteger,
     pub tonumberx: unsafe extern "C" fn(LuaState, c_int, *mut c_int) -> LuaNumber,
-    pub rawlen: unsafe extern "C" fn(LuaState, c_int) -> usize,
+    pub rawlen: unsafe extern "C" fn(LuaState, c_int) -> u64,
     pub rawgeti: unsafe extern "C" fn(LuaState, c_int, LuaInteger) -> c_int,
     pub rawseti: unsafe extern "C" fn(LuaState, c_int, LuaInteger),
     pub settop: unsafe extern "C" fn(LuaState, c_int),
@@ -80,7 +80,7 @@ pub unsafe fn get_api() -> Result<&'static LuaApi, &'static str> {
             createtable: sym!("lua_createtable"),
             pushcclosure: sym!("lua_pushcclosure"),
             setfield: sym!("lua_setfield"),
-            getfield: sym!("lua_getfield"),
+            rawget: sym!("lua_rawget"),
             lua_type: sym!("lua_type"),
             tolstring: sym!("lua_tolstring"),
             pushlstring: sym!("lua_pushlstring"),

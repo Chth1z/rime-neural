@@ -141,11 +141,12 @@ struct CachedEval {
     used_fused_kv: bool,
 }
 
-#[derive(Hash, PartialEq, Eq, Clone)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct CacheKey {
     ctx_tail: String,
     raw_input: String,
     layout: PinyinLayout,
+    weights_bits: [u64; 5],
     p2c_verify_margin_bits: u32,
     cands: Vec<String>,
 }
@@ -346,7 +347,8 @@ pub struct NeuralEngine {
     pub stats: EngineStats,
 }
 
-static ORT_ENV: OnceLock<Result<Environment, String>> = OnceLock::new();
+static ORT_ENV: OnceLock<Environment> = OnceLock::new();
+static INIT_LOCK: Mutex<()> = Mutex::new(());
 static ENGINE: OnceLock<Mutex<NeuralEngine>> = OnceLock::new();
 static ASYNC_STARTED: AtomicBool = AtomicBool::new(false);
 static LAST_INIT_ERROR: Mutex<Option<String>> = Mutex::new(None);
@@ -361,18 +363,22 @@ pub fn last_init_error() -> Option<String> {
     LAST_INIT_ERROR.lock().ok().and_then(|g| g.clone())
 }
 
+/// Retryable ORT environment initialization: transient errors (e.g. temporarily missing DLL)
+/// are not cached permanently in `ORT_ENV`. Caller holds `INIT_LOCK`.
 fn ensure_ort_env(ort_dll: &Path) -> Result<&'static Environment, String> {
+    if let Some(env) = ORT_ENV.get() {
+        return Ok(env);
+    }
+    let env = ort::init_from(ort_dll)
+        .map_err(|e| format!("ort::init_from({}) failed: {}", ort_dll.display(), e))?
+        .with_name("rime_neural")
+        .with_telemetry(false)
+        .build()
+        .map_err(|e| format!("ort env build failed: {}", e))?;
+    let _ = ORT_ENV.set(env);
     ORT_ENV
-        .get_or_init(|| {
-            ort::init_from(ort_dll)
-                .map_err(|e| format!("ort::init_from({}) failed: {}", ort_dll.display(), e))?
-                .with_name("rime_neural")
-                .with_telemetry(false)
-                .build()
-                .map_err(|e| format!("ort env build failed: {}", e))
-        })
-        .as_ref()
-        .map_err(|e| e.clone())
+        .get()
+        .ok_or_else(|| "ORT_ENV initialization race".to_string())
 }
 
 fn resolve_threads(requested: usize) -> usize {
@@ -476,8 +482,35 @@ fn introspect_kv_dims(session: &Session) -> (bool, usize, usize, usize, usize) {
     )
 }
 
+fn maybe_attach_gram(cfg: &InitConfig) {
+    let Some(ref gpath) = cfg.gram_path else {
+        return;
+    };
+    let Some(mutex) = ENGINE.get() else {
+        return;
+    };
+    let Ok(mut eng) = mutex.lock() else {
+        return;
+    };
+    if eng.gram.is_some() || !gpath.is_file() {
+        return;
+    }
+    if let Ok(g) = WanxiangGram::open(
+        gpath,
+        cfg.gram_collocation_penalty,
+        cfg.gram_non_collocation_penalty,
+    ) {
+        eng.gram = Some(g);
+        eng.stats.has_gram = true;
+        eng.lru_map.clear();
+        eng.lru_order.clear();
+    }
+}
+
 pub fn init_engine(cfg: &InitConfig) -> Result<(), String> {
+    let _guard = INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if ENGINE.get().is_some() {
+        maybe_attach_gram(cfg);
         return Ok(());
     }
     let res = init_engine_inner(cfg);
@@ -732,6 +765,7 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
 
 pub fn init_engine_async(cfg: InitConfig) {
     if ENGINE.get().is_some() {
+        maybe_attach_gram(&cfg);
         return;
     }
     if ASYNC_STARTED.swap(true, Ordering::AcqRel) {
@@ -828,6 +862,18 @@ fn rank_order_from_features(
     scored.into_iter().map(|(idx, _)| idx).collect()
 }
 
+fn sanitize_special_tokens(text: &str) -> Cow<'_, str> {
+    if text.contains("<mask>") || text.contains("<bos>") || text.contains("<eos>") {
+        Cow::Owned(
+            text.replace("<mask>", " ")
+                .replace("<bos>", " ")
+                .replace("<eos>", " "),
+        )
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
 impl NeuralEngine {
     #[inline]
     fn lookup_unit_id(&self, kind: &str, text: &str) -> i64 {
@@ -839,11 +885,7 @@ impl NeuralEngine {
     }
 
     fn encode_ids(&self, text: &str) -> Vec<i64> {
-        let cleaned: Cow<'_, str> = if text.contains("<mask>") {
-            Cow::Owned(text.replace("<mask>", " "))
-        } else {
-            Cow::Borrowed(text)
-        };
+        let cleaned = sanitize_special_tokens(text);
         match self.tokenizer.encode(cleaned.as_ref(), false) {
             Ok(enc) => enc.get_ids().iter().map(|&x| x as i64).collect(),
             Err(_) => Vec::new(),
@@ -852,11 +894,7 @@ impl NeuralEngine {
 
     fn encode_candidate_ids(&self, text: &str) -> Vec<i64> {
         if self.choice_compact {
-            let cleaned: Cow<'_, str> = if text.contains("<mask>") {
-                Cow::Owned(text.replace("<mask>", " "))
-            } else {
-                Cow::Borrowed(text)
-            };
+            let cleaned = sanitize_special_tokens(text);
             let tok = self
                 .tokenizer_no_prepend
                 .as_ref()
@@ -1007,6 +1045,13 @@ impl NeuralEngine {
             ctx_tail: ctx_tail.to_string(),
             raw_input: raw_input.to_string(),
             layout,
+            weights_bits: [
+                weights.w_logit.to_bits(),
+                weights.w_rank.to_bits(),
+                weights.w_gram.to_bits(),
+                weights.w_char_lp.to_bits(),
+                weights.w_ctx_lp.to_bits(),
+            ],
             p2c_verify_margin_bits: p2c_verify_margin.to_bits(),
             cands: cands.to_vec(),
         };
@@ -1259,7 +1304,14 @@ impl NeuralEngine {
         let (_, l_slice) = outputs["logits"]
             .try_extract_tensor::<f32>()
             .map_err(|e| format!("logits: {}", e))?;
-        let logits: Vec<f32> = l_slice.iter().take(n_markers).copied().collect();
+        if l_slice.len() < n_markers {
+            return Err(format!(
+                "logits length {} < n_markers {}",
+                l_slice.len(),
+                n_markers
+            ));
+        }
+        let logits: Vec<f32> = l_slice[..n_markers].to_vec();
 
         if let Some((cands, orig_units_len, shifted_lcp)) = decode_p2c {
             if self.has_char_logits {
@@ -1361,7 +1413,14 @@ impl NeuralEngine {
         let (_, l_slice) = outputs["logits"]
             .try_extract_tensor::<f32>()
             .map_err(|e| format!("logits: {}", e))?;
-        let logits: Vec<f32> = l_slice.iter().take(n_markers).copied().collect();
+        if l_slice.len() < n_markers {
+            return Err(format!(
+                "logits length {} < n_markers {}",
+                l_slice.len(),
+                n_markers
+            ));
+        }
+        let logits: Vec<f32> = l_slice[..n_markers].to_vec();
 
         if self.has_char_logits {
             let (c_shape, c_slice) = outputs["char_logits"]
@@ -1564,5 +1623,45 @@ mod tests {
         let clps = [0.0f32, 0.0, 0.0];
         let order = rank_order_from_features(&logits, &grams, &clps, 0.0, FusionWeights::default());
         assert_eq!(order, vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn test_sanitize_special_tokens_strips_bos_eos_mask() {
+        assert_eq!(sanitize_special_tokens("普通文本").as_ref(), "普通文本");
+        assert_eq!(
+            sanitize_special_tokens("a<bos>b<eos>c<mask>d").as_ref(),
+            "a b c d"
+        );
+    }
+
+    #[test]
+    fn test_cache_key_distinguishes_fusion_weights() {
+        let w1 = FusionWeights::default();
+        let w2 = FusionWeights { w_rank: -0.5, ..w1 };
+        let k1 = CacheKey {
+            ctx_tail: "你好".to_string(),
+            raw_input: "nihk".to_string(),
+            layout: PinyinLayout::Zrm,
+            weights_bits: [
+                w1.w_logit.to_bits(),
+                w1.w_rank.to_bits(),
+                w1.w_gram.to_bits(),
+                w1.w_char_lp.to_bits(),
+                w1.w_ctx_lp.to_bits(),
+            ],
+            p2c_verify_margin_bits: 0.2f32.to_bits(),
+            cands: vec!["你好".to_string()],
+        };
+        let k2 = CacheKey {
+            weights_bits: [
+                w2.w_logit.to_bits(),
+                w2.w_rank.to_bits(),
+                w2.w_gram.to_bits(),
+                w2.w_char_lp.to_bits(),
+                w2.w_ctx_lp.to_bits(),
+            ],
+            ..k1.clone()
+        };
+        assert_ne!(k1, k2);
     }
 }

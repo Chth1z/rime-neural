@@ -695,8 +695,14 @@ fn greedy_split_chunk(
             }
         }
         if !matched {
-            out.push(("p", chunk[pos..pos + 1].to_string()));
-            pos += 1;
+            let rem = &chunk[pos..];
+            if rem.starts_with("zh") || rem.starts_with("ch") || rem.starts_with("sh") {
+                out.push(("p", rem[..2].to_string()));
+                pos += 2;
+            } else {
+                out.push(("p", rem[..1].to_string()));
+                pos += 1;
+            }
         }
     }
 }
@@ -711,42 +717,6 @@ pub fn full_pinyin_to_units(
     readings: &HashMap<String, Vec<String>>,
     valid_syllables: &HashSet<String>,
 ) -> Vec<(&'static str, String)> {
-    // Fast path: explicit space/apostrophe-delimited full syllables (e.g. `xi'an`, `ce'lue`, `wo men`)
-    if raw_input.contains(' ') || raw_input.contains('\'') {
-        let parts: Vec<String> = raw_input
-            .split([' ', '\''])
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                s.bytes()
-                    .filter(|b| b.is_ascii_alphabetic())
-                    .map(|b| b.to_ascii_lowercase() as char)
-                    .collect::<String>()
-            })
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !parts.is_empty() {
-            let resolved: Option<Vec<String>> = parts
-                .into_iter()
-                .map(|p| {
-                    if valid_syllables.contains(&p) {
-                        Some(p)
-                    } else if let Some(canon) = canonical_alias(&p) {
-                        if valid_syllables.contains(canon) {
-                            Some(canon.to_string())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if let Some(syllables) = resolved {
-                return syllables.into_iter().map(|p| ("f", p)).collect();
-            }
-        }
-    }
-
     // Build contiguous alpha code + bitmask of explicit separator positions so `walk` never crosses `'`
     let mut code = String::with_capacity(raw_input.len());
     let mut must_break = vec![false; raw_input.len() + 1];
@@ -1347,5 +1317,45 @@ mod tests {
                 tested
             );
         }
+    }
+
+    #[test]
+    fn test_full_pinyin_separator_with_abbrev_and_partial_split() {
+        let mut valid = sample_valid_syllables();
+        for s in ["fang", "an", "xi", "xian", "shi"] {
+            valid.insert(s.to_string());
+        }
+        let mut readings: HashMap<String, Vec<String>> = HashMap::new();
+        readings.insert("方".to_string(), vec!["fang".to_string()]);
+        readings.insert("案".to_string(), vec!["an".to_string()]);
+        readings.insert("西".to_string(), vec!["xi".to_string()]);
+        readings.insert("安".to_string(), vec!["an".to_string()]);
+        readings.insert("市".to_string(), vec!["shi".to_string()]);
+
+        // `fang'a` -> 方案: second slot must be partial `a` (for `an`), not full syllable `a`
+        let u1 = full_pinyin_to_units("fang'a", "方案", &readings, &valid);
+        assert_eq!(u1, vec![("f", "fang".to_string()), ("p", "a".to_string())]);
+
+        // `xian'shi` -> 西安市: 3-char lead_text aligns to [xi, an, shi], not 2-slot [xian, shi]
+        let u2 = full_pinyin_to_units("xian'shi", "西安市", &readings, &valid);
+        assert_eq!(
+            u2,
+            vec![
+                ("f", "xi".to_string()),
+                ("f", "an".to_string()),
+                ("f", "shi".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_greedy_split_preserves_zh_ch_sh_initials() {
+        let mut valid = sample_valid_syllables();
+        valid.insert("wen".to_string());
+        let readings: HashMap<String, Vec<String>> = HashMap::new();
+        // `zhonwen` (fuzzy `zhong` -> `zhon`) falls back to greedy split; must keep `zh` intact
+        let u = full_pinyin_to_units("zhonwen", "中文", &readings, &valid);
+        assert_eq!(u[0], ("p", "zh".to_string()));
+        assert_eq!(u.last().unwrap(), &("f", "wen".to_string()));
     }
 }

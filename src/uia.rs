@@ -165,32 +165,45 @@ mod win_impl {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
     use std::sync::mpsc::{self, SyncSender};
-    use std::sync::{OnceLock, RwLock};
+    use std::sync::{Mutex, OnceLock, RwLock};
     use std::thread;
 
-    use windows::core::PWSTR;
+    use windows::core::{Interface, PWSTR};
     use windows::Win32::Foundation::{CloseHandle, HWND};
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-        COINIT_APARTMENTTHREADED,
+        COINIT_MULTITHREADED,
     };
     use windows::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows::Win32::UI::Accessibility::{
-        CUIAutomation, IUIAutomation, IUIAutomationTextPattern, IUIAutomationValuePattern,
-        TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start, TextUnit_Character,
-        UIA_EditControlTypeId, UIA_TextPatternId, UIA_ValuePatternId,
+        CUIAutomation, CUIAutomation8, IUIAutomation, IUIAutomation6, IUIAutomationTextPattern,
+        IUIAutomationValuePattern, TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start,
+        TextUnit_Character, UIA_EditControlTypeId, UIA_TextPatternId, UIA_ValuePatternId,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetAncestor, GetForegroundWindow, GetWindowThreadProcessId, GA_ROOT,
+    };
+
+    const UIA_TIMEOUT_MS: u32 = 200;
+
+    struct ComGuard;
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            unsafe {
+                CoUninitialize();
+            }
+        }
+    }
 
     struct UiaSnapshot {
         hwnd: isize,
         is_password: bool,
         readable: bool,
         before_caret: String,
-        updated_at: Instant,
+        updated_at: Option<Instant>,
     }
 
     struct UiaRuntime {
@@ -200,8 +213,7 @@ mod win_impl {
 
     static RUNTIME: OnceLock<UiaRuntime> = OnceLock::new();
     static LAST_SEEN_HWND: AtomicIsize = AtomicIsize::new(0);
-    static LAST_DENIED_HWND: AtomicIsize = AtomicIsize::new(0);
-    static LAST_DENIED_STATE: AtomicBool = AtomicBool::new(false);
+    static LAST_DENIED: Mutex<(isize, bool)> = Mutex::new((0, false));
     static ENABLED: AtomicBool = AtomicBool::new(false);
     static POST_COMMIT_PENDING: AtomicBool = AtomicBool::new(false);
 
@@ -244,17 +256,30 @@ mod win_impl {
         if raw == 0 {
             return false;
         }
-        if LAST_DENIED_HWND.load(Ordering::Acquire) == raw {
-            return LAST_DENIED_STATE.load(Ordering::Acquire);
+        if let Ok(guard) = LAST_DENIED.lock() {
+            if guard.0 == raw {
+                return guard.1;
+            }
         }
         let mut pid: u32 = 0;
         unsafe {
             GetWindowThreadProcessId(hwnd, Some(&mut pid));
         }
         let denied = is_denied_pid(pid);
-        LAST_DENIED_STATE.store(denied, Ordering::Release);
-        LAST_DENIED_HWND.store(raw, Ordering::Release);
+        if let Ok(mut guard) = LAST_DENIED.lock() {
+            *guard = (raw, denied);
+        }
         denied
+    }
+
+    fn unreadable_snapshot(hwnd_raw: isize, is_password: bool, now: Instant) -> UiaSnapshot {
+        UiaSnapshot {
+            hwnd: hwnd_raw,
+            is_password,
+            readable: false,
+            before_caret: String::new(),
+            updated_at: Some(now),
+        }
     }
 
     fn probe_once(automation: &IUIAutomation) -> UiaSnapshot {
@@ -262,61 +287,41 @@ mod win_impl {
         let hwnd = unsafe { GetForegroundWindow() };
         let hwnd_raw = hwnd.0 as isize;
         if hwnd_raw == 0 {
-            return UiaSnapshot {
-                hwnd: 0,
-                is_password: false,
-                readable: false,
-                before_caret: String::new(),
-                updated_at: now,
-            };
+            return unreadable_snapshot(0, false, now);
         }
 
         if is_denied_hwnd_cached(hwnd) {
-            return UiaSnapshot {
-                hwnd: hwnd_raw,
-                is_password: true,
-                readable: false,
-                before_caret: String::new(),
-                updated_at: now,
-            };
+            return unreadable_snapshot(hwnd_raw, true, now);
         }
 
         let focused = match unsafe { automation.GetFocusedElement() } {
             Ok(el) => el,
             Err(_) => {
-                return UiaSnapshot {
-                    hwnd: hwnd_raw,
-                    is_password: false,
-                    readable: false,
-                    before_caret: String::new(),
-                    updated_at: now,
-                };
+                return unreadable_snapshot(hwnd_raw, false, now);
             }
         };
+
+        // Verify focused element belongs to the sampled foreground root window when a native HWND is reported
+        if let Ok(el_hwnd) = unsafe { focused.CurrentNativeWindowHandle() } {
+            if !el_hwnd.0.is_null() {
+                let root = unsafe { GetAncestor(el_hwnd, GA_ROOT) };
+                if !root.0.is_null() && root.0 as isize != hwnd_raw {
+                    return unreadable_snapshot(hwnd_raw, false, now);
+                }
+            }
+        }
 
         // Also check focused element's own PID against the password-manager denylist
         if let Ok(fpid) = unsafe { focused.CurrentProcessId() } {
             if fpid > 0 && is_denied_pid(fpid as u32) {
-                return UiaSnapshot {
-                    hwnd: hwnd_raw,
-                    is_password: true,
-                    readable: false,
-                    before_caret: String::new(),
-                    updated_at: now,
-                };
+                return unreadable_snapshot(hwnd_raw, true, now);
             }
         }
 
         // Hard password check
         if let Ok(is_pw) = unsafe { focused.CurrentIsPassword() } {
             if is_pw.as_bool() {
-                return UiaSnapshot {
-                    hwnd: hwnd_raw,
-                    is_password: true,
-                    readable: false,
-                    before_caret: String::new(),
-                    updated_at: now,
-                };
+                return unreadable_snapshot(hwnd_raw, true, now);
             }
         }
 
@@ -375,13 +380,17 @@ mod win_impl {
                                             };
                                         }
                                     }
-                                    if let Ok(bstr) = unsafe { before.GetText(128) } {
+                                    if let Ok(bstr) = unsafe { before.GetText(512) } {
+                                        // Re-verify foreground window did not change mid-probe (cross-app isolation)
+                                        if unsafe { GetForegroundWindow().0 as isize } != hwnd_raw {
+                                            return unreadable_snapshot(hwnd_raw, false, now);
+                                        }
                                         return UiaSnapshot {
                                             hwnd: hwnd_raw,
                                             is_password: false,
                                             readable: true,
                                             before_caret: bstr.to_string(),
-                                            updated_at: now,
+                                            updated_at: Some(now),
                                         };
                                     }
                                 }
@@ -403,6 +412,9 @@ mod win_impl {
                         .unwrap_or(true);
                     if !is_ro {
                         if let Ok(bstr) = unsafe { val_pat.CurrentValue() } {
+                            if unsafe { GetForegroundWindow().0 as isize } != hwnd_raw {
+                                return unreadable_snapshot(hwnd_raw, false, now);
+                            }
                             let full = bstr.to_string();
                             let tail = tail_utf8_chars(&full, MAX_VALUE_PATTERN_TAIL_CHARS);
                             return UiaSnapshot {
@@ -410,7 +422,7 @@ mod win_impl {
                                 is_password: false,
                                 readable: true,
                                 before_caret: tail.to_string(),
-                                updated_at: now,
+                                updated_at: Some(now),
                             };
                         }
                     }
@@ -418,13 +430,7 @@ mod win_impl {
             }
         }
 
-        UiaSnapshot {
-            hwnd: hwnd_raw,
-            is_password: false,
-            readable: false,
-            before_caret: String::new(),
-            updated_at: now,
-        }
+        unreadable_snapshot(hwnd_raw, false, now)
     }
 
     fn ensure_started() -> &'static UiaRuntime {
@@ -437,25 +443,36 @@ mod win_impl {
                     is_password: false,
                     readable: false,
                     before_caret: String::new(),
-                    updated_at: Instant::now() - Duration::from_secs(60),
+                    updated_at: None,
                 }),
             };
 
             let _ = thread::Builder::new()
                 .name("rime_neural_uia".to_string())
                 .spawn(move || {
-                    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+                    let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
                     if hr.is_err() {
                         return;
                     }
-                    let automation: Result<IUIAutomation, _> =
-                        unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) };
+                    // Declared before `automation` so `IUIAutomation` drops before `CoUninitialize`.
+                    let _com_guard = ComGuard;
+
+                    let automation: Result<IUIAutomation, _> = unsafe {
+                        CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER).or_else(
+                            |_| CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER),
+                        )
+                    };
                     let Ok(automation) = automation else {
-                        unsafe { CoUninitialize() };
                         return;
                     };
+                    if let Ok(auto6) = automation.cast::<IUIAutomation6>() {
+                        unsafe {
+                            let _ = auto6.SetConnectionTimeout(UIA_TIMEOUT_MS);
+                            let _ = auto6.SetTransactionTimeout(UIA_TIMEOUT_MS);
+                        }
+                    }
 
-                    let mut last_probe = Instant::now() - Duration::from_secs(10);
+                    let mut last_probe: Option<Instant> = None;
                     let mut last_hwnd: isize = 0;
 
                     while rx.recv().is_ok() {
@@ -469,7 +486,8 @@ mod win_impl {
                             }
                         } else {
                             let cur_hwnd = unsafe { GetForegroundWindow().0 as isize };
-                            if cur_hwnd == last_hwnd && last_probe.elapsed() < MIN_REFRESH_INTERVAL
+                            if cur_hwnd == last_hwnd
+                                && last_probe.is_some_and(|t| t.elapsed() < MIN_REFRESH_INTERVAL)
                             {
                                 continue;
                             }
@@ -483,8 +501,6 @@ mod win_impl {
                             }
                         }
                     }
-
-                    unsafe { CoUninitialize() };
                 });
 
             runtime
@@ -533,7 +549,7 @@ mod win_impl {
                 if snap.is_password {
                     return UiaContext::Blocked;
                 }
-                if snap.readable && snap.updated_at.elapsed() <= SNAPSHOT_TTL {
+                if snap.readable && snap.updated_at.is_some_and(|t| t.elapsed() <= SNAPSHOT_TTL) {
                     let clean = normalize_before_caret(
                         &snap.before_caret,
                         live_preedit,

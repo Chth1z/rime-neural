@@ -18,7 +18,10 @@ const LUA_TTABLE: c_int = 5;
 const LUA_TSTRING: c_int = 4;
 
 unsafe fn read_str_array(api: &lua_api::LuaApi, l: LuaState, idx: c_int) -> Vec<String> {
-    let n = (api.rawlen)(l, idx);
+    if (api.lua_type)(l, idx) != LUA_TTABLE {
+        return Vec::new();
+    }
+    let n = usize::try_from((api.rawlen)(l, idx)).unwrap_or(0);
     let mut out = Vec::with_capacity(n);
     for i in 1..=(n as LuaInteger) {
         (api.rawgeti)(l, idx, i);
@@ -31,7 +34,10 @@ unsafe fn read_str_array(api: &lua_api::LuaApi, l: LuaState, idx: c_int) -> Vec<
 }
 
 unsafe fn read_f32_array(api: &lua_api::LuaApi, l: LuaState, idx: c_int) -> Vec<f32> {
-    let n = (api.rawlen)(l, idx);
+    if (api.lua_type)(l, idx) != LUA_TTABLE {
+        return Vec::new();
+    }
+    let n = usize::try_from((api.rawlen)(l, idx)).unwrap_or(0);
     let mut out = Vec::with_capacity(n);
     for i in 1..=(n as LuaInteger) {
         (api.rawgeti)(l, idx, i);
@@ -89,10 +95,12 @@ unsafe fn read_table_f32(
     api: &lua_api::LuaApi,
     l: LuaState,
     idx: c_int,
-    field: &std::ffi::CStr,
+    field: &str,
     default_val: f32,
 ) -> f32 {
-    (api.getfield)(l, idx, field.as_ptr());
+    let tbl_idx = if idx < 0 { idx - 1 } else { idx };
+    push_str(api, l, field);
+    (api.rawget)(l, tbl_idx);
     let mut isnum: c_int = 0;
     let v = (api.tonumberx)(l, -1, &mut isnum);
     pop(api, l, 1);
@@ -106,15 +114,15 @@ unsafe fn read_table_f32(
 unsafe fn read_p2c_cfg(api: &lua_api::LuaApi, l: LuaState, idx: c_int) -> P2cConfig {
     let mut cfg = P2cConfig::default();
     if (api.lua_type)(l, idx) == LUA_TTABLE {
-        cfg.verify_margin = read_table_f32(api, l, idx, c"verify_margin", cfg.verify_margin);
-        cfg.top1_logit_diff = read_table_f32(api, l, idx, c"top1_logit_diff", cfg.top1_logit_diff);
+        cfg.verify_margin = read_table_f32(api, l, idx, "verify_margin", cfg.verify_margin);
+        cfg.top1_logit_diff = read_table_f32(api, l, idx, "top1_logit_diff", cfg.top1_logit_diff);
         cfg.top1_min_gram_diff =
-            read_table_f32(api, l, idx, c"top1_min_gram_diff", cfg.top1_min_gram_diff);
-        cfg.top2_logit_diff = read_table_f32(api, l, idx, c"top2_logit_diff", cfg.top2_logit_diff);
+            read_table_f32(api, l, idx, "top1_min_gram_diff", cfg.top1_min_gram_diff);
+        cfg.top2_logit_diff = read_table_f32(api, l, idx, "top2_logit_diff", cfg.top2_logit_diff);
         cfg.legacy_top1_margin =
-            read_table_f32(api, l, idx, c"legacy_top1_margin", cfg.legacy_top1_margin);
+            read_table_f32(api, l, idx, "legacy_top1_margin", cfg.legacy_top1_margin);
         cfg.legacy_top2_margin =
-            read_table_f32(api, l, idx, c"legacy_top2_margin", cfg.legacy_top2_margin);
+            read_table_f32(api, l, idx, "legacy_top2_margin", cfg.legacy_top2_margin);
         return cfg;
     }
     let mut isnum: c_int = 0;
@@ -230,9 +238,12 @@ unsafe extern "C" fn lua_resolve_layout(l: LuaState) -> c_int {
     let Ok(api) = get_api() else {
         return 0;
     };
-    let opt = read_str(api, l, 1).unwrap_or_default();
-    let schema = read_str(api, l, 2).unwrap_or_default();
-    let layout = PinyinLayout::from_name_or_schema(&opt, &schema);
+    let layout = catch_unwind(AssertUnwindSafe(|| {
+        let opt = read_str(api, l, 1).unwrap_or_default();
+        let schema = read_str(api, l, 2).unwrap_or_default();
+        PinyinLayout::from_name_or_schema(&opt, &schema)
+    }))
+    .unwrap_or(PinyinLayout::Full);
     push_str(api, l, layout.as_str());
     (api.pushboolean)(l, if layout.is_double_pinyin() { 1 } else { 0 });
     (api.pushboolean)(l, if layout.uses_semicolon() { 1 } else { 0 });
@@ -244,9 +255,12 @@ unsafe extern "C" fn lua_set_uia_enabled(l: LuaState) -> c_int {
     let Ok(api) = get_api() else {
         return 0;
     };
-    let enable = (api.toboolean)(l, 1) != 0;
-    uia::set_enabled(enable);
-    (api.pushboolean)(l, 1);
+    let ok = catch_unwind(AssertUnwindSafe(|| {
+        let enable = (api.toboolean)(l, 1) != 0;
+        uia::set_enabled(enable);
+    }))
+    .is_ok();
+    (api.pushboolean)(l, if ok { 1 } else { 0 });
     1
 }
 
@@ -415,7 +429,15 @@ unsafe extern "C" fn lua_stats(l: LuaState) -> c_int {
     let Ok(api) = get_api() else {
         return 0;
     };
-    let st = engine::get_stats();
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        let st = engine::get_stats();
+        let uia_on = uia::is_enabled();
+        (st, uia_on)
+    }));
+    let Ok((st, uia_on)) = res else {
+        (api.pushnil)(l);
+        return 1;
+    };
     (api.createtable)(l, 0, 13);
     (api.pushboolean)(l, if st.ready { 1 } else { 0 });
     (api.setfield)(l, -2, c"ready".as_ptr());
@@ -433,7 +455,7 @@ unsafe extern "C" fn lua_stats(l: LuaState) -> c_int {
     (api.setfield)(l, -2, c"fused_kv".as_ptr());
     (api.pushboolean)(l, if st.has_gram { 1 } else { 0 });
     (api.setfield)(l, -2, c"has_gram".as_ptr());
-    (api.pushboolean)(l, if uia::is_enabled() { 1 } else { 0 });
+    (api.pushboolean)(l, if uia_on { 1 } else { 0 });
     (api.setfield)(l, -2, c"uia_enabled".as_ptr());
     (api.pushinteger)(l, st.enc_layers as LuaInteger);
     (api.setfield)(l, -2, c"enc_layers".as_ptr());
@@ -456,29 +478,32 @@ unsafe extern "C" fn lua_stats(l: LuaState) -> c_int {
 /// Must only be called by the host Lua 5.4 VM (`librime-lua` / `rime.dll`) with a valid `lua_State*`.
 #[no_mangle]
 pub unsafe extern "C" fn luaopen_rime_neural(l: LuaState) -> c_int {
-    lua_api::pin_self_module(luaopen_rime_neural as *const std::ffi::c_void);
-    let Ok(api) = get_api() else {
-        return 0;
-    };
-    (api.createtable)(l, 0, 11);
-
-    macro_rules! export_fn {
-        ($name:literal, $func:ident) => {
-            (api.pushcclosure)(l, $func, 0);
-            (api.setfield)(l, -2, concat!($name, "\0").as_ptr() as *const c_char);
+    catch_unwind(AssertUnwindSafe(|| {
+        lua_api::pin_self_module(luaopen_rime_neural as *const std::ffi::c_void);
+        let Ok(api) = get_api() else {
+            return 0;
         };
-    }
+        (api.createtable)(l, 0, 11);
 
-    export_fn!("init", lua_init);
-    export_fn!("init_async", lua_init_async);
-    export_fn!("is_ready", lua_is_ready);
-    export_fn!("resolve_layout", lua_resolve_layout);
-    export_fn!("set_uia_enabled", lua_set_uia_enabled);
-    export_fn!("query_uia_context", lua_query_uia_context);
-    export_fn!("kick_uia_refresh", lua_kick_uia_refresh);
-    export_fn!("kick_uia_after_commit", lua_kick_uia_after_commit);
-    export_fn!("rerank", lua_rerank);
-    export_fn!("log_feedback", lua_log_feedback);
-    export_fn!("stats", lua_stats);
-    1
+        macro_rules! export_fn {
+            ($name:literal, $func:ident) => {
+                (api.pushcclosure)(l, $func, 0);
+                (api.setfield)(l, -2, concat!($name, "\0").as_ptr() as *const c_char);
+            };
+        }
+
+        export_fn!("init", lua_init);
+        export_fn!("init_async", lua_init_async);
+        export_fn!("is_ready", lua_is_ready);
+        export_fn!("resolve_layout", lua_resolve_layout);
+        export_fn!("set_uia_enabled", lua_set_uia_enabled);
+        export_fn!("query_uia_context", lua_query_uia_context);
+        export_fn!("kick_uia_refresh", lua_kick_uia_refresh);
+        export_fn!("kick_uia_after_commit", lua_kick_uia_after_commit);
+        export_fn!("rerank", lua_rerank);
+        export_fn!("log_feedback", lua_log_feedback);
+        export_fn!("stats", lua_stats);
+        1
+    }))
+    .unwrap_or(0)
 }

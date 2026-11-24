@@ -4,7 +4,6 @@ use std::path::Path;
 
 const GENERIC_READ: u32 = 0x8000_0000;
 const FILE_SHARE_READ: u32 = 0x0000_0001;
-const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const FILE_SHARE_DELETE: u32 = 0x0000_0004;
 const OPEN_EXISTING: u32 = 3;
 const PAGE_READONLY: u32 = 0x02;
@@ -127,7 +126,7 @@ impl WanxiangGram {
             let file = CreateFileW(
                 wide.as_ptr(),
                 GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_SHARE_READ | FILE_SHARE_DELETE,
                 std::ptr::null(),
                 OPEN_EXISTING,
                 0,
@@ -135,11 +134,6 @@ impl WanxiangGram {
             );
             if file.is_null() || file == INVALID_HANDLE_VALUE {
                 return Err(format!("CreateFileW failed: {}", path.display()));
-            }
-            let mut file_size: i64 = 0;
-            if GetFileSizeEx(file, &mut file_size) == 0 || file_size < 64 {
-                CloseHandle(file);
-                return Err(format!("invalid .gram size: {}", file_size));
             }
             let mapping = CreateFileMappingW(
                 file,
@@ -153,6 +147,17 @@ impl WanxiangGram {
                 CloseHandle(file);
                 return Err("CreateFileMappingW failed".to_string());
             }
+            let mut file_size: i64 = 0;
+            if GetFileSizeEx(file, &mut file_size) == 0 || file_size < 64 {
+                CloseHandle(mapping);
+                CloseHandle(file);
+                return Err(format!("invalid .gram size: {}", file_size));
+            }
+            let Ok(mapped_len) = usize::try_from(file_size) else {
+                CloseHandle(mapping);
+                CloseHandle(file);
+                return Err(format!("invalid .gram size: {}", file_size));
+            };
             let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0) as *const u8;
             if view.is_null() {
                 CloseHandle(mapping);
@@ -160,7 +165,7 @@ impl WanxiangGram {
                 return Err("MapViewOfFile failed".to_string());
             }
 
-            let bytes = std::slice::from_raw_parts(view, file_size as usize);
+            let bytes = std::slice::from_raw_parts(view, mapped_len);
             if !bytes.starts_with(b"Rime::Grammar/") {
                 UnmapViewOfFile(view as *const c_void);
                 CloseHandle(mapping);
@@ -169,9 +174,18 @@ impl WanxiangGram {
             }
             let da_size = u32::from_le_bytes(bytes[36..40].try_into().unwrap()) as usize;
             let rel_off = i32::from_le_bytes(bytes[40..44].try_into().unwrap()) as isize;
+            if rel_off < 4 {
+                UnmapViewOfFile(view as *const c_void);
+                CloseHandle(mapping);
+                CloseHandle(file);
+                return Err("corrupt double-array offset".to_string());
+            }
             let da_off = (40isize + rel_off) as usize;
             let da_bytes = da_size.saturating_mul(4);
-            if !da_off.is_multiple_of(4) || da_off.saturating_add(da_bytes) > bytes.len() {
+            if da_off < 44
+                || !da_off.is_multiple_of(4)
+                || da_off.saturating_add(da_bytes) > bytes.len()
+            {
                 UnmapViewOfFile(view as *const c_void);
                 CloseHandle(mapping);
                 CloseHandle(file);
@@ -334,5 +348,18 @@ mod tests {
             s2,
             s1
         );
+    }
+
+    #[test]
+    fn test_rejects_corrupt_header_overlap_offset() {
+        let mut buf = vec![0u8; 128];
+        buf[..14].copy_from_slice(b"Rime::Grammar/");
+        buf[36..40].copy_from_slice(&4u32.to_le_bytes());
+        buf[40..44].copy_from_slice(&(-40i32).to_le_bytes()); // da_off = 0 (overlaps header)
+        let tmp = std::env::temp_dir().join("rime_neural_test_corrupt_off.gram");
+        std::fs::write(&tmp, &buf).expect("write tmp gram");
+        let res = WanxiangGram::open(&tmp, -15.5, -4.0);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(res.is_err(), "expected corrupt negative rel_off to fail");
     }
 }
