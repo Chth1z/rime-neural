@@ -9,9 +9,11 @@ Statistical anti-overfitting design:
      readable (and can be converted in-place to zero-plaintext v2 via `--scrub-legacy-inplace`),
      and legacy 10%-sampled Top-1 logs remain supported via `--top1-sample-rate 0.10`.
   2. Fits exact damped Newton-Raphson Bayesian MAP estimation around `W_PRIOR` with Gaussian
-     prior precision `lam`:
-         J(w) = (1 / sum_w) * sum_i w_i * NLL_i(w) + (lam / (2 * sum_w)) * ||w - W_PRIOR||^2
-     so prior strength stays fixed in effective sample count and vanishes asymptotically as N -> inf.
+     prior precision `lam` scaled by Kish effective sample size `N_eff` (scale-invariant):
+         J(w) = (1 / sum_w) * sum_i w_i * NLL_i(w) + (lam / (2 * N_eff)) * ||w - W_PRIOR||^2
+     so prior strength stays fixed in effective sample count and vanishes asymptotically as N_eff -> inf.
+     Freezes `w_ctx_lp` at `W_PRIOR[4]` unless both `has_ctx=True` and `has_ctx=False` have >= 20 samples
+     so collinear features cannot arbitrarily split weight between `w_logit` and `w_ctx_lp`.
   3. Selects prior precision `lam` by contiguous blocked 5-fold out-of-fold weighted **log-loss
      (NLL)** (strictly proper scoring rule; contiguous folds prevent adjacent-session leakage).
   4. Only recommends an update when ALL FOUR guards pass:
@@ -20,8 +22,8 @@ Statistical anti-overfitting design:
        - Out-of-fold weighted NLL improvement passes a one-sided paired 95% CI test (`z >= 1.645`)
          using the heteroscedasticity-robust Hajek sandwich variance estimator
        - Out-of-fold weighted Top-1 accuracy does not drop below `W_PRIOR`
-       - Fitted weights satisfy domain sanity invariants (`w_logit >= 0.1`, `w_rank <= 0.0`,
-         `w_logit + w_ctx_lp >= 0.1`) and differ from `W_PRIOR` after 3-decimal rounding.
+       - Fitted (and 3-decimal rounded) weights satisfy domain sanity invariants (`w_logit >= 0.1`,
+         `w_rank <= 0.0`, `w_logit + w_ctx_lp >= 0.1`) and differ from `W_PRIOR`.
 
 Usage:
     python scripts/tune-fusion.py
@@ -37,6 +39,7 @@ import os
 import pathlib
 import sys
 import tempfile
+import time
 from collections import Counter
 from typing import Any, List, Optional, Tuple
 
@@ -44,10 +47,12 @@ import numpy as np
 
 # General OOD-verified prior weights: [w_logit, w_rank, w_gram, w_char_lp, w_ctx_lp]
 W_PRIOR = np.array([1.0, -1.4, 0.05, 0.15, 0.0], dtype=np.float64)
-# Prior precision grid (effective prior sample count; scaled by 1 / sum_w in the mean NLL objective)
+# Prior precision grid (effective prior sample count; scaled by 1 / Kish N_eff)
 LAMBDA_GRID = (0.5, 1.5, 5.0, 15.0, 50.0, 150.0, 500.0)
 MAX_ABS_FEATURE = 1e6
 MAX_SAMPLE_WEIGHT = 1e6
+MIN_CTX_STRATUM = 20
+PLAINTEXT_KEYS = ("raw_input", "context", "cands", "chosen_text", "shown_top1", "p2c_cand")
 
 
 def _registry_rime_user_dir() -> Optional[pathlib.Path]:
@@ -99,8 +104,11 @@ def _parse_strict_int(raw: Any, default: Optional[int] = None) -> Optional[int]:
         return default
     if isinstance(raw, str):
         s = raw.strip()
-        if s and (s.isdigit() or (s[0] in "+-" and s[1:].isdigit())):
-            return int(s)
+        if s and s.isascii() and (s.isdigit() or (s[0] in "+-" and s[1:].isdigit())):
+            try:
+                return int(s)
+            except ValueError:
+                return default
     return default
 
 
@@ -123,8 +131,21 @@ def _parse_finite_float_list(raw: Any, expected_len: int, allow_empty: bool = Fa
     return out
 
 
+def _parse_sample_weight(raw_sw: Any) -> Optional[float]:
+    if raw_sw is None or isinstance(raw_sw, bool):
+        return None
+    try:
+        fsw = float(raw_sw)
+    except (TypeError, ValueError):
+        return None
+    if math.isfinite(fsw) and 0.0 < fsw <= MAX_SAMPLE_WEIGHT:
+        return fsw
+    return None
+
+
 def _convert_v1_to_v2(rec: dict) -> Optional[dict]:
-    """Convert a legacy v1 record (containing raw text fields) into a zero-plaintext v2 record."""
+    """Convert a legacy v1 record (containing raw text fields) into a zero-plaintext v2 record.
+    Preserves absent `sample_weight` (omitting the key) so `--top1-sample-rate` remains effective."""
     cands = rec.get("cands")
     if not isinstance(cands, list) or len(cands) < 2:
         return None
@@ -140,6 +161,7 @@ def _convert_v1_to_v2(rec: dict) -> Optional[dict]:
     p2c_cand = rec.get("p2c_cand") if isinstance(rec.get("p2c_cand"), str) else ""
     ctx = rec.get("context") if isinstance(rec.get("context"), str) else ""
     schema = rec.get("schema") if isinstance(rec.get("schema"), str) else ""
+    model = rec.get("model") if isinstance(rec.get("model"), str) else ""
 
     chosen_idx = cands.index(chosen) if (chosen and chosen in cands) else -1
     p2c_shown = bool(p2c_cand)
@@ -153,21 +175,12 @@ def _convert_v1_to_v2(rec: dict) -> Optional[dict]:
 
     chosen_rank = _parse_strict_int(rec.get("chosen_rank"), 0) or 0
     ts = _parse_strict_int(rec.get("ts"), 0) or 0
-    raw_sw = rec.get("sample_weight")
-    sw = 1.0
-    if raw_sw is not None and not isinstance(raw_sw, bool):
-        try:
-            fsw = float(raw_sw)
-            if math.isfinite(fsw) and 0.0 < fsw <= MAX_SAMPLE_WEIGHT:
-                sw = fsw
-        except (TypeError, ValueError):
-            pass
+    sw = _parse_sample_weight(rec.get("sample_weight"))
 
     reverted = (shown_top1_idx > 0 or shown_top1_idx == -2) and chosen_idx == 0
-    return {
+    out: dict[str, Any] = {
         "v": 2,
         "ts": ts,
-        "sample_weight": sw,
         "schema": schema,
         "has_ctx": len(ctx.strip()) >= 2,
         "num_cands": num_cands,
@@ -181,6 +194,27 @@ def _convert_v1_to_v2(rec: dict) -> Optional[dict]:
         "chosen_rank": chosen_rank,
         "reverted": reverted,
     }
+    if sw is not None:
+        out["sample_weight"] = sw
+    if model:
+        out["model"] = model
+    if isinstance(rec.get("has_gram"), bool):
+        out["has_gram"] = rec["has_gram"]
+    return out
+
+
+def _atomic_replace_with_retry(src: str, dst: pathlib.Path, attempts: int = 5) -> None:
+    last_err: Optional[OSError] = None
+    for i in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            last_err = exc
+            if i + 1 < attempts:
+                time.sleep(0.04 * (i + 1))
+    if last_err is not None:
+        raise last_err
 
 
 def scrub_legacy_log_files(path: pathlib.Path, include_rotated: bool = True) -> Tuple[int, int]:
@@ -188,8 +222,12 @@ def scrub_legacy_log_files(path: pathlib.Path, include_rotated: bool = True) -> 
     targets: List[pathlib.Path] = []
     if include_rotated:
         rot = pathlib.Path(str(path) + ".1")
+        if rot.is_symlink():
+            raise OSError(f"Refusing to scrub symlink: {rot}")
         if rot.is_file():
             targets.append(rot)
+    if path.is_symlink():
+        raise OSError(f"Refusing to scrub symlink: {path}")
     if path.is_file():
         targets.append(path)
 
@@ -210,11 +248,16 @@ def scrub_legacy_log_files(path: pathlib.Path, include_rotated: bool = True) -> 
             if not isinstance(rec, dict):
                 changed = True
                 continue
-            has_plaintext = any(
-                k in rec for k in ("raw_input", "context", "cands", "chosen_text", "shown_top1", "p2c_cand")
-            )
+            has_plaintext = any(k in rec for k in PLAINTEXT_KEYS)
             if has_plaintext:
-                v2 = _convert_v1_to_v2(rec)
+                if "cands" in rec:
+                    v2 = _convert_v1_to_v2(rec)
+                elif "chosen_idx" in rec and isinstance(rec.get("logits"), list):
+                    # Hybrid v2 record with stray plaintext keys: strip plaintext keys in place
+                    v2 = {k: v for k, v in rec.items() if k not in PLAINTEXT_KEYS}
+                    v2["v"] = 2
+                else:
+                    v2 = None
                 if v2 is not None:
                     out_lines.append(json.dumps(v2, ensure_ascii=False, separators=(",", ":")))
                     converted_total += 1
@@ -228,7 +271,7 @@ def scrub_legacy_log_files(path: pathlib.Path, include_rotated: bool = True) -> 
                 with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
                     if out_lines:
                         fh.write("\n".join(out_lines) + "\n")
-                os.replace(tmp_name, target)
+                _atomic_replace_with_retry(tmp_name, target)
             except Exception:
                 try:
                     os.unlink(tmp_name)
@@ -258,6 +301,7 @@ def load_samples(
     include_rotated: bool = True,
     schema_filter: Optional[str] = None,
     model_filter: Optional[str] = None,
+    has_gram_filter: Optional[bool] = None,
 ) -> Tuple[List[np.ndarray], List[int], np.ndarray, dict]:
     summary: dict[str, Any] = {
         "files_found": 0,
@@ -268,8 +312,11 @@ def load_samples(
         "disagreed": 0,
         "neural_win": 0,
         "rime_revert": 0,
+        "with_ctx": 0,
+        "without_ctx": 0,
         "schemas": Counter(),
         "models": Counter(),
+        "has_gram": Counter(),
     }
     raw_lines, files_found = _iter_log_lines(path, include_rotated=include_rotated)
     summary["files_found"] = files_found
@@ -295,9 +342,12 @@ def load_samples(
 
         rec_schema = rec.get("schema") if isinstance(rec.get("schema"), str) else ""
         rec_model = rec.get("model") if isinstance(rec.get("model"), str) else ""
+        rec_has_gram = rec.get("has_gram") if isinstance(rec.get("has_gram"), bool) else None
         if schema_filter and rec_schema != schema_filter:
             continue
         if model_filter and rec_model != model_filter:
+            continue
+        if has_gram_filter is not None and rec_has_gram is not has_gram_filter:
             continue
 
         is_v2 = ("chosen_idx" in rec) or (
@@ -344,7 +394,7 @@ def load_samples(
         clps = v2["char_lps"]
         chosen_idx = v2["chosen_idx"]
         shown_top1_idx = v2["shown_top1_idx"]
-        p2c_chosen = bool(v2["p2c_chosen"])
+        p2c_chosen = bool(v2["p2c_chosen"]) and (chosen_idx < 0)
 
         if p2c_chosen:
             summary["p2c_accepted"] += 1
@@ -363,6 +413,8 @@ def load_samples(
             summary["schemas"][rec_schema] += 1
         if rec_model:
             summary["models"][rec_model] += 1
+        if rec_has_gram is not None:
+            summary["has_gram"][rec_has_gram] += 1
 
         if shown_top1_idx != -1 and shown_top1_idx != 0:
             summary["disagreed"] += 1
@@ -372,7 +424,12 @@ def load_samples(
                 summary["rime_revert"] += 1
 
         y = chosen_idx
-        has_ctx = 1.0 if bool(v2["has_ctx"]) else 0.0
+        has_ctx_bool = bool(v2["has_ctx"])
+        if has_ctx_bool:
+            summary["with_ctx"] += 1
+        else:
+            summary["without_ctx"] += 1
+        has_ctx = 1.0 if has_ctx_bool else 0.0
         lp = log_softmax(logits)
         X = np.array(
             [
@@ -382,15 +439,7 @@ def load_samples(
             dtype=np.float64,
         )
 
-        sw: Optional[float] = None
-        raw_sw = v2.get("sample_weight")
-        if raw_sw is not None and not isinstance(raw_sw, bool):
-            try:
-                cand_sw = float(raw_sw)
-                if math.isfinite(cand_sw) and 0.0 < cand_sw <= MAX_SAMPLE_WEIGHT:
-                    sw = cand_sw
-            except (TypeError, ValueError):
-                sw = None
+        sw = _parse_sample_weight(v2.get("sample_weight"))
         if sw is None:
             chosen_rank = _parse_strict_int(v2.get("chosen_rank"), 0) or 0
             sw = top1_weight if chosen_rank == 1 else 1.0
@@ -402,12 +451,18 @@ def load_samples(
     return X_list, y_list, np.array(w_list, dtype=np.float64), summary
 
 
+def kish_effective_n(weights: np.ndarray) -> float:
+    s1 = float(np.sum(weights))
+    s2 = float(np.sum(weights * weights))
+    return (s1 * s1 / s2) if (math.isfinite(s1) and math.isfinite(s2) and s2 > 0.0) else 0.0
+
+
 def eval_penalized_obj(
     X_list: List[np.ndarray],
     y_list: List[int],
     weights: np.ndarray,
     tot_w: float,
-    lam: float,
+    eff_lam: float,
     w_prior: np.ndarray,
     w: np.ndarray,
 ) -> float:
@@ -417,7 +472,6 @@ def eval_penalized_obj(
         s -= float(np.max(s))
         nll += (float(wt) / tot_w) * (math.log(float(np.sum(np.exp(s)))) - float(s[y]))
     delta = w - w_prior
-    eff_lam = lam / tot_w
     return nll + 0.5 * eff_lam * float(delta @ delta)
 
 
@@ -428,15 +482,17 @@ def fit_newton_offset_ridge(
     lam: float,
     w_prior: np.ndarray = W_PRIOR,
     max_iters: int = 20,
+    freeze_ctx_lp: bool = False,
 ) -> np.ndarray:
-    """Damped Newton-Raphson solver with Armijo backtracking line search for Bayesian MAP
-    weighted listwise NLL + (lam / (2 * sum_w)) * ||w - w_prior||^2."""
+    """Damped Newton-Raphson solver with Armijo backtracking line search for scale-invariant
+    Bayesian MAP weighted listwise NLL + (lam / (2 * Kish_N_eff)) * ||w - w_prior||^2."""
     d = len(w_prior)
     w = w_prior.copy()
     tot_w = float(np.sum(weights))
-    if not math.isfinite(tot_w) or tot_w <= 0.0:
+    n_eff = kish_effective_n(weights)
+    if not math.isfinite(tot_w) or tot_w <= 0.0 or not math.isfinite(n_eff) or n_eff <= 0.0:
         return w
-    eff_lam = lam / tot_w
+    eff_lam = lam / n_eff
     eye = np.eye(d, dtype=np.float64)
 
     for _ in range(max_iters):
@@ -459,12 +515,19 @@ def fit_newton_offset_ridge(
             mu = p @ X
             Xc = X - mu
             hess += c * ((Xc * p[:, None]).T @ Xc)
+        if freeze_ctx_lp and d > 4:
+            grad[4] = 0.0
+            hess[4, :] = 0.0
+            hess[:, 4] = 0.0
+            hess[4, 4] = 1.0
         if not (np.isfinite(grad).all() and np.isfinite(hess).all()):
             break
         try:
             step = np.linalg.solve(hess + 1e-8 * eye, grad)
         except np.linalg.LinAlgError:
             break
+        if freeze_ctx_lp and d > 4:
+            step[4] = 0.0
         if not np.isfinite(step).all():
             break
         dir_deriv = -float(grad @ step)
@@ -474,7 +537,7 @@ def fit_newton_offset_ridge(
         accepted = False
         for _ in range(10):
             w_cand = w - alpha * step
-            obj_cand = eval_penalized_obj(X_list, y_list, weights, tot_w, lam, w_prior, w_cand)
+            obj_cand = eval_penalized_obj(X_list, y_list, weights, tot_w, eff_lam, w_prior, w_cand)
             if math.isfinite(obj_cand) and obj_cand <= obj_cur + 1e-4 * alpha * dir_deriv:
                 w = w_cand
                 accepted = True
@@ -484,6 +547,8 @@ def fit_newton_offset_ridge(
             break
         if alpha * float(np.linalg.norm(step)) < 1e-7:
             break
+    if freeze_ctx_lp and d > 4:
+        w[4] = w_prior[4]
     return w
 
 
@@ -524,12 +589,6 @@ def eval_weighted_acc(
     return hits / tot_w * 100.0
 
 
-def kish_effective_n(weights: np.ndarray) -> float:
-    s1 = float(np.sum(weights))
-    s2 = float(np.sum(weights * weights))
-    return (s1 * s1 / s2) if (math.isfinite(s1) and math.isfinite(s2) and s2 > 0.0) else 0.0
-
-
 def hajek_paired_se(diff: np.ndarray, weights: np.ndarray, mean_d: float) -> float:
     """Heteroscedasticity-robust Hajek sandwich SE for a weighted ratio mean."""
     n = len(diff)
@@ -538,6 +597,22 @@ def hajek_paired_se(diff: np.ndarray, weights: np.ndarray, mean_d: float) -> flo
         return 0.0
     var_hat = (n / (n - 1.0)) * float(np.sum((weights * (diff - mean_d)) ** 2)) / (s1 * s1)
     return math.sqrt(max(0.0, var_hat))
+
+
+def paired_z_score(mean_d: float, se_d: float) -> float:
+    if se_d > 1e-12:
+        return mean_d / se_d
+    if mean_d > 1e-12:
+        return math.inf
+    return 0.0
+
+
+def format_weights(w: np.ndarray) -> List[float]:
+    out: List[float] = []
+    for x in w:
+        rv = round(float(x), 3)
+        out.append(0.0 if rv == 0.0 else rv)
+    return out
 
 
 def main() -> None:
@@ -559,6 +634,12 @@ def main() -> None:
     ap.add_argument("--schema", default="", help="Filter feedback records to a single Rime schema_id")
     ap.add_argument("--model", default="", help="Filter feedback records to a single ONNX model filename")
     ap.add_argument(
+        "--has-gram",
+        choices=("any", "true", "false"),
+        default="any",
+        help="Filter records by whether a .gram language model was active (default: any)",
+    )
+    ap.add_argument(
         "--no-rotated",
         action="store_true",
         help="Do not include rotated feedback.jsonl.1 alongside feedback.jsonl",
@@ -573,15 +654,29 @@ def main() -> None:
     if not (0.0 < args.top1_sample_rate <= 1.0):
         print("Error: --top1-sample-rate must be in (0, 1].", file=sys.stderr)
         sys.exit(2)
+    if args.min_corrections < 0 or args.min_accepts < 0:
+        print("Error: --min-corrections and --min-accepts must be >= 0.", file=sys.stderr)
+        sys.exit(2)
 
     log_path = pathlib.Path(args.log)
     if args.scrub_legacy_inplace:
-        if not log_path.is_file() and not pathlib.Path(str(log_path) + ".1").is_file():
+        has_primary = log_path.is_file() or log_path.is_symlink()
+        has_rot = (not args.no_rotated) and (
+            pathlib.Path(str(log_path) + ".1").is_file()
+            or pathlib.Path(str(log_path) + ".1").is_symlink()
+        )
+        if not has_primary and not has_rot:
             print(f"No feedback log found at {log_path}.")
             return
         converted, kept = scrub_legacy_log_files(log_path, include_rotated=not args.no_rotated)
         print(f"Scrubbed {log_path}: converted {converted} legacy v1 record(s) to zero-plaintext v2 (kept {kept} v2).")
         return
+
+    gram_filter: Optional[bool] = None
+    if args.has_gram == "true":
+        gram_filter = True
+    elif args.has_gram == "false":
+        gram_filter = False
 
     X_list, y_list, weights, summary = load_samples(
         log_path,
@@ -589,10 +684,11 @@ def main() -> None:
         include_rotated=not args.no_rotated,
         schema_filter=args.schema.strip() or None,
         model_filter=args.model.strip() or None,
+        has_gram_filter=gram_filter,
     )
     if summary["files_found"] == 0:
         print(f"No feedback log file found at {log_path} (enable rime_neural/log_feedback: true first).")
-        print("Current prior fusion_weights:", [round(float(x), 3) for x in W_PRIOR])
+        print("Current prior fusion_weights:", format_weights(W_PRIOR))
         return
 
     n = len(X_list)
@@ -618,6 +714,11 @@ def main() -> None:
         print(f"Note: multiple schemas pooled ({dict(summary['schemas'])}); pass --schema <id> to tune one.")
     if len(summary["models"]) > 1 and not args.model:
         print(f"Note: multiple models pooled ({dict(summary['models'])}); pass --model <file> to isolate one.")
+    if len(summary["has_gram"]) > 1 and gram_filter is None:
+        print(
+            f"Note: mixed .gram states pooled ({dict(summary['has_gram'])}); "
+            "pass --has-gram true|false to isolate one."
+        )
 
     min_req = max(5, args.min_samples)
     tot_w = float(np.sum(weights))
@@ -633,8 +734,15 @@ def main() -> None:
             f"Safety guard: need >= {min_req} total & Kish N_eff, >= {args.min_corrections} prior misses, "
             f">= {args.min_accepts} prior hits to prevent overfitting (keeping prior weights)."
         )
-        print("Current prior fusion_weights:", [round(float(x), 3) for x in W_PRIOR])
+        print("Current prior fusion_weights:", format_weights(W_PRIOR))
         return
+
+    freeze_ctx = summary["with_ctx"] < MIN_CTX_STRATUM or summary["without_ctx"] < MIN_CTX_STRATUM
+    if freeze_ctx:
+        print(
+            f"Note: freezing w_ctx_lp at {W_PRIOR[4]:.3f} "
+            f"(with_ctx={summary['with_ctx']}, without_ctx={summary['without_ctx']}, need >= {MIN_CTX_STRATUM} each)."
+        )
 
     prior_nll_vec = eval_nll_vec(X_list, y_list, W_PRIOR)
     prior_nll = float(np.sum(weights * prior_nll_vec) / tot_w)
@@ -643,10 +751,8 @@ def main() -> None:
 
     folds = 5
     fold_bounds = [(f * n // folds, (f + 1) * n // folds) for f in range(folds)]
-    best_lam: Optional[float] = None
-    best_nll = prior_nll
-    best_oof_nll: Optional[np.ndarray] = None
-    best_oof_acc = prior_acc
+    best_raw: Optional[dict[str, Any]] = None
+    best_valid: Optional[dict[str, Any]] = None
 
     for lam in LAMBDA_GRID:
         oof_nll = np.zeros(n, dtype=np.float64)
@@ -655,7 +761,11 @@ def main() -> None:
             va_i = list(range(lo, hi))
             tr_i = list(range(0, lo)) + list(range(hi, n))
             wf = fit_newton_offset_ridge(
-                [X_list[i] for i in tr_i], [y_list[i] for i in tr_i], weights[tr_i], lam
+                [X_list[i] for i in tr_i],
+                [y_list[i] for i in tr_i],
+                weights[tr_i],
+                lam,
+                freeze_ctx_lp=freeze_ctx,
             )
             for i in va_i:
                 s = X_list[i] @ wf
@@ -666,48 +776,68 @@ def main() -> None:
         wl = float(np.sum(weights * oof_nll) / tot_w)
         wa = oof_hit_w / tot_w * 100.0
         print(f"  lambda={lam:5.1f} -> 5-fold NLL={wl:.4f} | Top-1 acc={wa:.2f}%")
-        if wl < best_nll - 1e-6:
-            best_nll = wl
-            best_lam = lam
-            best_oof_nll = oof_nll
-            best_oof_acc = wa
 
-    if best_lam is None or best_oof_nll is None:
+        if wl < prior_nll - 1e-6:
+            diff = prior_nll_vec - oof_nll
+            mean_d = float(np.sum(weights * diff) / tot_w)
+            se_d = hajek_paired_se(diff, weights, mean_d)
+            z_score = paired_z_score(mean_d, se_d)
+            cand_info = {
+                "lam": lam,
+                "nll": wl,
+                "acc": wa,
+                "mean_d": mean_d,
+                "se_d": se_d,
+                "z": z_score,
+            }
+            if best_raw is None or wl < best_raw["nll"] - 1e-9:
+                best_raw = cand_info
+            if z_score >= 1.645 and wa >= prior_acc - 1e-6:
+                w_cand = fit_newton_offset_ridge(
+                    X_list, y_list, weights, lam, freeze_ctx_lp=freeze_ctx
+                )
+                w_fmt_cand = format_weights(w_cand)
+                sane_raw, _ = weights_pass_domain_sanity(w_cand)
+                sane_fmt, _ = weights_pass_domain_sanity(np.array(w_fmt_cand, dtype=np.float64))
+                if sane_raw and sane_fmt and (best_valid is None or wl < best_valid["nll"] - 1e-9):
+                    best_valid = {**cand_info, "w_new": w_cand, "w_fmt": w_fmt_cand}
+
+    if best_raw is None:
         print("\nPrior weights already achieve the lowest 5-fold log-loss; no update needed.")
         return
 
-    diff = prior_nll_vec - best_oof_nll
-    mean_d = float(np.sum(weights * diff) / tot_w)
-    se_d = hajek_paired_se(diff, weights, mean_d)
-    z_score = mean_d / se_d if se_d > 1e-12 else 0.0
+    if best_valid is None:
+        print(
+            f"\nBest lambda={best_raw['lam']}: delta_NLL={best_raw['mean_d']:+.4f} +/- {best_raw['se_d']:.4f} "
+            f"(z={best_raw['z']:.2f}, acc {prior_acc:.2f}% -> {best_raw['acc']:.2f}%)"
+        )
+        w_check = fit_newton_offset_ridge(
+            X_list, y_list, weights, best_raw["lam"], freeze_ctx_lp=freeze_ctx
+        )
+        sane, reason = weights_pass_domain_sanity(w_check)
+        if not sane:
+            print(
+                f"Safety guard: fitted weights failed domain sanity check ({reason}); "
+                "keeping prior weights (check for selection-biased feedback logs)."
+            )
+        else:
+            print(
+                "Improvement is NOT statistically significant at 95% confidence (or drops Top-1 acc); "
+                "keeping prior weights to avoid overfitting."
+            )
+        return
 
+    w_fmt = best_valid["w_fmt"]
+    prior_fmt = format_weights(W_PRIOR)
     print(
-        f"\nBest lambda={best_lam}: delta_NLL={mean_d:+.4f} +/- {se_d:.4f} (z={z_score:.2f}, "
-        f"acc {prior_acc:.2f}% -> {best_oof_acc:.2f}%)"
+        f"\nBest lambda={best_valid['lam']}: delta_NLL={best_valid['mean_d']:+.4f} +/- {best_valid['se_d']:.4f} "
+        f"(z={best_valid['z']:.2f}, acc {prior_acc:.2f}% -> {best_valid['acc']:.2f}%)"
     )
-    if z_score < 1.645 or best_oof_acc < prior_acc - 1e-6:
-        print(
-            "Improvement is NOT statistically significant at 95% confidence (or drops Top-1 acc); "
-            "keeping prior weights to avoid overfitting."
-        )
-        return
-
-    w_new = fit_newton_offset_ridge(X_list, y_list, weights, best_lam)
-    sane, reason = weights_pass_domain_sanity(w_new)
-    if not sane:
-        print(
-            f"Safety guard: fitted weights failed domain sanity check ({reason}); "
-            "keeping prior weights (check for selection-biased feedback logs)."
-        )
-        return
-
-    w_fmt = [round(float(x), 3) for x in w_new]
-    prior_fmt = [round(float(x), 3) for x in W_PRIOR]
     if w_fmt == prior_fmt:
         print("Fitted weights match W_PRIOR after rounding; no update needed.")
         return
 
-    print(f"Statistically significant improvement verified (z={z_score:.2f} >= 1.645)!")
+    print(f"Statistically significant improvement verified (z={best_valid['z']:.2f} >= 1.645)!")
     print("Paste into rime_neural/fusion_weights in your schema custom yaml:")
     print(f"  fusion_weights: {w_fmt}")
 
