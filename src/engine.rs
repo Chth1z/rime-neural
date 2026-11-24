@@ -143,7 +143,7 @@ pub enum GramRequest {
     Disabled,
     /// Evaluate with an explicit `.gram` path and per-schema penalties / collocation window.
     Custom {
-        path: PathBuf,
+        paths: [Option<PathBuf>; 2],
         collocation_penalty: u64,
         non_collocation_penalty: u64,
         max_length: usize,
@@ -152,14 +152,14 @@ pub enum GramRequest {
 
 impl GramRequest {
     pub fn custom(
-        path: PathBuf,
+        paths: [Option<PathBuf>; 2],
         collocation_penalty: f64,
         non_collocation_penalty: f64,
         max_length: usize,
     ) -> Self {
         let (col, non_col) = sanitize_penalties(collocation_penalty, non_collocation_penalty);
         Self::Custom {
-            path,
+            paths,
             collocation_penalty: canon_f64_bits(col),
             non_collocation_penalty: canon_f64_bits(non_col),
             max_length: sanitize_max_length(max_length),
@@ -192,7 +192,7 @@ struct CachedEval {
     last_used: u64,
 }
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+#[derive(Default, Debug, Hash, PartialEq, Eq, Clone)]
 struct ResolvedGramKey {
     path: Option<PathBuf>,
     col_bits: u64,
@@ -214,8 +214,6 @@ struct CacheKey {
 struct CharVocab {
     chars: Vec<String>,
     char_to_id: HashMap<char, usize>,
-    /// Simplified character IDs (`cid < old_chars`) allowed per syllable for P2C synthesis.
-    syl_to_p2c_cids: HashMap<String, Vec<usize>>,
     /// All character IDs (`cid < chars.len()`, including extended/Traditional chars) per syllable.
     syl_to_all_cids: HashMap<String, Vec<usize>>,
     old_chars: usize,
@@ -237,157 +235,93 @@ impl CharVocab {
         shifted_lcp: bool,
     ) -> (Vec<f32>, Option<String>, f32) {
         let (n_slots, vocab_chars) = shape;
-        let mut char_lps = vec![0.0f32; cands.len()];
-        let mut p2c_text: Option<String> = None;
-        let mut p2c_margin: f32 = -100.0;
-
-        let can_decode = !shifted_lcp
-            && orig_units_len > 0
-            && orig_units_len <= self.max_slots
-            && n_slots == orig_units_len
-            && vocab_chars >= self.old_chars
-            && !self.chars.is_empty()
-            && c_slice.len() >= n_slots.saturating_mul(vocab_chars);
-
-        if !can_decode {
-            return (char_lps, p2c_text, p2c_margin);
+        let neutral = || (vec![0.0; cands.len()], None, -100.0);
+        if shifted_lcp
+            || n_slots == 0
+            || n_slots != orig_units_len
+            || n_slots > self.max_slots
+            || vocab_chars < self.old_chars
+            || c_slice.len() < n_slots.saturating_mul(vocab_chars)
+            || units.iter().any(|(kind, _)| *kind != "f")
+            || cands.is_empty()
+            || cands.iter().any(|c| c.chars().count() != n_slots)
+        {
+            return neutral();
         }
 
-        let mut gen_chars: Vec<char> = Vec::with_capacity(n_slots);
-        let mut slot_lse: Vec<f32> = Vec::with_capacity(n_slots);
-        let mut slot_allowed: Vec<Option<&[usize]>> = Vec::with_capacity(n_slots);
-        let mut gen_sum = 0.0f32;
-        let mut all_full = true;
-
-        for (j, (kind, syl)) in units.iter().enumerate() {
-            if *kind != "f" {
-                all_full = false;
-            }
+        let mut cand_chars: Vec<_> = cands.iter().map(|c| c.chars()).collect();
+        let mut scores = vec![0.0f64; cands.len()];
+        let mut generated = String::new();
+        let mut gen_score = 0.0;
+        let mut ch_buf = [0u8; 4];
+        for (j, (_, syl)) in units.iter().enumerate() {
+            let Some(ids) = self.syl_to_all_cids.get(syl) else {
+                return neutral();
+            };
+            let allowed = &ids[..ids.partition_point(|&id| id < vocab_chars)];
             let row = &c_slice[j * vocab_chars..(j + 1) * vocab_chars];
-            if let Some(p2c_allowed) = self.syl_to_p2c_cids.get(syl) {
-                let mut max_v = f32::NEG_INFINITY;
-                let mut best_cid = p2c_allowed[0];
-                for &cid in p2c_allowed {
-                    if cid >= vocab_chars {
-                        continue;
-                    }
-                    let v = row[cid];
-                    if v.is_finite() && v > max_v {
-                        max_v = v;
-                        best_cid = cid;
+            let mut max_v = f32::NEG_INFINITY;
+            let mut best_core = None;
+            for &id in allowed {
+                let v = row[id];
+                if v.is_finite() && v > max_v {
+                    max_v = v;
+                    // IDs are sorted, so the last core maximum is the best synthesis choice.
+                    if id < self.old_chars {
+                        best_core = Some(id);
                     }
                 }
-                if !max_v.is_finite() {
-                    all_full = false;
-                    slot_lse.push(0.0);
-                    slot_allowed.push(None);
-                    continue;
-                }
-                let sum_e: f32 = p2c_allowed
-                    .iter()
-                    .map(|&cid| {
-                        let v = if cid < vocab_chars {
-                            row[cid]
-                        } else {
-                            f32::NAN
-                        };
-                        if v.is_finite() {
-                            (v - max_v).exp()
-                        } else {
-                            0.0
-                        }
-                    })
-                    .sum();
-                let lse = max_v + sum_e.ln();
-                gen_sum += max_v - lse;
-                if let Some(ch) = self.chars[best_cid].chars().next() {
-                    gen_chars.push(ch);
-                }
-                slot_lse.push(lse);
-                slot_allowed.push(
-                    self.syl_to_all_cids
-                        .get(syl)
-                        .map(Vec::as_slice)
-                        .or(Some(p2c_allowed.as_slice())),
-                );
-            } else {
-                all_full = false;
-                slot_lse.push(0.0);
-                slot_allowed.push(None);
             }
-        }
+            if !max_v.is_finite() {
+                return neutral();
+            }
+            if let Some(id) = best_core {
+                generated.push_str(&self.chars[id]);
+                gen_score += f64::from(row[id]) - f64::from(max_v);
+            }
 
-        // Gate both relative `char_lps` AND P2C synthesis strictly on `all_same_len`:
-        // if candidate lengths disagree with `n_slots` (e.g. fuzzy split mismatch), never emit
-        // a wrong-length P2C candidate or skewed missing-slot penalties.
-        let all_same_len = !cands.is_empty() && cands.iter().all(|c| c.chars().count() == n_slots);
-        if all_full && all_same_len && gen_chars.len() == n_slots {
-            // Detect equal-length alternate-segmentation / fuzzy-pinyin candidates (e.g. `fangan`:
-            // `他很方案` vs `他很反感`, `dangan`: `档案` vs `单干`): if any candidate contains a known
-            // Hanzi whose pronunciation does not match `cands[0]`'s aligned syllable at slot `j`,
-            // suppress `char_lps` & P2C so valid alternate splits are not penalized by `-15.0`/slot.
-            let mut has_alt_pronunciation = false;
-            let mut ch_buf = [0u8; 4];
-            'alt_check: for c in cands {
-                for (j, ch) in c.chars().enumerate() {
-                    let matched_in_slot = self.char_to_id.get(&ch).is_some_and(|&cid| {
-                        slot_allowed[j].is_some_and(|al| al.binary_search(&cid).is_ok())
+            // Every aligned sentence has the same per-slot log normalizer. Centering on the
+            // row maximum preserves all score differences, including those for extended IDs.
+            // Only the fixed -15 log-probability for an unscored character needs the partition.
+            let mut missing_score = None;
+            for (chars, score) in cand_chars.iter_mut().zip(&mut scores) {
+                let ch = chars.next().unwrap();
+                if let Some(&id) = self.char_to_id.get(&ch)
+                    && allowed.binary_search(&id).is_ok()
+                    && row[id].is_finite()
+                {
+                    *score += f64::from(row[id]) - f64::from(max_v);
+                } else {
+                    let key: &str = ch.encode_utf8(&mut ch_buf);
+                    if readings.get(key).is_some_and(|rlist| !rlist.contains(syl)) {
+                        // A valid alternate segmentation cannot be scored on these slots.
+                        return neutral();
+                    }
+                    *score += *missing_score.get_or_insert_with(|| {
+                        let sum: f64 = allowed
+                            .iter()
+                            .map(|&id| row[id])
+                            .filter(|v| v.is_finite())
+                            .map(|v| (f64::from(v) - f64::from(max_v)).exp())
+                            .sum();
+                        sum.ln() - 15.0
                     });
-                    if !matched_in_slot {
-                        let key = ch.encode_utf8(&mut ch_buf);
-                        if let Some(rlist) = readings.get(key)
-                            && !rlist.iter().any(|r| r == &units[j].1)
-                        {
-                            has_alt_pronunciation = true;
-                            break 'alt_check;
-                        }
-                    }
                 }
-            }
-            if has_alt_pronunciation {
-                return (char_lps, p2c_text, p2c_margin);
-            }
-
-            let mut raw_clp = Vec::with_capacity(cands.len());
-            for c in cands {
-                let mut s = 0.0f32;
-                for (j, ch) in c.chars().enumerate() {
-                    let row = &c_slice[j * vocab_chars..(j + 1) * vocab_chars];
-                    let lp = self
-                        .char_to_id
-                        .get(&ch)
-                        .and_then(|&cid| {
-                            if cid >= vocab_chars {
-                                return None;
-                            }
-                            let allowed = slot_allowed[j]?;
-                            allowed.binary_search(&cid).ok().and_then(|_| {
-                                let v = row[cid];
-                                v.is_finite().then_some((v - slot_lse[j]).min(0.0))
-                            })
-                        })
-                        .unwrap_or(-15.0);
-                    s += lp;
-                }
-                raw_clp.push(s / (n_slots as f32));
-            }
-            let c0 = raw_clp[0];
-            for (i, &v) in raw_clp.iter().enumerate() {
-                char_lps[i] = v - c0;
-            }
-            let max_cand_clp = raw_clp.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let gen_str: String = gen_chars.into_iter().collect();
-            let gen_mean = gen_sum / (n_slots as f32);
-            if gen_mean.is_finite()
-                && max_cand_clp.is_finite()
-                && !cands.iter().any(|c| c == &gen_str)
-            {
-                p2c_margin = gen_mean - max_cand_clp;
-                p2c_text = Some(gen_str);
             }
         }
 
-        (char_lps, p2c_text, p2c_margin)
+        let baseline = scores[0];
+        let best = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let char_lps = scores
+            .into_iter()
+            .map(|s| ((s - baseline) / n_slots as f64) as f32)
+            .collect();
+        if generated.chars().count() == n_slots && !cands.contains(&generated) {
+            let margin = ((gen_score - best) / n_slots as f64) as f32;
+            (char_lps, Some(generated), margin)
+        } else {
+            (char_lps, None, -100.0)
+        }
     }
 }
 
@@ -752,17 +686,10 @@ fn maybe_attach_gram(cfg: &InitConfig) {
             return;
         };
         if eng.gram_cache.contains_key(gpath) {
-            let changed = eng.default_gram_path.as_ref() != Some(gpath)
-                || canon_f64_bits(eng.default_gram_penalties.0) != canon_f64_bits(new_p.0)
-                || canon_f64_bits(eng.default_gram_penalties.1) != canon_f64_bits(new_p.1)
-                || eng.default_gram_max_len != new_max;
             eng.default_gram_path = Some(gpath.clone());
             eng.default_gram_penalties = new_p;
             eng.default_gram_max_len = new_max;
             eng.stats.has_gram = true;
-            if changed {
-                eng.lru_map.clear();
-            }
             true
         } else {
             false
@@ -776,7 +703,7 @@ fn maybe_attach_gram(cfg: &InitConfig) {
     if !gpath.is_file() {
         return;
     }
-    let Ok(g) = WanxiangGram::open_with_max_len(gpath, new_p.0, new_p.1, new_max) else {
+    let Ok(g) = WanxiangGram::open(gpath) else {
         return;
     };
 
@@ -787,7 +714,6 @@ fn maybe_attach_gram(cfg: &InitConfig) {
         eng.default_gram_penalties = new_p;
         eng.default_gram_max_len = new_max;
         eng.stats.has_gram = true;
-        eng.lru_map.clear();
     }
 }
 
@@ -853,7 +779,7 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
 
     // Union `uv.readings` and `uv.ml.pinyin` (preserving order and deduplicating per char) so
     // delta `ml.pinyin` tables never erase base `uv.readings` entries, while `old_chars` strictly
-    // caps `syl_to_p2c_cids` for Simplified P2C generation.
+    // caps Simplified P2C generation within each sorted list of character IDs.
     let mut merged_readings = uv.readings;
     if let Some(ref ml) = uv.ml {
         for (ch, rlist) in &ml.pinyin {
@@ -866,7 +792,6 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
         }
     }
 
-    let mut syl_to_p2c_cids: HashMap<String, Vec<usize>> = HashMap::with_capacity(450);
     let mut syl_to_all_cids: HashMap<String, Vec<usize>> = HashMap::with_capacity(450);
     for (ch_str, rlist) in &merged_readings {
         if let Some(ch) = ch_str.chars().next()
@@ -875,15 +800,8 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
         {
             for syl in rlist {
                 syl_to_all_cids.entry(syl.clone()).or_default().push(cid);
-                if cid < old_chars {
-                    syl_to_p2c_cids.entry(syl.clone()).or_default().push(cid);
-                }
             }
         }
-    }
-    for cids in syl_to_p2c_cids.values_mut() {
-        cids.sort_unstable();
-        cids.dedup();
     }
     for cids in syl_to_all_cids.values_mut() {
         cids.sort_unstable();
@@ -997,8 +915,7 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
     let mut default_gram_path = None;
     if let Some(gp) = cfg.gram_path.as_deref()
         && gp.is_file()
-        && let Ok(g) =
-            WanxiangGram::open_with_max_len(gp, gram_penalties.0, gram_penalties.1, gram_max_len)
+        && let Ok(g) = WanxiangGram::open(gp)
     {
         gram_cache.insert(gp.to_path_buf(), g);
         default_gram_path = Some(gp.to_path_buf());
@@ -1041,7 +958,6 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
         char_vocab: CharVocab {
             chars: uv.chars,
             char_to_id,
-            syl_to_p2c_cids,
             syl_to_all_cids,
             old_chars,
             max_slots,
@@ -1080,15 +996,17 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
 
     // Single untimed warmup pass (also pre-populates empty-context KV cache!)
     let warmup_cands = vec!["你好".to_string(), "拟好".to_string()];
-    let _ = engine.evaluate(
-        "",
-        "nihk",
-        PinyinLayout::Zrm,
-        &warmup_cands,
-        FusionWeights::default(),
-        0.0,
-        &GramRequest::Default,
-    );
+    engine
+        .evaluate(
+            "",
+            "nihk",
+            PinyinLayout::Zrm,
+            &warmup_cands,
+            FusionWeights::default(),
+            0.0,
+            &GramRequest::Default,
+        )
+        .map_err(|e| format!("model warmup: {e}"))?;
     engine.lru_map.clear();
     engine.lru_clock = 0;
     engine.stats.calls = 0;
@@ -1481,74 +1399,42 @@ impl NeuralEngine {
         &self,
         req: &GramRequest,
     ) -> (ResolvedGramKey, Option<(f64, f64, usize)>) {
-        match req {
-            GramRequest::Disabled => (
-                ResolvedGramKey {
-                    path: None,
-                    col_bits: 0,
-                    non_col_bits: 0,
-                    max_length: 0,
-                },
-                None,
-            ),
-            GramRequest::Default => {
-                if let Some(ref p) = self.default_gram_path
-                    && self.gram_cache.contains_key(p)
-                {
-                    let (col, non_col) = self.default_gram_penalties;
-                    let max_len = self.default_gram_max_len;
-                    (
-                        ResolvedGramKey {
-                            path: Some(p.clone()),
-                            col_bits: canon_f64_bits(col),
-                            non_col_bits: canon_f64_bits(non_col),
-                            max_length: max_len,
-                        },
-                        Some((col, non_col, max_len)),
-                    )
-                } else {
-                    (
-                        ResolvedGramKey {
-                            path: None,
-                            col_bits: 0,
-                            non_col_bits: 0,
-                            max_length: 0,
-                        },
-                        None,
-                    )
-                }
-            }
+        let active = match req {
+            GramRequest::Disabled => None,
+            GramRequest::Default => self.default_gram_path.as_ref().map(|path| {
+                let (col, non_col) = self.default_gram_penalties;
+                (path, col, non_col, self.default_gram_max_len)
+            }),
             GramRequest::Custom {
-                path,
+                paths,
                 collocation_penalty,
                 non_collocation_penalty,
                 max_length,
-            } => {
-                if self.gram_cache.contains_key(path) {
-                    let col = f64::from_bits(*collocation_penalty);
-                    let non_col = f64::from_bits(*non_collocation_penalty);
-                    let max_len = sanitize_max_length(*max_length);
+            } => paths
+                .iter()
+                .flatten()
+                .find(|path| self.gram_cache.contains_key(*path))
+                .map(|path| {
                     (
-                        ResolvedGramKey {
-                            path: Some(path.clone()),
-                            col_bits: *collocation_penalty,
-                            non_col_bits: *non_collocation_penalty,
-                            max_length: max_len,
-                        },
-                        Some((col, non_col, max_len)),
+                        path,
+                        f64::from_bits(*collocation_penalty),
+                        f64::from_bits(*non_collocation_penalty),
+                        *max_length,
                     )
-                } else {
-                    (
-                        ResolvedGramKey {
-                            path: None,
-                            col_bits: 0,
-                            non_col_bits: 0,
-                            max_length: 0,
-                        },
-                        None,
-                    )
-                }
-            }
+                }),
+        };
+        if let Some((path, col, non_col, max_length)) = active {
+            (
+                ResolvedGramKey {
+                    path: Some(path.clone()),
+                    col_bits: canon_f64_bits(col),
+                    non_col_bits: canon_f64_bits(non_col),
+                    max_length,
+                },
+                Some((col, non_col, max_length)),
+            )
+        } else {
+            (ResolvedGramKey::default(), None)
         }
     }
 
@@ -1578,7 +1464,7 @@ impl NeuralEngine {
                 canon_f64_bits(weights.w_ctx_lp),
             ],
             p2c_verify_margin_bits: canon_f32_bits(p2c_verify_margin),
-            gram_key: gram_key.clone(),
+            gram_key,
             cands: cands.to_vec(),
         };
         if let Some(entry) = self.lru_map.get_mut(&key) {
@@ -1644,7 +1530,8 @@ impl NeuralEngine {
         };
 
         // Compute exact `.gram` deltas (~0.004 ms/cand) using per-schema params and retain `raw_g`
-        let active_gram_ref = gram_key
+        let active_gram_ref = key
+            .gram_key
             .path
             .as_ref()
             .and_then(|p| self.gram_cache.get(p))
@@ -1654,7 +1541,7 @@ impl NeuralEngine {
             if let Some((g, (col, non_col, max_len))) = active_gram_ref {
                 let rg: Vec<f64> = cands
                     .iter()
-                    .map(|c| g.score_sentence_per_char_with(c, col, non_col, max_len))
+                    .map(|c| g.score_sentence_per_char(c, col, non_col, max_len))
                     .collect();
                 let g0 = rg.first().copied().unwrap_or(0.0);
                 let gd = rg.iter().map(|&x| (x - g0) as f32).collect();
@@ -1693,16 +1580,15 @@ impl NeuralEngine {
             {
                 let ldiff = l_p2c - l_best;
                 self.stats.p2c_pass2_calls += 1;
-                let gdiff = if let Some((g, (col, non_col, max_len))) = gram_key
+                let gdiff = if let Some((g, (col, non_col, max_len))) = key
+                    .gram_key
                     .path
                     .as_ref()
                     .and_then(|p| self.gram_cache.get(p))
                     .zip(gram_params)
                 {
-                    let best_g = raw_g.get(best_idx).copied().unwrap_or_else(|| {
-                        g.score_sentence_per_char_with(&cands[best_idx], col, non_col, max_len)
-                    });
-                    (g.score_sentence_per_char_with(p2c_str, col, non_col, max_len) - best_g) as f32
+                    (g.score_sentence_per_char(p2c_str, col, non_col, max_len) - raw_g[best_idx])
+                        as f32
                 } else {
                     0.0
                 };
@@ -2218,19 +2104,14 @@ mod tests {
         for (i, s) in chars.iter().enumerate() {
             char_to_id.insert(s.chars().next().unwrap(), i);
         }
-        let mut syl_to_p2c_cids = HashMap::new();
-        syl_to_p2c_cids.insert("ni".to_string(), vec![0, 1]);
-        syl_to_p2c_cids.insert("hao".to_string(), vec![2, 3]);
-        syl_to_p2c_cids.insert("fang".to_string(), vec![5]);
-        syl_to_p2c_cids.insert("an".to_string(), vec![6]);
-
-        let mut syl_to_all_cids = syl_to_p2c_cids.clone();
-        // Pretend `東` (cid=4 >= old_chars=4) also maps to `hao` for testing extended scoring
+        let mut syl_to_all_cids = HashMap::new();
+        syl_to_all_cids.insert("ni".to_string(), vec![0, 1]);
         syl_to_all_cids.insert("hao".to_string(), vec![2, 3, 4]);
+        syl_to_all_cids.insert("fang".to_string(), vec![5]);
+        syl_to_all_cids.insert("an".to_string(), vec![6]);
         CharVocab {
             chars,
             char_to_id,
-            syl_to_p2c_cids,
             syl_to_all_cids,
             old_chars: 4,
             max_slots: 24,
@@ -2352,6 +2233,38 @@ mod tests {
         );
         assert_eq!(clps_alt, vec![0.0, 0.0]);
         assert_eq!(p2c_alt, None);
+    }
+
+    #[test]
+    fn test_extended_character_logits_share_candidate_and_p2c_scale() {
+        let cv = test_char_vocab();
+        let readings = test_readings();
+        let units = [("f", "ni".to_string()), ("f", "hao".to_string())];
+        let mut scores = [0.0; 18];
+        scores[1] = 5.0;
+        scores[9 + 3] = 5.0;
+        scores[9 + 4] = 15.0;
+        let cands = ["你好".into(), "你東".into()];
+        let (clps, generated, margin) =
+            cv.decode_char_logits(&scores, (2, 9), &units, &cands, &readings, 2, false);
+        assert_eq!(clps, [0.0, 7.5]);
+        assert_eq!(generated.as_deref(), Some("拟号"));
+        assert_eq!(margin, -2.5);
+
+        // A slot with only extended finite logits can still score existing candidates.
+        scores[9 + 2] = f32::NAN;
+        scores[9 + 3] = f32::NAN;
+        let cands = ["你東".into(), "拟東".into()];
+        let (clps, generated, _) =
+            cv.decode_char_logits(&scores, (2, 9), &units, &cands, &readings, 2, false);
+        assert_eq!(clps, [0.0, 2.5]);
+        assert_eq!(generated, None);
+
+        // For an unknown character the fixed -15 log probability uses all three hao IDs.
+        let cands = ["你好".into(), "你□".into()];
+        let (clps, _, _) =
+            cv.decode_char_logits(&[0.0; 18], (2, 9), &units, &cands, &readings, 2, false);
+        assert!((clps[1] - (3.0f32.ln() - 15.0) / 2.0).abs() < 1e-6);
     }
 
     #[test]

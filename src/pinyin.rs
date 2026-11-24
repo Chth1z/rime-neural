@@ -1018,7 +1018,7 @@ mod tests {
     use super::*;
 
     fn sample_valid_syllables() -> HashSet<String> {
-        let mut set: HashSet<String> = [
+        [
             "a", "o", "e", "ai", "ei", "ao", "ou", "an", "en", "ang", "eng", "er", "zhu", "zhui",
             "zhuang", "zhuai", "chuan", "shuo", "shuang", "shui", "nv", "lv", "lve", "nve", "jue",
             "que", "xue", "yue", "ju", "qu", "xu", "yu", "suo", "bo", "po", "mo", "fo", "wo", "yo",
@@ -1029,32 +1029,11 @@ mod tests {
             "lie", "jie", "qie", "xie", "piao", "miao", "diao", "tiao", "niao", "liao", "jiao",
             "qiao", "xiao", "kun", "gun", "hun", "dun", "tun", "lun", "zun", "cun", "sun", "run",
             "zhun", "chun", "shun", "xi", "xian", "fang", "fan", "gan", "nai", "ce", "lu", "dai",
-            "ding", "yao", "juan", "quan", "xuan", "yuan", "jun", "qun", "xun", "yun", "ze",
+            "ding", "jin", "yao", "juan", "quan", "xuan", "yuan", "jun", "qun", "xun", "yun", "ze",
         ]
         .into_iter()
         .map(String::from)
-        .collect();
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            for sub in ["neural", "zhiyi"] {
-                let p = std::path::PathBuf::from(&appdata)
-                    .join("Rime")
-                    .join(sub)
-                    .join("unified_vocab.json");
-                if let Ok(raw) = std::fs::read_to_string(&p) {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
-                        && let Some(arr) = v.get("units").and_then(|u| u.as_array())
-                    {
-                        for item in arr {
-                            if let Some(s) = item.as_str().and_then(|u| u.strip_prefix("f:")) {
-                                set.insert(s.to_string());
-                            }
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-        set
+        .collect()
     }
 
     #[test]
@@ -1420,7 +1399,17 @@ mod tests {
 
     #[test]
     fn test_exhaustive_roundtrip_all_7_layouts() {
-        let valid = sample_valid_syllables();
+        let mut valid = sample_valid_syllables();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("unified_vocab.json");
+        if fixture.is_file() {
+            let vocab: serde_json::Value =
+                serde_json::from_reader(std::fs::File::open(fixture).unwrap()).unwrap();
+            for unit in vocab["units"].as_array().unwrap() {
+                if let Some(syl) = unit.as_str().unwrap().strip_prefix("f:") {
+                    valid.insert(syl.to_owned());
+                }
+            }
+        }
         let skip = [
             "hm", "hng", "m", "n", "ng", "lo", "nou", "den", "kei", "dia", "tei", "fiao", "chua",
         ];

@@ -81,9 +81,6 @@ pub struct WanxiangGram {
     view: *const u8,
     da_ptr: *const u32,
     da_len: usize,
-    collocation_penalty: f64,
-    non_collocation_penalty: f64,
-    collocation_max_length: usize,
 }
 
 // SAFETY: `WanxiangGram` holds read-only Win32 file/mapping handles and an immutable `PAGE_READONLY`
@@ -97,15 +94,9 @@ impl Drop for WanxiangGram {
         // SAFETY: Each handle/view was obtained from Win32 and is unmapped/closed in reverse order
         // exactly once when `WanxiangGram` is dropped.
         unsafe {
-            if !self.view.is_null() {
-                UnmapViewOfFile(self.view as *const c_void);
-            }
-            if !self._mapping.is_null() {
-                CloseHandle(self._mapping);
-            }
-            if !self._file.is_null() && self._file != INVALID_HANDLE_VALUE {
-                CloseHandle(self._file);
-            }
+            UnmapViewOfFile(self.view as *const c_void);
+            CloseHandle(self._mapping);
+            CloseHandle(self._file);
         }
     }
 }
@@ -211,9 +202,8 @@ fn score_slice_per_char(
     text: &str,
     collocation_penalty: f64,
     non_collocation_penalty: f64,
-    max_length: usize,
+    max_len: usize,
 ) -> f64 {
-    let max_len = sanitize_max_length(max_length);
     let mut encoded: [([u8; 6], u8); 48] = [([0; 6], 0); 48];
     let mut n = 0usize;
     let mut overflow: Vec<([u8; 6], u8)> = Vec::new();
@@ -311,29 +301,7 @@ fn score_slice_per_char(
 }
 
 impl WanxiangGram {
-    #[cfg(test)]
-    pub fn open(
-        path: &Path,
-        collocation_penalty: f64,
-        non_collocation_penalty: f64,
-    ) -> Result<Self, String> {
-        Self::open_with_max_len(
-            path,
-            collocation_penalty,
-            non_collocation_penalty,
-            DEFAULT_COLLOCATION_MAX_LENGTH,
-        )
-    }
-
-    pub fn open_with_max_len(
-        path: &Path,
-        collocation_penalty: f64,
-        non_collocation_penalty: f64,
-        collocation_max_length: usize,
-    ) -> Result<Self, String> {
-        let (collocation_penalty, non_collocation_penalty) =
-            sanitize_penalties(collocation_penalty, non_collocation_penalty);
-        let collocation_max_length = sanitize_max_length(collocation_max_length);
+    pub fn open(path: &Path) -> Result<Self, String> {
         let wide: Vec<u16> = path
             .as_os_str()
             .encode_wide()
@@ -411,20 +379,7 @@ impl WanxiangGram {
                 view,
                 da_ptr: view.add(da_off) as *const u32,
                 da_len: da_size,
-                collocation_penalty,
-                non_collocation_penalty,
-                collocation_max_length,
             })
-        }
-    }
-
-    #[cfg(test)]
-    pub fn update_penalties(&mut self, collocation_penalty: f64, non_collocation_penalty: f64) {
-        if collocation_penalty.is_finite() {
-            self.collocation_penalty = collocation_penalty;
-        }
-        if non_collocation_penalty.is_finite() {
-            self.non_collocation_penalty = non_collocation_penalty;
         }
     }
 
@@ -435,29 +390,22 @@ impl WanxiangGram {
         unsafe { std::slice::from_raw_parts(self.da_ptr, self.da_len) }
     }
 
-    /// Mean per-character transition log-weight in the grammar trie using this instance's defaults.
-    #[allow(dead_code)]
-    pub fn score_sentence_per_char(&self, text: &str) -> f64 {
-        score_slice_per_char(
-            self.da_slice(),
-            text,
-            self.collocation_penalty,
-            self.non_collocation_penalty,
-            self.collocation_max_length,
-        )
-    }
-
     /// Score a sentence with explicit per-schema penalties and max collocation length
     /// without mutating the shared read-only memory mapping.
-    pub fn score_sentence_per_char_with(
+    pub fn score_sentence_per_char(
         &self,
         text: &str,
         collocation_penalty: f64,
         non_collocation_penalty: f64,
         collocation_max_length: usize,
     ) -> f64 {
-        let (col, non_col) = sanitize_penalties(collocation_penalty, non_collocation_penalty);
-        score_slice_per_char(self.da_slice(), text, col, non_col, collocation_max_length)
+        score_slice_per_char(
+            self.da_slice(),
+            text,
+            collocation_penalty,
+            non_collocation_penalty,
+            collocation_max_length,
+        )
     }
 }
 
@@ -706,37 +654,31 @@ mod tests {
         // End-to-end Win32 mmap open + per-call penalties + NaN sanitization
         let tmp = std::env::temp_dir().join("rime_neural_test_synthetic.gram");
         write_synthetic_gram_file(&tmp, &da);
-        let mut gram = WanxiangGram::open(&tmp, -15.5, -4.0).expect("open synthetic gram");
+        let gram = WanxiangGram::open(&tmp).expect("open synthetic gram");
         assert!(
-            (gram.score_sentence_per_char("你好世界") - 3.5).abs() < 1e-6,
+            (gram.score_sentence_per_char("你好世界", -15.5, -4.0, 5) - 3.5).abs() < 1e-6,
             "expected 19.0 - 15.5 = 3.5"
         );
         assert!(
-            (gram.score_sentence_per_char_with("你好世界", -14.0, -4.0, 5) - 5.0).abs() < 1e-6,
+            (gram.score_sentence_per_char("你好世界", -14.0, -4.0, 5) - 5.0).abs() < 1e-6,
             "expected 19.0 - 14.0 = 5.0"
         );
         assert!(
-            (gram.score_sentence_per_char_with("中卫市沙坡头区", -15.5, -4.0, 7) - 9.1548).abs()
-                < 1e-6
+            (gram.score_sentence_per_char("中卫市沙坡头区", -15.5, -4.0, 7) - 9.1548).abs() < 1e-6
         );
-        gram.update_penalties(f64::NAN, f64::INFINITY);
-        assert!((gram.score_sentence_per_char("你好世界") - 3.5).abs() < 1e-6);
+        assert_eq!(sanitize_penalties(f64::NAN, f64::INFINITY), (-15.5, -4.0));
         drop(gram);
         let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_wanxiang_gram_if_present_and_single_pass_equivalence() {
-        let Ok(appdata) = std::env::var("APPDATA") else {
-            return;
-        };
-        let p = Path::new(&appdata)
-            .join("Rime")
-            .join("wanxiang-lts-zh-hans.gram");
+        // Optional integration fixture alongside Cargo.toml, ignored by Git.
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("wanxiang-lts-zh-hans.gram");
         if !p.is_file() {
             return;
         }
-        let gram = WanxiangGram::open(&p, -15.5, -4.0).expect("open gram");
+        let gram = WanxiangGram::open(&p).expect("open gram");
         let sentences = [
             "所有按键都在传送带上循环滚动",
             "所有案件都在传送带上循环滚动",
@@ -748,7 +690,7 @@ mod tests {
             "",
         ];
         for s in sentences {
-            let fast = gram.score_sentence_per_char(s);
+            let fast = gram.score_sentence_per_char(s, -15.5, -4.0, 5);
             let ref_s = reference_score_slice(gram.da_slice(), s, -15.5, -4.0, 5);
             assert_eq!(
                 fast.to_bits(),
@@ -759,15 +701,15 @@ mod tests {
                 ref_s
             );
         }
-        let s1 = gram.score_sentence_per_char("所有按键都在传送带上循环滚动");
-        let s2 = gram.score_sentence_per_char("所有案件都在传送带上循环滚动");
+        let s1 = gram.score_sentence_per_char("所有按键都在传送带上循环滚动", -15.5, -4.0, 5);
+        let s2 = gram.score_sentence_per_char("所有案件都在传送带上循环滚动", -15.5, -4.0, 5);
         assert!(
             s2 > s1,
             "expected 案件 ({}) > 按键 ({}) in raw N-gram",
             s2,
             s1
         );
-        let s_2031 = gram.score_sentence_per_char("二〇三一年");
+        let s_2031 = gram.score_sentence_per_char("二〇三一年", -15.5, -4.0, 5);
         assert!(
             s_2031 > 0.0,
             "expected 二〇三一年 to hit wanxiang trie (> 0.0), got {}",
@@ -841,7 +783,7 @@ mod tests {
         buf[40..44].copy_from_slice(&(-40i32).to_le_bytes());
         let tmp = std::env::temp_dir().join("rime_neural_test_corrupt_off.gram");
         std::fs::write(&tmp, &buf).expect("write tmp gram");
-        let res = WanxiangGram::open(&tmp, -15.5, -4.0);
+        let res = WanxiangGram::open(&tmp);
         let _ = std::fs::remove_file(&tmp);
         assert!(res.is_err(), "expected corrupt negative rel_off to fail");
     }
