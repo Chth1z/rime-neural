@@ -93,11 +93,10 @@ If the user opted to install `wanxiang-lts-zh-hans.gram` into `<RimeUserDir>\wan
 
 ## Optional: Lightweight Model (`zhen-feather`)
 
-If the user installed `zhen-feather-preview-1121` (`laya.one.w4.onnx`) AND also still has `laya.one.fused.int8g.onnx` in `<RimeUserDir>\neural\`, set:
+Each ONNX model ships with its own paired `tokenizer.json` and `unified_vocab.json`, so keep only one model active in `<RimeUserDir>\neural\`. Running `scripts\install.ps1 -Prebuilt -Model feather` (or `-Model pumpkin`) automatically installs the matching vocab/tokenizer and removes conflicting `.onnx` files; `model_file` can stay omitted for auto-detection.
+
+To point a schema at a specific model filename inside an existing paired directory, set the single dotted key under `patch:` (never add a second `rime_neural:` block):
 
 ```yaml
-  rime_neural:
-    model_file: laya.one.w4.onnx
+  rime_neural/model_file: laya.one.w4.onnx
 ```
-
-If only one `.onnx` file is present in `<RimeUserDir>\neural\`, `model_file` can be left omitted (auto-detected).

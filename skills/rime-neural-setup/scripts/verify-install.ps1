@@ -43,7 +43,7 @@ $onnxDetail = if ($onnxFiles.Count -ge 1) {
 } else {
     "MISSING: no .onnx model in $neuralDir"
 }
-Add-Check -Name "file:onnx_model" -Ok ($onnxFiles.Count -ge 1) -Detail $onnxDetail
+Add-Check -Name "file:onnx_model" -Ok ($onnxFiles.Count -eq 1) -Detail $(if ($onnxFiles.Count -gt 1) { "CONFLICT ($($onnxFiles.Count) .onnx files may mismatch tokenizer/vocab): $onnxDetail" } else { $onnxDetail })
 
 $luaDetail = if (Test-Path $luaFile) { $luaFile } else { "MISSING: $luaFile" }
 Add-Check -Name "file:rime_neural.lua" -Ok (Test-Path $luaFile) -Detail $luaDetail
@@ -66,25 +66,60 @@ if ($SchemaId) {
     $builtSchema = Join-Path $RimeDir "build\$SchemaId.schema.yaml"
     if (Test-Path $builtSchema) {
         $raw = Get-Content $builtSchema -Raw -Encoding UTF8
-        $hasFilter = $raw -match 'lua_filter@\*rime_neural'
-        $filterMsg = if ($hasFilter) {
-            "lua_filter@*rime_neural present in build/$SchemaId.schema.yaml"
+        # Extract ONLY the `engine:` -> `filters:` list items from compiled YAML (avoids false positives on other sections)
+        $filters = [System.Collections.Generic.List[string]]::new()
+        $inEngine = $false
+        $inFilters = $false
+        foreach ($line in ($raw -split "`r?`n")) {
+            if ($line -match '^engine:\s*$') { $inEngine = $true; $inFilters = $false; continue }
+            if ($inEngine -and $line -match '^\S') { $inEngine = $false; $inFilters = $false }
+            if ($inEngine) {
+                if ($line -match '^\s{2}filters:\s*$') { $inFilters = $true; continue }
+                if ($inFilters) {
+                    if ($line -match '^\s{4}-\s*"?([^"#]+?)"?\s*(?:#.*)?$') {
+                        $filters.Add($Matches[1].Trim())
+                    } elseif ($line -match '^\s{2}\S') {
+                        $inFilters = $false
+                    }
+                }
+            }
+        }
+
+        $neuralIndices = @()
+        for ($i = 0; $i -lt $filters.Count; $i++) {
+            if ($filters[$i] -eq "lua_filter@*rime_neural") { $neuralIndices += $i }
+        }
+        $hasFilter = ($neuralIndices.Count -eq 1)
+        $filterMsg = if ($neuralIndices.Count -eq 1) {
+            "lua_filter@*rime_neural mounted once at engine/filters[$($neuralIndices[0])]"
+        } elseif ($neuralIndices.Count -gt 1) {
+            "DUPLICATE mount: lua_filter@*rime_neural appears $($neuralIndices.Count) times in engine/filters"
         } else {
-            "NOT FOUND in build/$SchemaId.schema.yaml (did you run WeaselDeployer /deploy?)"
+            "NOT FOUND in build/$SchemaId.schema.yaml engine/filters (did you run WeaselDeployer /deploy?)"
         }
         Add-Check -Name "build:${SchemaId}:filter_mounted" -Ok $hasFilter -Detail $filterMsg
 
-        # Verify rime_neural appears BEFORE simplifier (OpenCC) if simplifier exists
-        $idxNeural = $raw.IndexOf("lua_filter@*rime_neural")
-        $idxSimp   = $raw.IndexOf("simplifier")
-        if ($idxNeural -ge 0 -and $idxSimp -ge 0) {
-            $orderOk = $idxNeural -lt $idxSimp
-            $orderMsg = if ($orderOk) {
-                "rime_neural precedes simplifier (OpenCC)"
-            } else {
-                "WARNING: rime_neural appears AFTER simplifier; move it before OpenCC!"
+        # Verify rime_neural appears BEFORE OpenCC / Traditionalization filters (simplifier, tw_dual_filter, wanxiang.charset_filter)
+        if ($neuralIndices.Count -ge 1) {
+            $firstNeural = $neuralIndices[0]
+            $firstOpencc = -1
+            $firstOpenccName = ""
+            for ($i = 0; $i -lt $filters.Count; $i++) {
+                if ($filters[$i] -match '^(simplifier\b|lua_filter@\*tw_dual_filter\b|lua_filter@\*?wanxiang\.charset_filter\b)') {
+                    $firstOpencc = $i
+                    $firstOpenccName = $filters[$i]
+                    break
+                }
             }
-            Add-Check -Name "build:${SchemaId}:filter_before_opencc" -Ok $orderOk -Detail $orderMsg
+            if ($firstOpencc -ge 0) {
+                $orderOk = $firstNeural -lt $firstOpencc
+                $orderMsg = if ($orderOk) {
+                    "rime_neural (idx $firstNeural) precedes $firstOpenccName (idx $firstOpencc)"
+                } else {
+                    "WARNING: rime_neural (idx $firstNeural) appears AFTER $firstOpenccName (idx $firstOpencc); move it before OpenCC!"
+                }
+                Add-Check -Name "build:${SchemaId}:filter_before_opencc" -Ok $orderOk -Detail $orderMsg
+            }
         }
 
         $maxSentOk = $raw -match 'max_sentences:\s*([6-9]|[1-9]\d)'
@@ -121,7 +156,7 @@ if (Test-Path $logDir) {
         Where-Object { $_.LastWriteTime -ge $cutoff -and ($_.Name -match '\.INFO\.') } |
         Sort-Object LastWriteTime -Descending | Select-Object -First 2
     foreach ($lf in $infoLogs) {
-        $hits = Select-String -Path $lf.FullName -Pattern '^[WE]\d{4}\b.*(rime_neural|lua_filter.*error|loadlib failed)' -ErrorAction SilentlyContinue
+        $hits = Select-String -Path $lf.FullName -Pattern '^[WEF]\d{4,8}\s.*(rime_neural|lua_filter.*error|loadlib failed)' -ErrorAction SilentlyContinue
         foreach ($h in $hits) {
             $line = $h.Line.Trim()
             if ($seenLines.Add($line)) {

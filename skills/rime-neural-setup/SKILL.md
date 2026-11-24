@@ -45,7 +45,7 @@ Unless the user already specified all choices (or asked for "recommended default
    - Explain clearly that `rime-neural` works standalone, **but pairing it with `wanxiang-lts-zh-hans.gram` improves both Top-8 candidate recall and reranking accuracy (`0 MB` extra RAM via shared memory mapping)**.
 4. **Optional Privacy Preferences** (mention defaults so there are no surprises):
    - `enable_uia_context: true` (reads up to 64 chars before cursor locally; password fields & password managers are hard-blocked).
-   - `log_feedback: true` (redacted local commit log capped at 5 MiB for optional personal weight tuning).
+   - `log_feedback: true` (zero-plaintext local numeric/index commit log capped at 5 MiB for optional personal weight tuning; stores only model scores and candidate indices, never user text or context).
 
 ### Step 3: Install Binaries, ONNX Runtime & Verified Model
 
@@ -62,12 +62,21 @@ Unless the user already specified all choices (or asked for "recommended default
    (Use `-Model feather` if the user chose the lightweight 8-layer model.)
 
 2. **If the user opted to install `wanxiang-lts-zh-hans.gram`** and it is not already in `<rime_user_dir>`:
-   Download the latest LTS `.gram` asset from `amzxyz/rime-wanxiang-data` (`releases/tags/LTS`) into `<rime_user_dir>\wanxiang-lts-zh-hans.gram`:
+   Stage the latest LTS `.gram` asset from `amzxyz/rime-wanxiang-data` (`releases/tags/LTS`) into `%TEMP%`, verify its SHA-256 digest, stop `WeaselServer.exe`, and move it into `<rime_user_dir>\wanxiang-lts-zh-hans.gram`:
 
    ```powershell
+   [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
    $rel = Invoke-RestMethod "https://api.github.com/repos/amzxyz/rime-wanxiang-data/releases/tags/LTS" -Headers @{ "User-Agent" = "rime-neural-setup" }
    $asset = $rel.assets | Where-Object { $_.name -eq "wanxiang-lts-zh-hans.gram" } | Select-Object -First 1
-   & curl.exe -fSL --retry 3 -o "<rime_user_dir>\wanxiang-lts-zh-hans.gram" $asset.browser_download_url
+   $tmpGram = Join-Path $env:TEMP "wanxiang-lts-zh-hans.gram"
+   & curl.exe -fSL --retry 3 -o $tmpGram $asset.browser_download_url
+   if ($asset.digest -match '^sha256:([0-9a-fA-F]{64})$') {
+       $got = (Get-FileHash $tmpGram -Algorithm SHA256).Hash.ToLowerInvariant()
+       if ($got -ne $Matches[1].ToLowerInvariant()) { throw "wanxiang .gram SHA-256 mismatch!" }
+   }
+   & "<weasel_dir>\WeaselServer.exe" /q 2>$null; Start-Sleep -Milliseconds 600
+   Get-Process -Name WeaselServer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+   Move-Item -Path $tmpGram -Destination "<rime_user_dir>\wanxiang-lts-zh-hans.gram" -Force
    ```
 
 ### Step 4: Patch `<schema_id>.custom.yaml` Safely
@@ -97,8 +106,14 @@ Never end the task without deploying and verifying!
    $p = Start-Process -FilePath "$weaselDir\WeaselDeployer.exe" -ArgumentList "/deploy" -Wait -PassThru
    if ($p.ExitCode -ne 0) { throw "WeaselDeployer failed with exit code $($p.ExitCode)" }
 
-   Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = "`"$weaselDir\WeaselServer.exe`"" } | Out-Null
-   Start-Sleep -Milliseconds 800
+   Start-Sleep -Milliseconds 400
+   $procs = @(Get-Process -Name WeaselServer -ErrorAction SilentlyContinue)
+   if ($procs.Count -eq 0) {
+       Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = "`"$weaselDir\WeaselServer.exe`"" } | Out-Null
+       Start-Sleep -Milliseconds 800
+   } elseif ($procs.Count -gt 1) {
+       $procs | Sort-Object StartTime | Select-Object -Skip 1 | Stop-Process -Force -ErrorAction SilentlyContinue
+   }
    ```
 
 2. **Run [`scripts/verify-install.ps1`](./scripts/verify-install.ps1)** in a **separate command** (this also proves `WeaselServer.exe` stayed alive after the previous shell exited):

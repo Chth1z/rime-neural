@@ -193,13 +193,13 @@ Intel Core Ultra 7 255HX，隔离 `rime.dll` 基准实测：
 
 ```text
 官方小狼毫 (WeaselServer.exe / rime.dll, librime >= 1.17.0, Lua 5.4)
-  ├── lua/rime_neural.lua            # Lua 滤镜：方案布局识别、整句门控、UIA 预热、脱敏反馈记录
+  ├── lua/rime_neural.lua            # Lua 滤镜：方案布局识别、整句门控、UIA 预热、纯数值反馈记录
   └── neural/rime_neural.dll (Rust)  # 动态解析 rime.dll Lua C API，进程内钉驻
         ├── engine.rs                # ONNX 结构自省、选择性输出裁剪、16 槽 KV-cache、Pass-2 P2C
         ├── gram.rs                  # Win32 共享内存只读映射 Rime::Grammar/1.0
         ├── pinyin.rs                # 记忆化全拼对齐 + 7 套双拼码表
-        ├── uia.rs                   # 后台 STA UIA 读取（RangeFromChild 钳制 + 密码屏蔽）
-        └── feedback.rs              # 本地脱敏日志（5 MiB 自动轮转）
+        ├── uia.rs                   # 后台 MTA UIA 读取（RangeFromChild 钳制 + 200ms 超时 + 密码屏蔽）
+        └── feedback.rs              # 零明文纯数值本地日志（5 MiB 自动轮转）
 ```
 
 实现细节见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
@@ -217,17 +217,18 @@ Intel Core Ultra 7 255HX，隔离 `rime.dll` 基准实测：
 | `enable_uia_context` | `true` | 非阻塞后台 Windows UIA 前文读取（按方案独立生效） |
 | `threads` | `0` | ONNX Runtime CPU 线程数（`0` 自动适配并限幅 `4..8`） |
 | `min_input_len` | 双拼 `4` / 全拼 `6` | 触发神经重排的最小有效拼音按键数 |
-| `model_file` | `""`（自动探测） | 可选：显式指定 `%APPDATA%\Rime\neural\` 下的 `.onnx` 文件名 |
+| `data_dir` | `""`（自动探测） | 可选：显式指定 `neural\` 数据目录（中文 Windows 用户名可指向纯 ASCII 路径） |
+| `model_file` | `""`（自动探测） | 可选：显式指定 `neural\` 下的 `.onnx` 文件名 |
 | `t2s_config` | `""`（自动 `tw2sp` / `t2s`） | 可选：显式指定繁体上文转简体的 OpenCC 配置文件（如 `t2s.json`） |
-| `log_feedback` | `true` | 本地脱敏日志开关（供可选的个人权重校准脚本使用） |
+| `log_feedback` | `true` | 零明文纯数值本地日志开关（供可选的个人权重校准脚本使用） |
 | `sync_init` | `false` | `false` 后台异步加载；`true` 同步加载（离线评测脚本用） |
 
 ## 隐私与安全边界
 
-- **本地离线推理**：推理阶段无网络请求；下载行为仅发生在执行安装脚本时，且对二进制与模型均执行 SHA-256 校验。
+- **本地离线推理**：推理阶段无网络请求；下载行为仅发生在执行安装脚本时，且对二进制、ONNX Runtime 与模型均执行哈希校验。
 - **密码场景屏蔽**：控件报告 `IsPassword == true`，或前台窗口 / 焦点控件进程属于密码管理器与系统凭据界面（`KeePass`、`KeePassXC`、`1Password`、`Bitwarden`、`Enpass`、`LastPass`、`Dashlane`、`RoboForm`、`NordPass`、`ProtonPass`、`CredentialUIBroker`、`consent.exe`、`LockApp`、`mstsc.exe`）时，返回空上文并停止记录反馈。
-- **脱敏本地日志**：`%APPDATA%\Rime\neural\feedback.jsonl` 将 4 位以上数字、邮箱、URL 及 12 位以上 ASCII Token 脱敏为 `<REDACTED>`，上文截断至 64 字，文件总大小上限为 5 MiB；设置 `log_feedback: false` 可禁用。
-- **可选个人权重校准**：积累 100 条以上本地选词记录后，可运行 `python scripts\tune-fusion.py`；仅在 5 折交叉验证与单侧 95% 置信检验均通过且 Top-1 准确率不下降时输出新权重建议。
+- **零明文本地日志**：`%APPDATA%\Rime\neural\feedback.jsonl` 仅记录模型数值特征（`logits`、`gram_deltas`、`char_lps`）与候选索引结果（`shown_top1_idx`、`chosen_idx`、`has_ctx`），不写入用户输入文本、按键串、候选词或屏幕上下文，文件总大小上限为 5 MiB 并自动轮转；设置 `log_feedback: false` 可关闭。
+- **可选个人权重校准**：积累 100 条以上本地选词记录后，可运行 `python scripts\tune-fusion.py`；仅在分块 5 折交叉验证与单侧 95% 置信检验（Hajek 稳健标准误）均通过且 Top-1 准确率不下降时输出新权重建议。
 
 ## 常见问题
 

@@ -193,13 +193,13 @@ Intel Core Ultra 7 255HX, isolated `rime.dll` benchmark:
 
 ```text
 Official Weasel (WeaselServer.exe / rime.dll, librime >= 1.17.0, Lua 5.4)
-  ├── lua/rime_neural.lua            # Lua filter: layout resolution, sentence gating, UIA pre-warm, feedback hook
+  ├── lua/rime_neural.lua            # Lua filter: layout resolution, sentence gating, UIA pre-warm, numeric feedback hook
   └── neural/rime_neural.dll (Rust)  # Dynamic Lua C API binding via rime.dll + in-process module pin
         ├── engine.rs                # ONNX introspection, selective outputs, 16-slot KV-cache, Pass-2 P2C
         ├── gram.rs                  # Zero-extra-RAM Win32 file mapping for Rime::Grammar/1.0
         ├── pinyin.rs                # Memoized Full Pinyin + 7 Double Pinyin layouts
-        ├── uia.rs                   # Background STA UIA reader (RangeFromChild clamp + password block)
-        └── feedback.rs              # Local redacted commit log (5 MiB auto-rotation)
+        ├── uia.rs                   # Background MTA UIA reader (RangeFromChild clamp + 200ms timeout + password block)
+        └── feedback.rs              # Zero-plaintext numeric local commit log (5 MiB auto-rotation)
 ```
 
 Implementation details are documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
@@ -217,17 +217,18 @@ Implementation details are documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECT
 | `enable_uia_context` | `true` | Non-blocking background Windows UIA context (per-schema) |
 | `threads` | `0` | ONNX Runtime CPU threads (`0` = auto `4..8`) |
 | `min_input_len` | `4` (DP) / `6` (Full) | Min pinyin key count before reranking |
-| `model_file` | `""` (auto) | Optional explicit `.onnx` filename under `%APPDATA%\Rime\neural\` |
+| `data_dir` | `""` (auto) | Optional explicit `neural\` directory path (useful on non-ASCII Windows profiles) |
+| `model_file` | `""` (auto) | Optional explicit `.onnx` filename under `neural\` |
 | `t2s_config` | `""` (auto `tw2sp` / `t2s`) | Optional explicit OpenCC config for Traditional-to-Simplified context normalization |
-| `log_feedback` | `true` | Local redacted commit log for optional personal tuning |
+| `log_feedback` | `true` | Zero-plaintext numeric local commit log for optional personal tuning |
 | `sync_init` | `false` | `false` = async background load; `true` = blocking load (for benchmarks) |
 
 ## Privacy & Security
 
-- **Offline inference**: No network requests at runtime; downloads occur only during explicit installation with SHA-256 verification.
+- **Offline inference**: No network requests at runtime; downloads occur only during explicit installation with cryptographic hash verification for binaries, ONNX Runtime, and models.
 - **Password blocking**: Controls reporting `IsPassword == true` and common password managers / credential UIs (`KeePass`, `KeePassXC`, `1Password`, `Bitwarden`, `Enpass`, `LastPass`, `Dashlane`, `RoboForm`, `NordPass`, `ProtonPass`, `CredentialUIBroker`, `consent.exe`, `LockApp`, `mstsc.exe`) return empty context and suppress feedback logging.
-- **Redacted local feedback**: `%APPDATA%\Rime\neural\feedback.jsonl` redacts 4+ digit numbers, emails, URLs, and 12+ char ASCII tokens to `<REDACTED>`, truncates context to 64 chars, and caps file size at 5 MiB. Set `log_feedback: false` to disable.
-- **Optional weight tuning**: After collecting 100+ local multi-candidate commits, `python scripts\tune-fusion.py` evaluates MAP shrinkage via 5-fold cross-validation and a one-sided 95% CI test before recommending updated weights.
+- **Zero-plaintext local feedback**: `%APPDATA%\Rime\neural\feedback.jsonl` stores only numeric model features (`logits`, `gram_deltas`, `char_lps`) and candidate index outcomes (`shown_top1_idx`, `chosen_idx`, `has_ctx`), never persisting user text, keystrokes, candidates, or screen context. File size is capped at 5 MiB with automatic rotation; set `log_feedback: false` to disable.
+- **Optional weight tuning**: After collecting 100+ local multi-candidate commits, `python scripts\tune-fusion.py` evaluates Bayesian MAP shrinkage via contiguous blocked 5-fold cross-validation and a one-sided 95% CI test (Hajek sandwich SE) before recommending updated weights.
 
 ## Troubleshooting
 

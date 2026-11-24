@@ -12,13 +12,13 @@ param()
 $ErrorActionPreference = "SilentlyContinue"
 
 function Get-WeaselDir {
-    $candidates = @()
     foreach ($regPath in @("HKLM:\SOFTWARE\Rime\Weasel", "HKLM:\SOFTWARE\WOW6432Node\Rime\Weasel", "HKCU:\SOFTWARE\Rime\Weasel")) {
         $root = (Get-ItemProperty -Path $regPath -Name "WeaselRoot" -ErrorAction SilentlyContinue).WeaselRoot
         if ($root -and (Test-Path (Join-Path $root "rime.dll"))) {
-            $candidates += (Get-Item $root)
+            return (Get-Item $root).FullName
         }
     }
+    $candidates = @()
     foreach ($base in @("C:\Program Files\Rime", "C:\Program Files (x86)\Rime")) {
         if (Test-Path $base) {
             $candidates += Get-ChildItem $base -Directory -Filter "weasel-*" |
@@ -68,11 +68,11 @@ foreach ($cfgFile in @("default.custom.yaml", "default.yaml")) {
         $lines = Get-Content $p -Encoding UTF8
         $inList = $false
         foreach ($line in $lines) {
-            if ($line -match '^\s*schema_list\s*:') { $inList = $true; continue }
+            if ($line -match '^\s*"?schema_list(?:/\+)?"?\s*:') { $inList = $true; continue }
             if ($inList) {
-                if ($line -match '^\s*-\s*schema\s*:\s*([A-Za-z0-9_\-]+)') {
+                if ($line -match '^\s*-\s*(?:\{\s*)?schema\s*:\s*"?([A-Za-z0-9_\-]+)"?') {
                     if ($activeSchemas -notcontains $Matches[1]) { $activeSchemas += $Matches[1] }
-                } elseif ($line -match '^\s*[A-Za-z_]' -and $line -notmatch '^\s*#') {
+                } elseif ($line -match '^\s*[A-Za-z_"]' -and $line -notmatch '^\s*#') {
                     $inList = $false
                 }
             }
@@ -126,9 +126,9 @@ $wanxiangHints = @()
 foreach ($wf in @("wanxiang.custom.yaml", "wanxiang_pro.custom.yaml", "wanxiang.schema.yaml")) {
     $wp = Join-Path $userDir $wf
     if (Test-Path $wp) {
-        $hits = Select-String -Path $wp -Pattern 'algebra|double_pinyin|flypy|zrm|mspy|sogou|abc|ziguang|pyjj|自然码|小鹤|微软|搜狗' |
-            Select-Object -First 8 | ForEach-Object { "$($wf):$($_.LineNumber): $($_.Line.Trim())" }
-        $wanxiangHints += $hits
+        $hits = @(Select-String -Path $wp -Pattern 'algebra|double_pinyin|flypy|zrm|mspy|sogou|abc|ziguang|pyjj|自然码|小鹤|微软|搜狗' |
+            Select-Object -First 8 | ForEach-Object { "$($wf):$($_.LineNumber): $($_.Line.Trim())" })
+        if ($hits.Count -gt 0) { $wanxiangHints += $hits }
     }
 }
 

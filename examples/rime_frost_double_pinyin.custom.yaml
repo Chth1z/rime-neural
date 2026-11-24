@@ -1,5 +1,6 @@
-# rime-neural integration patch for rime-frost Natural Double Pinyin (白霜自然码双拼)
+# rime-neural integration patch for stock rime-frost Natural Double Pinyin (白霜自然码双拼)
 # Copy to %APPDATA%\Rime\rime_frost_double_pinyin.custom.yaml
+# Note: Skip this patch if your schema already mounts `lua_filter@*rime_neural` (e.g. Chth1z/rime-chth1z).
 patch:
   translator/max_sentences: 8
   translator/sentence_cutoff_threshold: 0.3
