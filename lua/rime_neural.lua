@@ -1,19 +1,22 @@
--- rime-neural (v1.3.0): Universal ONNX neural sentence reranker filter for Rime / Weasel.
--- Loads `neural/rime_neural.dll` in-process via official Weasel's exported Lua 5.4 C API.
+-- rime-neural (v2.0.0): Universal ONNX neural sentence reranker filter for Rime / Weasel / Unix.
+-- Loads native `rime_neural` shared library in-process via host Rime's exported Lua 5.4 C API.
 -- Features:
---   * Zero custom rime.dll required; works on official unmodified Weasel (librime >= 1.17.0).
+--   * Zero custom librime required; works on official unmodified Weasel (librime >= 1.17.0) and Unix/macOS hosts.
 --   * Universal layout auto-detection: Full Pinyin + 7 Double Pinyin layouts
 --     (ZRM, Flypy, MSPY, Sogou, ABC, Ziguang, Jiajia/PYJJ) across rime-ice / rime-frost / rime-wanxiang.
---   * Non-blocking background initialization (`init_async`) -> 0 ms Weasel startup delay.
+--   * Non-blocking background initialization (`init_async`) -> 0 ms startup delay.
 --   * Dynamic KV-cache ONNX architecture introspection (supports 12L ML-pumpkin-1103, 8L zhen-feather, etc.)
 --     + selective ORT output fetching + per-schema isolated mmap `.gram` fusion + KV-cached Pass-2 P2C.
 --   * Non-blocking background Windows UIA preceding-text context (frozen per composition,
---     clamped to focused control, focus-change invalidation, fail-closed password/terminal blocking).
+--     clamped to focused control, focus-change invalidation, fail-closed password/terminal blocking),
+--     plus opt-in 1,024-char focus-clamped document entity lexicon with zero KV prefix overhead.
+--   * Automatic 1-edit typo-tolerant lattice recovery for proven-dead spellings (Full Pinyin & 7 Double Pinyin
+--     layouts), strictly gated by live-prefix protection for zero clean-typing regression.
 --   * Strict dictionary & tag protection: only reranks `sentence` candidates on matching segments (`abc`),
 --     never overrides exact dictionary/userdb hits (`phrase`, `user_phrase`, `table`, `completion`, etc.).
 --   * Traditional-to-Simplified context normalization (`tw2sp.json` / `t2s.json`) + pre-OpenCC commit capture.
 --   * Zero-plaintext numeric local feedback logger (`neural/feedback.jsonl`) for unbiased MAP tuning.
---   * Graceful zero-cost pass-through if DLL/model is absent or the configured toggle option is off.
+--   * Graceful zero-cost pass-through if native library/model is absent or the configured toggle option is off.
 
 local M = {}
 
@@ -22,6 +25,7 @@ local native_loaded = false
 local failed_dll_paths = {}
 local attached_gram_keys = {}
 local logged_init_error = false
+local active_doc_entities_flag = nil
 
 -- Module-level OpenCC converter cache (shared across schemas; `tw2sp` loaded lazily on demand)
 local shared_t2s = nil
@@ -47,25 +51,28 @@ local function get_shared_tw2sp()
     return shared_tw2sp
 end
 
---- Normalize forward slashes to Windows backslashes so `package.loadlib` (`LoadLibraryExA` with
---- `LOAD_WITH_ALTERED_SEARCH_PATH`) always receives canonical Windows paths.
-local function normalize_win_path(p)
+local IS_WINDOWS = (package.config and package.config:sub(1, 1) == "\\") or false
+local PATH_SEP = IS_WINDOWS and "\\" or "/"
+
+--- Normalize path separators to the host OS convention (`\` on Windows, `/` on Unix).
+local function normalize_os_path(p)
     if type(p) ~= "string" then
         return ""
     end
-    local s = p:gsub("/", "\\")
-    while #s > 3 and s:sub(-1) == "\\" do
+    local s = IS_WINDOWS and p:gsub("/", "\\") or p:gsub("\\", "/")
+    local min_len = IS_WINDOWS and 3 or 1
+    while #s > min_len and s:sub(-1) == PATH_SEP do
         s = s:sub(1, -2)
     end
     return s
 end
 
 local function join_path(a, b)
-    local base = normalize_win_path(a)
-    if base:sub(-1) == "\\" then
+    local base = normalize_os_path(a)
+    if base:sub(-1) == PATH_SEP then
         return base .. b
     end
-    return base .. "\\" .. b
+    return base .. PATH_SEP .. b
 end
 
 local function file_exists(path)
@@ -75,6 +82,32 @@ local function file_exists(path)
         return true
     end
     return false
+end
+
+local function resolve_native_lib_path(dir)
+    if IS_WINDOWS then
+        return join_path(dir, "rime_neural.dll")
+    end
+    for _, name in ipairs({ "librime_neural.dylib", "librime_neural.so", "rime_neural.so" }) do
+        local p = join_path(dir, name)
+        if file_exists(p) then
+            return p
+        end
+    end
+    return join_path(dir, "librime_neural.so")
+end
+
+local function resolve_ort_lib_path(dir)
+    if IS_WINDOWS then
+        return join_path(dir, "onnxruntime.dll")
+    end
+    for _, name in ipairs({ "libonnxruntime.dylib", "libonnxruntime.so", "libonnxruntime.so.1" }) do
+        local p = join_path(dir, name)
+        if file_exists(p) then
+            return p
+        end
+    end
+    return join_path(dir, "libonnxruntime.so")
 end
 
 local function has_any_model(dir, model_file)
@@ -144,24 +177,28 @@ local function get_shared_data_dir()
     if rime_api and type(rime_api.get_shared_data_dir) == "function" then
         local ok_s, shared_dir = pcall(rime_api.get_shared_data_dir)
         if ok_s and type(shared_dir) == "string" and #shared_dir > 0 then
-            return normalize_win_path(shared_dir)
+            return normalize_os_path(shared_dir)
         end
     end
     return ""
 end
 
 local function is_temp_user_dir(user_dir)
-    local ud = normalize_win_path(user_dir):lower()
-    if ud:find("\\appdata\\local\\temp\\", 1, true) ~= nil
-        or ud:find("\\windows\\temp\\", 1, true) ~= nil
-    then
+    local ud = normalize_os_path(user_dir):lower()
+    if IS_WINDOWS then
+        if ud:find("\\appdata\\local\\temp\\", 1, true) ~= nil
+            or ud:find("\\windows\\temp\\", 1, true) ~= nil
+        then
+            return true
+        end
+    elseif ud:sub(1, 5) == "/tmp/" or ud:sub(1, 9) == "/var/tmp/" then
         return true
     end
-    for _, env_var in ipairs({ "TEMP", "TMP" }) do
+    for _, env_var in ipairs({ "TEMP", "TMP", "TMPDIR" }) do
         local tv = os.getenv(env_var)
         if type(tv) == "string" and #tv > 0 then
-            local norm_tv = normalize_win_path(tv):lower()
-            if ud == norm_tv or ud:sub(1, #norm_tv + 1) == (norm_tv .. "\\") then
+            local norm_tv = normalize_os_path(tv):lower()
+            if ud == norm_tv or ud:sub(1, #norm_tv + 1) == (norm_tv .. PATH_SEP) then
                 return true
             end
         end
@@ -171,16 +208,16 @@ end
 
 local function resolve_data_dir(user_dir, shared_dir, model_file, custom_data_dir)
     if custom_data_dir and #custom_data_dir > 0 then
-        return normalize_win_path(custom_data_dir)
+        return normalize_os_path(custom_data_dir)
     end
     local primary = join_path(user_dir, "neural")
-    if file_exists(join_path(primary, "rime_neural.dll")) and has_any_model(primary, model_file) then
+    if file_exists(resolve_native_lib_path(primary)) and has_any_model(primary, model_file) then
         return primary
     end
-    -- Fallback to shared_data_dir\neural (typically ASCII Program Files path for non-ASCII usernames)
+    -- Fallback to shared_data_dir/neural (typically ASCII Program Files or /usr/share path)
     if shared_dir and #shared_dir > 0 then
         local shared_neural = join_path(shared_dir, "neural")
-        if file_exists(join_path(shared_neural, "rime_neural.dll"))
+        if file_exists(resolve_native_lib_path(shared_neural))
             and has_any_model(shared_neural, model_file)
         then
             return shared_neural
@@ -188,7 +225,7 @@ local function resolve_data_dir(user_dir, shared_dir, model_file, custom_data_di
     end
     -- Graceful fallback for users migrating from earlier `zhiyi/` folder layout
     local legacy = join_path(user_dir, "zhiyi")
-    if file_exists(join_path(legacy, "rime_neural.dll")) and has_any_model(legacy, model_file) then
+    if file_exists(resolve_native_lib_path(legacy)) and has_any_model(legacy, model_file) then
         return legacy
     end
     return primary
@@ -215,7 +252,7 @@ local function ensure_native(
     sync_init,
     explicit_data_dir
 )
-    local ort_path = join_path(data_dir, "onnxruntime.dll")
+    local ort_path = resolve_ort_lib_path(data_dir)
     -- Pass candidate `.gram` paths (`{ user_dir\x.gram, shared_dir\x.gram }`) to Rust so UTF-16
     -- `Path::is_file()` resolves them without Lua ANSI `io.open` failures.
     local gram_arg = (type(gram_paths) == "table" and #gram_paths > 0) and gram_paths or ""
@@ -250,7 +287,7 @@ local function ensure_native(
         return true
     end
 
-    local dll_path = join_path(data_dir, "rime_neural.dll")
+    local dll_path = resolve_native_lib_path(data_dir)
     if failed_dll_paths[dll_path] then
         return false
     end
@@ -293,6 +330,7 @@ local function ensure_native(
     -- config (e.g. valid `model_file`) can retry without re-calling `loadlib`.
     native_mod = mod
     native_loaded = true
+    package.loaded["_rime_neural_native"] = mod
 
     if sync_init then
         local ok_init, init_err = mod.init(
@@ -487,31 +525,50 @@ end
 --- Resolve preceding context with strict cross-app isolation, password protection, and per-
 --- composition freezing (preventing 1-keystroke lagged inline-preedit pollution and KV-cache
 --- thrashing under Weasel's default `inline_preedit: true`).
---- Returns the model context and whether this focus permits feedback.
+--- Convert optional document entity text to Simplified without polluting `env.norm_cache`.
+local function normalize_doc_entities_once(text, is_trad, env)
+    if not text or #text == 0 or is_pure_ascii(text) then
+        return text or ""
+    end
+    local conv_obj = env.t2s_override
+    if not conv_obj then
+        conv_obj = is_trad and (get_shared_tw2sp() or get_shared_t2s()) or get_shared_t2s()
+    end
+    if conv_obj then
+        local ok, conv = pcall(conv_obj.convert, conv_obj, text)
+        if ok and conv then
+            return conv
+        end
+    end
+    return text
+end
+
+--- Returns `(model_context, allow_feedback, entity_context)`.
 local function get_preceding_context(context, segment_start, first_preedit, raw_seg, first_cand_text, env)
     local comp_prefix = collect_composition_prefix(context, segment_start)
     local base_ctx = ""
+    local entity_ctx = ""
 
     if env.enable_uia then
         if type(native_mod.query_uia_context) ~= "function" then
-            return utf8_tail_bytes(comp_prefix, 384), false
+            return utf8_tail_bytes(comp_prefix, 384), false, ""
         end
         local full_preedit = preedit_before_caret(context, first_preedit)
         local frozen = env.comp_ctx
-        local status, uia_text, hwnd, preedit_stripped, focus_epoch = native_mod.query_uia_context(
-            full_preedit, raw_seg, first_cand_text
-        )
+        local status, uia_text, hwnd, preedit_stripped, focus_epoch, doc_entities =
+            native_mod.query_uia_context(full_preedit, raw_seg, first_cand_text)
         if status ~= "text" and status ~= "fallback" then
             env.comp_ctx = nil
             env.last_commit_focus = nil
-            return status == "window_changed" and utf8_tail_bytes(comp_prefix, 384) or "", false
+            return status == "window_changed" and utf8_tail_bytes(comp_prefix, 384) or "", false, ""
         elseif frozen and frozen.base_ctx
             and frozen.hwnd == hwnd and frozen.focus_epoch == focus_epoch
         then
             base_ctx = frozen.base_ctx
+            entity_ctx = frozen.entity_ctx or ""
         elseif status == "text" then
+            local is_trad = is_traditional_mode(context)
             if uia_text and #uia_text > 0 then
-                local is_trad = is_traditional_mode(context)
                 base_ctx = normalize_to_simplified(utf8_tail_bytes(uia_text, 384), is_trad, env)
                 -- Under Traditional mode + `preedit_type: preview`, Weasel echoes the Traditional
                 -- candidate inline; only strip its Simplified equivalent on initial capture when
@@ -526,7 +583,15 @@ local function get_preceding_context(context, segment_start, first_preedit, raw_
                     base_ctx = trim_ws(base_ctx:sub(1, #base_ctx - #first_cand_text))
                 end
             end
-            env.comp_ctx = { hwnd = hwnd, focus_epoch = focus_epoch, base_ctx = base_ctx }
+            if env.enable_doc_entities and type(doc_entities) == "string" and #doc_entities > 0 then
+                entity_ctx = normalize_doc_entities_once(utf8_tail_bytes(doc_entities, 3072), is_trad, env)
+            end
+            env.comp_ctx = {
+                hwnd = hwnd,
+                focus_epoch = focus_epoch,
+                base_ctx = base_ctx,
+                entity_ctx = entity_ctx,
+            }
         else
             -- Non-TextPattern classified control (e.g. WeChat, QQ, IDE canvas): reuse Rime's
             -- session commit history only while (hwnd, focus_epoch) matches the last commit in
@@ -556,19 +621,22 @@ local function get_preceding_context(context, segment_start, first_preedit, raw_
     end
 
     if #base_ctx == 0 then
-        return utf8_tail_bytes(comp_prefix, 384), true
+        return utf8_tail_bytes(comp_prefix, 384), true, entity_ctx
     end
     -- Deduplicate confirmed multi-segment prefix after Simplified normalization so Traditional UIA
     -- text (`我們`) and Simplified `comp_prefix` (`我们`) never double up.
     if #comp_prefix > 0 and base_ctx:sub(-#comp_prefix) ~= comp_prefix then
-        return utf8_tail_bytes(base_ctx .. comp_prefix, 384), true
+        return utf8_tail_bytes(base_ctx .. comp_prefix, 384), true, entity_ctx
     end
-    return utf8_tail_bytes(base_ctx, 384), true
+    return utf8_tail_bytes(base_ctx, 384), true, entity_ctx
 end
 
 -- OpenCC followed by uniquifier can merge distinct source sentences into one visible choice.
 local function menu_source_text(cand, snap)
     if not cand or cand.start ~= snap.seg_start or cand._end ~= snap.seg_end then
+        return nil
+    end
+    if type(cand.type) == "string" and cand.type:sub(1, 12) == "rime_neural_" then
         return nil
     end
     local sources = cand:get_genuines()
@@ -734,11 +802,241 @@ local function clear_unless_trailing_punct(env, is_punct, start)
     env.last_rerank = nil
 end
 
+-- Lazy read-only dictionary translator used strictly on proven-dead typo inputs (zero cost on
+-- clean typing, zero userdict learning or secondary-correction side effects).
+local function get_typo_translator(env)
+    if env.typo_tr_tried then
+        return env.typo_tr
+    end
+    env.typo_tr_tried = true
+    if not Component or type(Component.Translator) ~= "function" then
+        return nil
+    end
+    local cfg = env.engine and env.engine.schema and env.engine.schema.config
+    if cfg then
+        local ok_ns, tr_ns = pcall(function()
+            local dict = cfg:get_string("translator/dictionary") or ""
+            if #dict == 0 then
+                return nil
+            end
+            local ns = "rime_neural_lookup"
+            cfg:set_string(ns .. "/dictionary", dict)
+            local prism = cfg:get_string("translator/prism") or ""
+            if #prism > 0 then
+                cfg:set_string(ns .. "/prism", prism)
+            end
+            local packs = cfg:get_list("translator/packs")
+            if packs and packs.size and packs.size > 0 then
+                for i = 0, packs.size - 1 do
+                    local pv = packs:get_value_at(i)
+                    local ps = pv and pv:get_string()
+                    if ps and #ps > 0 then
+                        cfg:set_string(ns .. "/packs/@" .. i, ps)
+                    end
+                end
+            end
+            local ctx_sug = cfg:get_bool("translator/contextual_suggestions")
+            if ctx_sug ~= nil then
+                cfg:set_bool(ns .. "/contextual_suggestions", ctx_sug)
+            end
+            local max_hp = cfg:get_int("translator/max_homophones")
+            cfg:set_int(ns .. "/max_homophones", (max_hp and max_hp > 1) and max_hp or 8)
+            local max_hg = cfg:get_int("translator/max_homographs")
+            if max_hg and max_hg > 0 then
+                cfg:set_int(ns .. "/max_homographs", max_hg)
+            end
+            local max_st = cfg:get_int("translator/max_sentences")
+            cfg:set_int(ns .. "/max_sentences", (max_st and max_st > 1) and max_st or 6)
+            local cutoff = cfg:get_double("translator/sentence_cutoff_threshold")
+            if cutoff ~= nil then
+                cfg:set_double(ns .. "/sentence_cutoff_threshold", cutoff)
+            end
+            cfg:set_bool(ns .. "/enable_user_dict", false)
+            cfg:set_bool(ns .. "/enable_sentence", true)
+            cfg:set_bool(ns .. "/enable_completion", false)
+            cfg:set_bool(ns .. "/enable_encoder", false)
+            cfg:set_bool(ns .. "/enable_correction", false)
+            return Component.Translator(env.engine, ns, "script_translator")
+        end)
+        if ok_ns and tr_ns then
+            env.typo_tr = tr_ns
+        end
+    end
+    return env.typo_tr
+end
+
+--- Fast-path check for automatic 1-edit typo suggestions on a raw segment.
+--- Returns `nil` in ~1 µs on any clean or live-prefix input with zero UIA or translator calls.
+local function find_broken_typo_fixes(env, raw_seg)
+    if not env.enable_typo_recovery
+        or type(native_mod.suggest_typo_inputs) ~= "function"
+        or type(native_mod.score_gram) ~= "function"
+    then
+        return nil
+    end
+    if type(raw_seg) ~= "string" or #raw_seg < env.min_input_len or #raw_seg > 96 then
+        return nil
+    end
+    local max_fixes = (env.is_double_pinyin and (#raw_seg % 2) == 1) and 24 or 12
+    local fixes = native_mod.suggest_typo_inputs(raw_seg, env.layout, "broken", max_fixes)
+    if type(fixes) ~= "table" or #fixes == 0 then
+        return nil
+    end
+    return fixes
+end
+
+--- Automatic 1-edit typo recovery for proven-dead raw inputs (never fires on clean or live-prefix
+--- typing). Returns a synthesized `Candidate` over `[seg_start, seg_end]` if a repaired spelling
+--- passes `.gram` fluency + neural verification, or `nil` otherwise.
+local function try_typo_recovery(
+    env,
+    fixes,
+    raw_seg,
+    seg_start,
+    seg_end,
+    first_preedit,
+    orig_best_text,
+    orig_is_full_coverage,
+    pre_ctx,
+    entity_ctx
+)
+    if type(fixes) ~= "table" or #fixes == 0 then
+        return nil
+    end
+    local tr = get_typo_translator(env)
+    if not tr then
+        return nil
+    end
+
+    -- Query the schema's read-only translator for each 1-edit repaired spelling and collect
+    -- full-span Chinese hits that individually pass `.gram` fluency gating.
+    local best_fix = nil
+    local best_fix_cands = nil
+    local best_fix_score = -1e9
+    local orig_g = env.non_col_pen or -4.0
+    local n_orig_chars = math.max(4, math.min(16, utf8_char_count(orig_best_text or "")))
+    local trunc_floor = (env.non_col_pen or -4.0) + 0.5
+
+    if orig_is_full_coverage and type(orig_best_text) == "string" and #orig_best_text > 0 then
+        local og, has_gram = native_mod.score_gram({ orig_best_text }, env.gram_req)
+        if not has_gram then
+            return nil
+        end
+        if type(og) == "table" and type(og[1]) == "number" then
+            orig_g = og[1]
+        end
+    end
+
+    local function cand_passes_fluency(g_val, fcost)
+        if orig_is_full_coverage then
+            local gain = g_val - orig_g
+            local total_gain = gain * n_orig_chars
+            local min_per_char = (orig_g < 1.0) and 0.30 or 0.35
+            local min_total = (orig_g < 1.0) and 3.5 or (5.0 + 2.5 * fcost)
+            return gain > min_per_char and total_gain > min_total
+        end
+        return g_val > trunc_floor
+    end
+
+    for i = 1, #fixes do
+        local fix = fixes[i]
+        local finp = fix and fix.input
+        local fcost = (fix and fix.cost) or 1.0
+        if type(finp) == "string" and #finp >= 2 then
+            local qseg = Segment(0, #finp)
+            qseg.tags = { abc = true }
+            local ok_q, xlat = pcall(tr.query, tr, finp, qseg)
+            if ok_q and xlat then
+                local fcands, fseen = {}, {}
+                local scanned = 0
+                for c in xlat:iter() do
+                    scanned = scanned + 1
+                    local g = c:get_genuine()
+                    if g and g.start == 0 and g._end == #finp
+                        and (g.type == "sentence" or g.type == "phrase" or g.type == "user_phrase")
+                    then
+                        local txt = (g.text and #g.text > 0) and g.text or c.text
+                        if txt and #txt > 0 and not is_pure_ascii(txt) and not fseen[txt] then
+                            fseen[txt] = true
+                            fcands[#fcands + 1] = txt
+                            if #fcands >= 6 then
+                                break
+                            end
+                        end
+                    end
+                    if scanned >= 48 then
+                        break
+                    end
+                end
+                if #fcands > 0 then
+                    local gscores, has_gram = native_mod.score_gram(fcands, env.gram_req)
+                    if not has_gram then
+                        return nil
+                    end
+                    local eligible = {}
+                    local top_g = -1e9
+                    if type(gscores) == "table" then
+                        for k = 1, #fcands do
+                            local v = gscores[k]
+                            if type(v) == "number" and cand_passes_fluency(v, fcost) then
+                                eligible[#eligible + 1] = fcands[k]
+                                if v > top_g then
+                                    top_g = v
+                                end
+                            end
+                        end
+                    end
+                    if #eligible > 0 then
+                        local adj = top_g - 0.6 * fcost
+                        if adj > best_fix_score then
+                            best_fix_score = adj
+                            best_fix = { input = finp, cost = fcost, top_g = top_g }
+                            best_fix_cands = eligible
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if not best_fix or not best_fix_cands or #best_fix_cands == 0 then
+        return nil
+    end
+
+    -- When the winning repaired spelling has multiple fluency-verified candidate sentences, use
+    -- the 12-layer neural reranker to select the semantically best one in context.
+    local winner = best_fix_cands[1]
+    if #best_fix_cands >= 2 then
+        local res = native_mod.rerank(
+            pre_ctx or "",
+            best_fix.input,
+            env.layout,
+            best_fix_cands,
+            env.fusion_weights,
+            { verify_margin = 0.0 },
+            env.gram_req,
+            entity_ctx or ""
+        )
+        if type(res) == "table" and type(res.order) == "table" and res.order[1] then
+            winner = best_fix_cands[res.order[1]] or winner
+        end
+    end
+
+    if winner == orig_best_text then
+        return nil
+    end
+    local cand = Candidate("rime_neural_typo", seg_start, seg_end, winner, "")
+    cand.preedit = (first_preedit and #first_preedit > 0) and first_preedit or raw_seg
+    return cand
+end
+
 -- librime calls this for the segment whose menu it is building. composition:back() may
 -- already be a later punctuation or reverse-lookup segment.
 function M.tags_match(seg, env)
     for tag in pairs(env.tags) do
         if seg:has_tag(tag) then
+            env.matched_seg_start = seg.start
+            env.matched_seg_end = seg._end
             return true
         end
     end
@@ -775,7 +1073,7 @@ function M.init(env)
     env.model_file = cfg:get_string(ns .. "/model_file") or ""
     env.sync_init = (cfg:get_bool(ns .. "/sync_init") == true)
 
-    local user_dir = normalize_win_path(rime_api.get_user_data_dir())
+    local user_dir = normalize_os_path(rime_api.get_user_data_dir())
     local shared_dir = get_shared_data_dir()
     local in_temp = is_temp_user_dir(user_dir)
 
@@ -791,8 +1089,7 @@ function M.init(env)
         fb_opt = true
     end
     env.log_feedback = fb_opt and (not in_temp or allow_temp_log)
-    -- Always store feedback under writable `user_dir\neural\feedback.jsonl` (Rust uses UTF-16
-    -- `CreateFileW`, so non-ASCII user profiles work without writing into read-only Program Files).
+    -- Always store feedback under writable `user_dir/neural/feedback.jsonl`.
     env.feedback_path = join_path(join_path(user_dir, "neural"), "feedback.jsonl")
 
     local uia_opt = cfg:get_bool(ns .. "/enable_uia_context")
@@ -800,8 +1097,19 @@ function M.init(env)
         uia_opt = true
     end
     local allow_temp_uia = (cfg:get_bool(ns .. "/enable_uia_in_temp") == true)
-    env.enable_uia = uia_opt and (not in_temp or allow_temp_uia)
+    env.enable_uia = IS_WINDOWS and uia_opt and (not in_temp or allow_temp_uia)
+    env.enable_doc_entities = (cfg:get_bool(ns .. "/enable_document_entities") == true) and env.enable_uia
     env.uia_activated = false
+
+    local typo_opt = cfg:get_bool(ns .. "/enable_typo_recovery")
+    if typo_opt == nil then
+        typo_opt = true
+    end
+    env.enable_typo_recovery = typo_opt
+    env.typo_tr = nil
+    env.typo_tr_tried = false
+    env.matched_seg_start = nil
+    env.matched_seg_end = nil
 
     env.last_rerank = nil
     env.comp_ctx = nil
@@ -874,6 +1182,19 @@ function M.init(env)
         env.layout = env.is_double_pinyin and "zrm" or "full"
         env.uses_semicolon = false
     end
+    local layouts_map = package.loaded["_rime_neural_layouts"]
+    if type(layouts_map) ~= "table" then
+        layouts_map = {}
+        package.loaded["_rime_neural_layouts"] = layouts_map
+    end
+    layouts_map[env.schema_id] = env.layout
+
+    local gram_reqs_map = package.loaded["_rime_neural_gram_reqs"]
+    if type(gram_reqs_map) ~= "table" then
+        gram_reqs_map = {}
+        package.loaded["_rime_neural_gram_reqs"] = gram_reqs_map
+    end
+    gram_reqs_map[env.schema_id] = env.gram_req
 
     local min_len = cfg:get_int(ns .. "/min_input_len") or (env.is_double_pinyin and 4 or 6)
     if min_len < 2 then
@@ -898,6 +1219,7 @@ function M.init(env)
                 if (env.comp_ctx or env.last_rerank) and not ctx:is_composing() then
                     env.comp_ctx = nil
                     env.last_rerank = nil
+                    package.loaded["_rime_neural_last_ctx"] = nil
                 end
             end)
         end
@@ -905,6 +1227,7 @@ function M.init(env)
             -- Always unfreeze per-composition UIA snapshot on commit so next sentence reads fresh text
             local prev_focus = env.comp_ctx
             env.comp_ctx = nil
+            package.loaded["_rime_neural_last_ctx"] = nil
 
             local rerank_on = is_rerank_enabled(ctx, env)
             local uia_ok = env.enable_uia
@@ -1003,6 +1326,12 @@ function M.func(input, env)
     if not env.ready or not native_mod or not is_rerank_enabled(ctx, env) or not native_mod.is_ready() then
         env.last_rerank = nil
         env.comp_ctx = nil
+        if active_doc_entities_flag == true and native_mod
+            and type(native_mod.set_doc_entities_enabled) == "function"
+        then
+            active_doc_entities_flag = false
+            native_mod.set_doc_entities_enabled(false)
+        end
         if native_mod and not logged_init_error and type(native_mod.is_ready) == "function"
             and not native_mod.is_ready() and type(native_mod.stats) == "function"
         then
@@ -1020,7 +1349,13 @@ function M.func(input, env)
         return
     end
 
-    -- Lazily enable background UIA worker only after ONNX engine is ready and option is active
+    -- Lazily enable background UIA worker only after ONNX engine is ready and option is active.
+    -- Always sync `doc_entities` flag (including opt-out when switching to a non-UIA schema).
+    local want_doc = (env.enable_uia and env.enable_doc_entities) == true
+    if active_doc_entities_flag ~= want_doc and type(native_mod.set_doc_entities_enabled) == "function" then
+        active_doc_entities_flag = want_doc
+        native_mod.set_doc_entities_enabled(want_doc)
+    end
     if env.enable_uia and not env.uia_activated and type(native_mod.set_uia_enabled) == "function" then
         env.uia_activated = true
         native_mod.set_uia_enabled(true)
@@ -1029,7 +1364,7 @@ function M.func(input, env)
     -- One-shot lazy `.gram` attachment once async init finishes (covers multi-schema startup races)
     if #env.gram_key > 0 and not attached_gram_keys[env.gram_key] then
         attached_gram_keys[env.gram_key] = true
-        local ort_path = join_path(env.data_dir, "onnxruntime.dll")
+        local ort_path = resolve_ort_lib_path(env.data_dir)
         native_mod.init_async(
             env.data_dir,
             ort_path,
@@ -1067,7 +1402,7 @@ function M.func(input, env)
             return
         end
         if #sent_cands >= 2 then
-            local pre_ctx, allow_feedback = get_preceding_context(
+            local pre_ctx, allow_feedback, entity_ctx = get_preceding_context(
                 ctx,
                 seg_start,
                 first_preedit,
@@ -1075,6 +1410,14 @@ function M.func(input, env)
                 sent_texts[1] or "",
                 env
             )
+            package.loaded["_rime_neural_last_ctx"] = {
+                engine_id = tostring(env.engine),
+                schema_id = env.schema_id,
+                input_prefix = cur_input:sub(1, seg_end),
+                pre_ctx = pre_ctx,
+                hwnd = env.comp_ctx and env.comp_ctx.hwnd or 0,
+                focus_epoch = env.comp_ctx and env.comp_ctx.focus_epoch or 0,
+            }
             local res = native_mod.rerank(
                 pre_ctx,
                 raw_seg,
@@ -1082,9 +1425,34 @@ function M.func(input, env)
                 sent_texts,
                 env.fusion_weights,
                 env.p2c_cfg,
-                env.gram_req
+                env.gram_req,
+                entity_ctx
             )
             if type(res) == "table" and type(res.order) == "table" and #res.order == #sent_cands then
+                local top1_text = (res.p2c_pos == 1 and res.p2c_text) or sent_texts[res.order[1]] or sent_texts[1]
+                -- Check automatic 1-edit typo recovery on proven-dead spellings (returns nil in ~1 µs on clean input).
+                local fixes = find_broken_typo_fixes(env, raw_seg)
+                local typo_cand = fixes and try_typo_recovery(
+                    env,
+                    fixes,
+                    raw_seg,
+                    seg_start,
+                    seg_end,
+                    first_preedit,
+                    top1_text,
+                    true,
+                    pre_ctx,
+                    entity_ctx
+                )
+                if typo_cand then
+                    env.last_rerank = nil
+                    yield(typo_cand)
+                    for _, idx in ipairs(res.order) do
+                        yield(sent_cands[idx])
+                    end
+                    return
+                end
+
                 local p2c_cand = nil
                 if type(res.p2c_text) == "string" and #res.p2c_text > 0 and (res.p2c_pos == 1 or res.p2c_pos == 2) then
                     p2c_cand = Candidate("sentence", seg_start, seg_end, res.p2c_text, "")
@@ -1126,11 +1494,29 @@ function M.func(input, env)
             end
         else
             env.last_rerank = nil
+            -- Even a single full-span `sentence` candidate can be a Jianpin garbage parse of a typo.
+            local fixes = (#sent_cands == 1) and find_broken_typo_fixes(env, raw_seg) or nil
+            if fixes then
+                local pre_ctx, _, entity_ctx = get_preceding_context(
+                    ctx, seg_start, first_preedit, raw_seg, sent_texts[1] or "", env
+                )
+                local typo_cand = try_typo_recovery(
+                    env, fixes, raw_seg, seg_start, seg_end, first_preedit, sent_texts[1] or "", true, pre_ctx, entity_ctx
+                )
+                if typo_cand then
+                    yield(typo_cand)
+                end
+            end
         end
         for i = 1, #sent_cands do
             yield(sent_cands[i])
         end
     end
+
+    local m_start = env.matched_seg_start
+    local m_end = env.matched_seg_end
+    env.matched_seg_start = nil
+    env.matched_seg_end = nil
 
     for cand in input:iter() do
         if passthrough or flushed then
@@ -1138,7 +1524,36 @@ function M.func(input, env)
         elseif is_first then
             is_first = false
             local g0 = cand:get_genuine()
-            if not g0 or g0.type ~= "sentence" then
+            -- If Rime truncated an unparseable segment (e.g. broken Double Pinyin pair `jntmtmqovfbuco`
+            -- -> `今天天` covering `[0..6)` of `[0..14)`), check fast-path typo eligibility BEFORE
+            -- touching UIA or translator. If no typo recovery fires (e.g. clean 9-key Double Pinyin
+            -- live prefix with 8-key sentences), fall straight through to normal sentence reranking.
+            local handled_trunc_typo = false
+            if env.enable_typo_recovery
+                and m_start and m_end and m_end > m_start
+                and cand.start == m_start and cand._end < m_end
+            then
+                local raw_full = string.sub(cur_input, m_start + 1, m_end)
+                local fixes = find_broken_typo_fixes(env, raw_full)
+                if fixes then
+                    local pre_ctx, _, entity_ctx = get_preceding_context(
+                        ctx, m_start, cand.preedit or "", raw_full, cand.text or "", env
+                    )
+                    local typo_cand = try_typo_recovery(
+                        env, fixes, raw_full, m_start, m_end, cand.preedit or "", cand.text or "", false, pre_ctx, entity_ctx
+                    )
+                    if typo_cand then
+                        env.last_rerank = nil
+                        passthrough = true
+                        handled_trunc_typo = true
+                        yield(typo_cand)
+                        yield(cand)
+                    end
+                end
+            end
+            if handled_trunc_typo then
+                -- Already emitted recovered candidate followed by native partial candidate.
+            elseif not g0 or g0.type ~= "sentence" then
                 clear_unless_trailing_punct(env, g0 ~= nil and g0.type == "punct", cand.start)
                 passthrough = true
                 yield(cand)
@@ -1205,6 +1620,22 @@ function M.func(input, env)
 
     if is_first then
         env.last_rerank = nil
+        -- Empty native stream on a matched `abc` segment (e.g. broken Double Pinyin pair at index 0)
+        if env.enable_typo_recovery and m_start and m_end and m_end > m_start then
+            local raw_full = string.sub(cur_input, m_start + 1, m_end)
+            local fixes = find_broken_typo_fixes(env, raw_full)
+            if fixes then
+                local pre_ctx, _, entity_ctx = get_preceding_context(
+                    ctx, m_start, raw_full, raw_full, "", env
+                )
+                local typo_cand = try_typo_recovery(
+                    env, fixes, raw_full, m_start, m_end, raw_full, "", false, pre_ctx, entity_ctx
+                )
+                if typo_cand then
+                    yield(typo_cand)
+                end
+            end
+        end
     elseif not passthrough and not flushed and sent_cands then
         flush_sentences()
     end
@@ -1219,6 +1650,18 @@ function M.fini(env)
         pcall(function() env.commit_conn:disconnect() end)
         env.commit_conn = nil
     end
+    if active_doc_entities_flag == true and native_mod
+        and type(native_mod.set_doc_entities_enabled) == "function"
+    then
+        active_doc_entities_flag = false
+        native_mod.set_doc_entities_enabled(false)
+    end
+    local cached = package.loaded["_rime_neural_last_ctx"]
+    if type(cached) == "table" and cached.engine_id == tostring(env.engine) then
+        package.loaded["_rime_neural_last_ctx"] = nil
+    end
+    env.typo_tr = nil
+    env.typo_tr_tried = false
     env.last_rerank = nil
     env.comp_ctx = nil
     env.last_commit_focus = nil
