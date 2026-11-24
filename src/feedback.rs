@@ -1,6 +1,6 @@
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,14 +14,6 @@ const MAX_SCHEMA_BYTES: usize = 128;
 const MAX_MODEL_BYTES: usize = 64;
 
 static LOG_LOCK: Mutex<()> = Mutex::new(());
-
-#[cfg(windows)]
-const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
-
-#[cfg(windows)]
-unsafe extern "system" {
-    fn MoveFileExW(lpExistingFileName: *const u16, lpNewFileName: *const u16, dwFlags: u32) -> i32;
-}
 
 /// Truncate a UTF-8 string to at most `max_bytes` on a valid char boundary.
 fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
@@ -78,6 +70,7 @@ impl<'a> FeedbackRecord<'a> {
         reverted: bool,
     ) -> Self {
         let n = logits.len().min(MAX_FEEDBACK_CANDS);
+        let n_i32 = n as i32;
         let clean = |xs: &[f32]| -> Vec<f32> {
             let mut v: Vec<f32> = xs
                 .iter()
@@ -87,6 +80,17 @@ impl<'a> FeedbackRecord<'a> {
             v.resize(n, 0.0);
             v
         };
+        let shown_top1_idx = if (-2..n_i32).contains(&shown_top1_idx) {
+            shown_top1_idx
+        } else {
+            -1
+        };
+        let chosen_idx = if (-1..n_i32).contains(&chosen_idx) {
+            chosen_idx
+        } else {
+            -1
+        };
+        let reverted = reverted && (shown_top1_idx > 0 || shown_top1_idx == -2) && chosen_idx == 0;
         Self {
             v: FEEDBACK_SCHEMA_VERSION,
             ts: now_unix_secs(),
@@ -103,7 +107,7 @@ impl<'a> FeedbackRecord<'a> {
             chosen_idx,
             p2c_shown,
             p2c_chosen,
-            chosen_rank,
+            chosen_rank: chosen_rank.max(0),
             reverted,
         }
     }
@@ -115,20 +119,82 @@ fn rotated_path(log_path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
-fn reject_symlink(path: &Path) -> Result<(), String> {
-    if let Ok(meta) = fs::symlink_metadata(path)
-        && meta.file_type().is_symlink()
-    {
-        return Err(format!("refusing to write symlink: {}", path.display()));
-    }
-    Ok(())
+#[cfg(windows)]
+fn is_reparse_point(meta: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0
 }
 
-fn atomic_rotate(src: &Path, dst: &Path) -> Result<(), String> {
-    reject_symlink(dst)?;
+#[cfg(not(windows))]
+fn is_reparse_point(_meta: &fs::Metadata) -> bool {
+    false
+}
+
+/// Fail-closed check refusing symlinks, Windows reparse points, directories, and unexpected
+/// metadata errors (only `ErrorKind::NotFound` is accepted for non-existent paths).
+fn reject_symlink_or_dir(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || is_reparse_point(&meta) {
+                return Err(format!(
+                    "refusing to write symlink/reparse point: {}",
+                    path.display()
+                ));
+            }
+            if meta.is_dir() {
+                return Err(format!(
+                    "refusing to write directory path: {}",
+                    path.display()
+                ));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "metadata check failed for {}: {}",
+            path.display(),
+            e
+        )),
+    }
+}
+
+fn reject_symlink_dir(dir: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || is_reparse_point(&meta) {
+                return Err(format!(
+                    "refusing to write under symlink/reparse directory: {}",
+                    dir.display()
+                ));
+            }
+            if !meta.is_dir() {
+                return Err(format!("parent path is not a directory: {}", dir.display()));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "parent metadata failed for {}: {}",
+            dir.display(),
+            e
+        )),
+    }
+}
+
+enum RotateError {
+    Hard(String),
+    Transient(String),
+}
+
+fn atomic_rotate(src: &Path, dst: &Path) -> Result<(), RotateError> {
+    reject_symlink_or_dir(dst).map_err(RotateError::Hard)?;
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MoveFileExW};
+        use windows::core::PCWSTR;
+
         let wsrc: Vec<u16> = src
             .as_os_str()
             .encode_wide()
@@ -141,15 +207,78 @@ fn atomic_rotate(src: &Path, dst: &Path) -> Result<(), String> {
             .collect();
         // SAFETY: Both `wsrc` and `wdst` are valid NUL-terminated UTF-16 paths; `MoveFileExW`
         // with `MOVEFILE_REPLACE_EXISTING` replaces `dst` atomically without deleting it first.
-        let ok = unsafe { MoveFileExW(wsrc.as_ptr(), wdst.as_ptr(), MOVEFILE_REPLACE_EXISTING) };
-        if ok != 0 {
-            return Ok(());
+        match unsafe {
+            MoveFileExW(
+                PCWSTR(wsrc.as_ptr()),
+                PCWSTR(wdst.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING,
+            )
+        } {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let os_err = std::io::Error::last_os_error();
+                let msg = format!("MoveFileExW rotating {}: {} ({})", src.display(), e, os_err);
+                // Sharing violation (32) / lock violation (33) can happen transiently while
+                // `tune-fusion.py` or antivirus reads `feedback.jsonl.1`.
+                if matches!(os_err.raw_os_error(), Some(32 | 33)) {
+                    Err(RotateError::Transient(msg))
+                } else {
+                    Err(RotateError::Hard(msg))
+                }
+            }
         }
-        Err(format!("MoveFileExW failed rotating {}", src.display()))
     }
     #[cfg(not(windows))]
     {
-        fs::rename(src, dst).map_err(|e| format!("rename {}: {}", src.display(), e))
+        fs::rename(src, dst)
+            .map_err(|e| RotateError::Hard(format!("rename {}: {}", src.display(), e)))
+    }
+}
+
+fn open_append_no_reparse(log_path: &Path) -> Result<File, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+            FILE_FLAG_OPEN_REPARSE_POINT, GetFileInformationByHandle,
+        };
+
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(log_path)
+            .map_err(|e| format!("open {}: {}", log_path.display(), e))?;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file.as_raw_handle()` is a valid open Win32 file handle and `info` is writable.
+        unsafe {
+            GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info)
+                .map_err(|e| format!("GetFileInformationByHandle {}: {}", log_path.display(), e))?;
+        }
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0 {
+            return Err(format!(
+                "refusing to write reparse point handle: {}",
+                log_path.display()
+            ));
+        }
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) != 0 {
+            return Err(format!(
+                "refusing to write directory handle: {}",
+                log_path.display()
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(windows))]
+    {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .map_err(|e| format!("open {}: {}", log_path.display(), e))
     }
 }
 
@@ -162,22 +291,36 @@ fn append_feedback_with_cap(
         return Ok(());
     }
     let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(parent) = log_path.parent() {
-        let _ = fs::create_dir_all(parent);
+    if let Some(parent) = log_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        reject_symlink_dir(parent)?;
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("create_dir_all {}: {}", parent.display(), e))?;
+        reject_symlink_dir(parent)?;
     }
-    reject_symlink(log_path)?;
+    reject_symlink_or_dir(log_path)?;
     if let Ok(meta) = fs::symlink_metadata(log_path)
         && meta.len() >= max_bytes
     {
         let rotated = rotated_path(log_path);
-        let _ = atomic_rotate(log_path, &rotated);
+        match atomic_rotate(log_path, &rotated) {
+            Ok(()) => {}
+            Err(RotateError::Hard(msg)) => return Err(msg),
+            Err(RotateError::Transient(msg)) => {
+                // Allow brief overflow during transient reader locks, but enforce a strict 2x
+                // hard cap so disk usage can never grow unboundedly.
+                if meta.len() >= max_bytes.saturating_mul(2) {
+                    return Err(format!(
+                        "feedback log exceeded hard 2x cap after rotation lock: {}",
+                        msg
+                    ));
+                }
+            }
+        }
     }
-    reject_symlink(log_path)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .map_err(|e| format!("open {}: {}", log_path.display(), e))?;
+    reject_symlink_or_dir(log_path)?;
+    let mut file = open_append_no_reparse(log_path)?;
     let mut line = serde_json::to_string(rec).map_err(|e| format!("serialize feedback: {}", e))?;
     line.push('\n');
     file.write_all(line.as_bytes())
@@ -233,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_caps_oversized_inputs() {
+    fn test_record_caps_oversized_inputs_and_clamps_out_of_range_indices() {
         let big_schema = "s".repeat(500);
         let big_model = "m".repeat(200);
         let big_logits = vec![1.0f32; 200];
@@ -245,17 +388,21 @@ mod tests {
             &big_logits,
             &[],
             &[],
-            0,
-            0,
+            99, // >= MAX_FEEDBACK_CANDS (64) -> must clamp to -1
+            70, // >= MAX_FEEDBACK_CANDS (64) -> must clamp to -1
             false,
             false,
-            1,
-            false,
+            -5,
+            true,
         );
         assert_eq!(rec.schema.len(), MAX_SCHEMA_BYTES);
         assert_eq!(rec.model.len(), MAX_MODEL_BYTES);
         assert_eq!(rec.num_cands, MAX_FEEDBACK_CANDS);
         assert_eq!(rec.logits.len(), MAX_FEEDBACK_CANDS);
+        assert_eq!(rec.shown_top1_idx, -1);
+        assert_eq!(rec.chosen_idx, -1);
+        assert_eq!(rec.chosen_rank, 0);
+        assert!(!rec.reverted);
     }
 
     #[test]
@@ -298,5 +445,39 @@ mod tests {
             rotated_path(Path::new("C:\\Users\\测试\\feedback.jsonl")),
             PathBuf::from("C:\\Users\\测试\\feedback.jsonl.1")
         );
+    }
+
+    #[test]
+    fn test_append_feedback_rejects_directory_at_log_or_rotated_destination() {
+        let dir = std::env::temp_dir().join("rime_neural_test_fb_dir_guard");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir");
+        let log = dir.join("feedback.jsonl");
+        let rot_dir = rotated_path(&log);
+        fs::create_dir_all(&rot_dir).expect("mkdir .1");
+
+        let rec = FeedbackRecord::new_numeric(
+            "rime_frost",
+            "m.onnx",
+            false,
+            false,
+            &[0.5, -0.5],
+            &[0.0, 0.0],
+            &[0.0, 0.0],
+            0,
+            0,
+            false,
+            false,
+            1,
+            false,
+        );
+        // First append succeeds (below cap); second hits rotation against directory `.1` -> hard Err
+        append_feedback_with_cap(&log, &rec, 64).expect("initial write");
+        let err = append_feedback_with_cap(&log, &rec, 64);
+        assert!(err.is_err(), "expected hard failure when .1 is a directory");
+
+        // Directory at log path itself -> hard Err
+        assert!(append_feedback_with_cap(&rot_dir, &rec, 64).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
