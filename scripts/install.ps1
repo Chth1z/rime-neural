@@ -362,8 +362,8 @@ if (-not $RimeDir) { $RimeDir = Get-DefaultRimeDir }
 $repoRoot  = if ($PSScriptRoot) { (Resolve-Path (Join-Path $PSScriptRoot "..")).Path } else { "" }
 $neuralDir = if ($DataDir) { $DataDir.Trim() } else { Join-Path $RimeDir "neural" }
 $luaDir    = Join-Path $RimeDir "lua"
-$baseHeaders = @{ "User-Agent" = "rime-neural-installer/1.1" }
-$authHeaders = @{ "User-Agent" = "rime-neural-installer/1.1" }
+$baseHeaders = @{ "User-Agent" = "rime-neural-installer/1.2" }
+$authHeaders = @{ "User-Agent" = "rime-neural-installer/1.2" }
 $ghToken   = if ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } elseif ($env:GH_TOKEN) { $env:GH_TOKEN } else { "" }
 if ($ghToken) { $authHeaders["Authorization"] = "Bearer $ghToken" }
 

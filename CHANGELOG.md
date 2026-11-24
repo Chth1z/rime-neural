@@ -4,26 +4,37 @@ All notable changes to `rime-neural` are documented in this file.
 
 ## [Unreleased]
 
+## [v1.2.0] - 2026-11-24
+
+> **Upgrade Note**: Users upgrading from `v1.0.0` or `v1.1.0` who previously enabled `log_feedback: true` should run `python scripts\tune-fusion.py --scrub-legacy-inplace` to convert historical `v1` records in `feedback.jsonl` / `feedback.jsonl.1` to the zero-plaintext `v2` schema in place.
+
 ### Security, Privacy & Soundness
-- **Zero-Plaintext Feedback & Legacy Scrubbing (`src/feedback.rs`, `src/lib.rs`, `lua/rime_neural.lua`, `scripts/tune-fusion.py`)**:
-  - Switched `feedback.jsonl` to schema `v: 2` numeric-only records (`model`, `has_gram`, `has_ctx`, `logits`, `gram_deltas`, `char_lps`, candidate indices; never persists user text, keystrokes, or UIA context), with symlink rejection, input length caps, and atomic `MoveFileExW` 5 MiB rotation.
-  - Added `--scrub-legacy-inplace`, `--schema`, `--model`, Kish `N_eff` gating, strict type/bound parsing, and domain sanity guards (`w_logit >= 0.1`, `w_rank <= 0.0`, `w_logit + w_ctx_lp >= 0.1`) to `scripts/tune-fusion.py`.
-- **Fail-Closed UIA Hardening (`src/uia.rs`)**:
-  - Upgraded background worker to MTA (`COINIT_MULTITHREADED`) with 200 ms `IUIAutomation6` timeouts, `(hwnd, pid)` denylist cache, post-read foreground `HWND` & `GetAncestor(GA_ROOT)` verification, deferred trailing probes when throttled by `MIN_REFRESH_INTERVAL`, fail-closed `ERROR_ACCESS_DENIED` / `CurrentIsPassword` / `MoveEndpointByUnit` / `end_inside < 0` checks, bullet-masked password detection, and expanded password-manager / remote-session denylist.
-- **Lua 5.4 FFI & Rust 2024 Hardening (`Cargo.toml`, `src/lua_api.rs`, `src/lib.rs`)**:
-  - Upgraded to Rust `edition = "2024"` (`rust-version = "1.92"`) with `#![warn(clippy::undocumented_unsafe_blocks)]` (0 warnings).
-  - Verified `lua_version(L) >= 504.0`, checked `pin_self_module()` return value, switched to strict `LUA_TSTRING` checks before `lua_tolstring` and metamethod-free `lua_rawget`/`lua_rawset`, checked `tointegerx` validity (`isnum`) in `lua_log_feedback`, and wrapped all `extern "C"` exports in `catch_unwind`.
-- **CI & Supply-Chain Hardening (`.github/workflows/ci-release.yml`, `scripts/install.ps1`)**:
-  - Eliminated PowerShell `${{ github.ref_name }}` injection in `publish-release`, scoped `contents: write` strictly to `publish-release`, added non-Rust CI gates (PowerShell AST, Python tuner self-test, YAML examples, tag-version parity, `SHA256SUMS.txt` LF & self-verification).
-  - Fixed `feather` model download URL (`laya-zhen-feather-preview-1121-slim.zip`) and pinned SHA-256 hashes for both `pumpkin` and `feather` `.onnx`/`tokenizer.json`/`unified_vocab.json`, pinned SHA-512 Microsoft NuGet `onnxruntime.dll` (1.31.0), added fail-closed external `SHA256SUMS.txt` checks, PS 5.1 stderr-safe `curl`/`cargo` execution, `-DataDir` support, and backup-and-rollback on install failure.
+- **Zero-Plaintext Feedback & Reparse-Safe Rotation (`src/feedback.rs`, `src/lib.rs`, `lua/rime_neural.lua`, `scripts/tune-fusion.py`, `tests/test_tune_fusion.py`)**:
+  - Switched `feedback.jsonl` to schema `v: 2` numeric-only records (`model`, `has_gram`, `has_ctx`, `logits`, `gram_deltas`, `char_lps`, clamped `shown_top1_idx`/`chosen_idx` against `num_cands <= 64`; never persists user text, keystrokes, or UIA context).
+  - Eliminated symlink/reparse-point TOCTOU races using `FILE_FLAG_OPEN_REPARSE_POINT` + `GetFileInformationByHandle` across the target file, `.1` backup, and parent directory; propagated hard rotation errors and enforced a 2× hard cap on transient sharing-violation locks during atomic `MoveFileExW` 5 MiB rotation.
+  - Added `--scrub-legacy-inplace` (with Windows `PermissionError` retry and hybrid-record plaintext stripping), `--schema`, `--model`, `--has-gram`, preserved `--top1-sample-rate` on `v1` logs before and after scrubbing, scaled MAP prior regularization by Kish `N_eff`, froze collinear `w_ctx_lp` unless both `has_ctx` strata have `>= 20` samples, enforced strict integer/domain sanity checks, and added a dedicated `unittest` suite (`tests/test_tune_fusion.py`).
+- **Fail-Closed UIA Hardening & Focus-Change Events (`src/uia.rs`, `lua/rime_neural.lua`)**:
+  - Upgraded the background worker to MTA (`COINIT_MULTITHREADED`) with 200 ms `IUIAutomation6` timeouts and an `IUIAutomationFocusChangedEventHandler` for immediate snapshot invalidation and same-window password detection when focus moves; throttled refreshes schedule a trailing deferred probe.
+  - Clamped `TextPattern` ranges strictly inside `[elem_range.Start, elem_range.End]` (`RangeFromChild(&focused)`, aborting without `ValuePattern` fallthrough on out-of-element carets or failed `MoveEndpointByUnit`), fixed blank-line paragraph bleed, NBSP tail trimming, and partial-preedit stripping, used dynamic buffer growth for `QueryFullProcessImageNameW`, refused unresolved PIDs without caching, and expanded the fail-closed denylist to cover password managers/authenticators (including versioned portable prefixes `mobaxterm_*` / `keepass-*`), credential/UAC UIs, remote-session clients, and local terminals (`WindowsTerminal`, `conhost`, `cmd`, `powershell`, `pwsh`, `mintty`, `alacritty`, `wezterm-gui`, `kitty`).
+  - Froze UIA context per composition in Lua (`comp_ctx`), sliced `preedit_before_caret` via `caret_pos`, lazily toggled `set_uia_enabled`, and prevented post-commit overwrite races.
+- **Lua 5.4 FFI Soundness & Embedded PE Metadata (`Cargo.toml`, `build.rs`, `src/lua_api.rs`, `src/lib.rs`)**:
+  - Upgraded to Rust `edition = "2024"` (`rust-version = "1.92"`) with `[lints.clippy]` `undocumented_unsafe_blocks = "warn"` and `panic = "unwind"` in `[profile.release]`.
+  - Probed `rime.dll` / `librime.dll` / `lua54.dll` / current process requiring Lua 5.4-exclusive `lua_newuserdatauv` before invoking `lua_version(L)`, enforced `(504.0..505.0)` prior to `pin_self_module()`, switched all Lua C bindings and entry points to `extern "C-unwind"` with `catch_unwind` boundaries, switched to strict `LUA_TSTRING` checks and metamethod-free `lua_rawget`/`lua_rawset`, fixed `read_weights` direct `f64` parsing, and exposed module `version` + per-call `.gram` / `has_ctx` / `has_gram` fields.
+  - Added pure-Rust `build.rs` embedding Win32 `VS_VERSION_INFO` into `rime_neural.dll`.
+- **Installer, Skill Scripts & CI Hardening (`scripts/install.ps1`, `skills/rime-neural-setup/`, `.github/workflows/ci-release.yml`, `SECURITY.md`)**:
+  - Hardened `install.ps1` with `--proto =https --proto-redir =https --max-time 300`, allowlisted ZipSlip-checked extraction (`Expand-ZipAllowlisted`), pinned `onnxruntime.dll` 1.31.0 SHA-512/SHA-256 + PE32+ x64 validation, verified `WeaselServer` exit before mutation, tracked newly created files for full rollback, fixed `feather` model download URL and pinned model SHA-256 digests, added `-DataDir` support, and fixed `Invoke-NativeSafe` missing-binary exit code handling.
+  - Hardened `inspect-env.ps1` and `verify-install.ps1` with strict PE32+ export table validation (`lua_newuserdatauv` + all 21 symbols), fixed `active_schema_list` array serialization, added `data_dir` YAML unescaping, DLL `FileVersion` reporting, and active-session glog timestamp filtering.
+  - Hardened CI with Windows PowerShell 5.1 AST/ASCII/no-BOM validation, Linux `luac5.4 -p` syntax linting, Rust 1.92 MSRV checking, `--locked` Clippy, `unittest` discovery, real `SHA256SUMS.txt` regex self-verification, tag parity across `Cargo.toml`/`Cargo.lock`/`CHANGELOG.md`/PE `ProductVersion`, and `--prerelease` handling; added `SECURITY.md`.
 
 ### Performance & NLP Correctness
-- **Engine Hot-Path & Cold-Start Optimizations (`src/engine.rs`, `src/gram.rs`, `src/pinyin.rs`)**:
-  - Implemented 3–4× faster single-pass forward double-array trie walk in `gram.rs` (bit-identical to `octagram.cc`) with `FILE_FLAG_RANDOM_ACCESS` and checked `Rime::Grammar/1.0` bounds; reused Pass-1 `.gram` scores in Pass-2.
-  - Replaced 3× JSON re-parse of 32 MB `tokenizer.json` for `choice_compact` models with in-memory `tokenizer.clone()` + `Metaspace(PrependScheme::Never)`; switched to `encode_fast`, dynamic special-token filtering, monotonic-clock LRU, token-ID prefix KV-cache with shared `true_mask`, precomputed `slot_allowed`, and sequential inter-op execution (`with_parallel_execution(false)`, `with_inter_op_spinning(false)`).
-  - Merged `uv.ml.pinyin` into `engine.readings` (+2,737 Traditional/variant/extended Hanzi), gated P2C synthesis strictly on `all_same_len`, guarded `shifted_lcp` 1:1 alignment, supported `'`-separated chunks in Double Pinyin and adjacent-transposition fuzzy recovery in Full Pinyin.
-- **Lua Filter Lifecycle & Feedback Accuracy (`lua/rime_neural.lua`)**:
-  - Preserved rerank snapshots across trailing punctuation auto-commits (`,`, `.`, `?`, `!`, `:`, `;`) with exact segment-range commit extraction while clearing stale snapshots on partial-segment selection; prevented Traditional UIA double-stripping via atomic `preedit_stripped` flag; fixed non-ASCII feedback path (always under writable `user_dir\neural\`); added per-path DLL failure tracking, lazy `.gram` attachment, and module-level OpenCC caching.
+- **`.gram` Non-BMP Equivalence & Per-Schema Isolation (`src/gram.rs`, `src/engine.rs`, `lua/rime_neural.lua`)**:
+  - Implemented a 3–4× faster single-pass forward double-array trie walk with `FILE_FLAG_RANDOM_ACCESS` and checked `Rime::Grammar/1.0` bounds, fixed non-BMP UTF-8 encoding (`〇`, CJK Ext A–I) to match upstream `librime-octagram` bit-for-bit, added configurable `collocation_max_length` (`2..=8`), cached `.gram` readers per `(path, penalties, max_length)` across schemas (with `shared_data_dir` fallback), and added synthetic trie unit tests.
+- **Pinyin Alignment & Double Pinyin Fixes (`src/pinyin.rs`)**:
+  - Split Full Pinyin alignment into 3 ordered phases (exact -> fuzzy transposition across readings and user aliases -> ASCII partial prefix) to eliminate polyphone partial-stealing, replaced the greedy fallback chunker with an `O(L)` dynamic-programming splitter, removed invalid Double Pinyin pair fallback to preserve 1:1 slot alignment, and added `ms`/`jj` schema token recognition.
+- **Engine Robustness & Caching (`src/engine.rs`)**:
+  - Fixed `AsyncInitGuard::drop` TOCTOU ordering, validated required ONNX outputs at initialization (eliminating unchecked output-index panics), handled `PreTokenizerWrapper::Sequence` in memory for no-prepend tokenizers, switched special-token sanitization to a dynamic first-byte trigger table preserving ordinary HTML vocabulary tokens and `<unk>`, merged `uv.ml.pinyin` with single-char guard and extended-char `syl_to_all_cids`, suppressed spurious `char_lps` penalties on equal-length alternate segmentations, added finiteness guards to Pass-2 P2C verification, and cached `(last_ctx_str, last_ctx_ids)` with `kv_idx` reuse across Pass-1/Pass-2.
+- **Lua Filter Usability & Compatibility (`lua/rime_neural.lua`)**:
+  - Auto-detected optional `switches` declaration (`require_option`), expanded Traditional Chinese detection for `rime-wanxiang`, added configurable `rime_neural/tags` allowlist (default `["abc"]`), normalized Windows paths before `package.loadlib`, preserved rerank snapshots across trailing punctuation auto-commits while clearing stale snapshots on partial-segment selection, and kept `feedback.jsonl` under writable `user_dir\neural\`.
 
 ## [v1.1.0] - 2026-11-23
 
@@ -56,3 +67,8 @@ First standalone public release (Apache-2.0), audited across 1,600 in-domain/hol
 - **Zero-Extra-RAM `.gram` Fusion + Pass-2 Verified P2C**: Win32 `CreateFileMappingW` shared-page-cache reader using the active schema's grammar penalties, zero-allocation `char_logits` decoding, and KV-cached Pass-2 cross-encoder + `.gram` OOV synthesis.
 - **Privacy-Hardened Non-Blocking UIA Context**: Dedicated STA thread (`< 2 µs` hot path, keystroke-1 pre-warm), `RangeFromChild` + `U+FFFC` chrome clamping, synchronous `HWND` isolation, and hard password / password-manager blocking.
 - **Unbiased Local Feedback & Anti-Overfitting MAP Tuner**: Pre-OpenCC genuine Simplified capture, automatic secret redaction, 5 MiB rotation, and Newton-Raphson MAP + 5-fold NLL CV + paired 95% CI tuner (`scripts/tune-fusion.py`).
+
+[Unreleased]: https://github.com/Chth1z/rime-neural/compare/v1.2.0...HEAD
+[v1.2.0]: https://github.com/Chth1z/rime-neural/compare/v1.1.0...v1.2.0
+[v1.1.0]: https://github.com/Chth1z/rime-neural/compare/v1.0.0...v1.1.0
+[v1.0.0]: https://github.com/Chth1z/rime-neural/releases/tag/v1.0.0

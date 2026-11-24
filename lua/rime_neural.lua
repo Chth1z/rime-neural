@@ -1,4 +1,4 @@
--- rime-neural (v1.1.0): Universal ONNX neural sentence reranker filter for Rime / Weasel.
+-- rime-neural (v1.2.0): Universal ONNX neural sentence reranker filter for Rime / Weasel.
 -- Loads `neural/rime_neural.dll` in-process via official Weasel's exported Lua 5.4 C API.
 -- Features:
 --   * Zero custom rime.dll required; works on official unmodified Weasel (librime >= 1.17.0).
