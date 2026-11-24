@@ -42,6 +42,35 @@ unsafe extern "system" {
     fn CloseHandle(hObject: *mut c_void) -> i32;
 }
 
+pub const DEFAULT_COLLOCATION_PENALTY: f64 = -15.5;
+pub const DEFAULT_NON_COLLOCATION_PENALTY: f64 = -4.0;
+pub const DEFAULT_COLLOCATION_MAX_LENGTH: usize = 5;
+
+#[inline]
+pub fn sanitize_penalties(collocation_penalty: f64, non_collocation_penalty: f64) -> (f64, f64) {
+    (
+        if collocation_penalty.is_finite() {
+            collocation_penalty
+        } else {
+            DEFAULT_COLLOCATION_PENALTY
+        },
+        if non_collocation_penalty.is_finite() {
+            non_collocation_penalty
+        } else {
+            DEFAULT_NON_COLLOCATION_PENALTY
+        },
+    )
+}
+
+#[inline]
+pub fn sanitize_max_length(max_length: usize) -> usize {
+    if max_length == 0 {
+        DEFAULT_COLLOCATION_MAX_LENGTH
+    } else {
+        max_length.clamp(2, 8)
+    }
+}
+
 /// Zero-dependency read-only memory-mapped reader for `Rime::Grammar/1.0` (`.gram`) files
 /// (such as `wanxiang-lts-zh-hans.gram`). Shares the OS page cache with `rime.dll`
 /// (0 MB extra physical RAM) and scores a candidate sentence in ~0.004 ms via a single-pass
@@ -54,6 +83,7 @@ pub struct WanxiangGram {
     da_len: usize,
     collocation_penalty: f64,
     non_collocation_penalty: f64,
+    collocation_max_length: usize,
 }
 
 // SAFETY: `WanxiangGram` holds read-only Win32 file/mapping handles and an immutable `PAGE_READONLY`
@@ -109,11 +139,14 @@ fn encode_char_stack(ch: char) -> ([u8; 6], u8) {
         let mut nb = (bits + 6) / 7;
         buf[len] = (0xE0 | nb) as u8;
         len += 1;
+        // Upstream `librime-octagram` (`gram_encoding.cc`) repeats the top 7-bit payload `nb` times
+        // without shifting `tmp` inside the emit loop; matching this bit-for-bit is required to
+        // hit `〇` (`U+3007`) and CJK Extension A/B-I entries in compiled `.gram` tries.
+        let byte = (((tmp >> 25) & 0x7F) | 0x80) as u8;
         while nb > 0 {
             nb -= 1;
-            buf[len] = (((tmp >> 25) & 0x7F) | 0x80) as u8;
+            buf[len] = byte;
             len += 1;
-            tmp <<= 7;
         }
     }
     (buf, len as u8)
@@ -178,7 +211,9 @@ fn score_slice_per_char(
     text: &str,
     collocation_penalty: f64,
     non_collocation_penalty: f64,
+    max_length: usize,
 ) -> f64 {
+    let max_len = sanitize_max_length(max_length);
     let mut encoded: [([u8; 6], u8); 48] = [([0; 6], 0); 48];
     let mut n = 0usize;
     let mut overflow: Vec<([u8; 6], u8)> = Vec::new();
@@ -235,9 +270,9 @@ fn score_slice_per_char(
             continue;
         }
 
-        // Walk characters `s + 1 .. min(s + 5, n)` once; each matched n-gram `[s..e)` (2..=5)
-        // updates `best[i]` for every split point `i in (s + 1)..e`.
-        let max_e = (s + 5).min(n);
+        // Walk characters `s + 1 .. min(s + max_len, n)` once; each matched n-gram `[s..e)`
+        // (2..=max_len) updates `best[i]` for every split point `i in (s + 1)..e`.
+        let max_e = (s + max_len).min(n);
         for e in (s + 2)..=max_e {
             let (ref buf, blen) = slice[e - 1];
             for &b in &buf[..blen as usize] {
@@ -281,16 +316,23 @@ impl WanxiangGram {
         collocation_penalty: f64,
         non_collocation_penalty: f64,
     ) -> Result<Self, String> {
-        let collocation_penalty = if collocation_penalty.is_finite() {
-            collocation_penalty
-        } else {
-            -15.5
-        };
-        let non_collocation_penalty = if non_collocation_penalty.is_finite() {
-            non_collocation_penalty
-        } else {
-            -4.0
-        };
+        Self::open_with_max_len(
+            path,
+            collocation_penalty,
+            non_collocation_penalty,
+            DEFAULT_COLLOCATION_MAX_LENGTH,
+        )
+    }
+
+    pub fn open_with_max_len(
+        path: &Path,
+        collocation_penalty: f64,
+        non_collocation_penalty: f64,
+        collocation_max_length: usize,
+    ) -> Result<Self, String> {
+        let (collocation_penalty, non_collocation_penalty) =
+            sanitize_penalties(collocation_penalty, non_collocation_penalty);
+        let collocation_max_length = sanitize_max_length(collocation_max_length);
         let wide: Vec<u16> = path
             .as_os_str()
             .encode_wide()
@@ -370,6 +412,7 @@ impl WanxiangGram {
                 da_len: da_size,
                 collocation_penalty,
                 non_collocation_penalty,
+                collocation_max_length,
             })
         }
     }
@@ -390,14 +433,30 @@ impl WanxiangGram {
         unsafe { std::slice::from_raw_parts(self.da_ptr, self.da_len) }
     }
 
-    /// Mean per-character transition log-weight in Wanxiang's grammar trie (matching `octagram.cc`).
+    /// Mean per-character transition log-weight in the grammar trie using this instance's defaults.
+    #[allow(dead_code)]
     pub fn score_sentence_per_char(&self, text: &str) -> f64 {
         score_slice_per_char(
             self.da_slice(),
             text,
             self.collocation_penalty,
             self.non_collocation_penalty,
+            self.collocation_max_length,
         )
+    }
+
+    /// Score a sentence with explicit per-schema penalties and max collocation length
+    /// without mutating the shared read-only memory mapping.
+    #[allow(dead_code)]
+    pub fn score_sentence_per_char_with(
+        &self,
+        text: &str,
+        collocation_penalty: f64,
+        non_collocation_penalty: f64,
+        collocation_max_length: usize,
+    ) -> f64 {
+        let (col, non_col) = sanitize_penalties(collocation_penalty, non_collocation_penalty);
+        score_slice_per_char(self.da_slice(), text, col, non_col, collocation_max_length)
     }
 }
 
@@ -411,7 +470,9 @@ mod tests {
         text: &str,
         collocation_penalty: f64,
         non_collocation_penalty: f64,
+        max_length: usize,
     ) -> f64 {
+        let max_len = sanitize_max_length(max_length);
         let slice: Vec<([u8; 6], u8)> = text.chars().map(encode_char_stack).collect();
         if slice.len() <= 1 || da.is_empty() {
             return 0.0;
@@ -419,7 +480,7 @@ mod tests {
         let mut total = 0.0f64;
         for i in 1..slice.len() {
             let mut best = non_collocation_penalty;
-            let max_cl = 4.min(i);
+            let max_cl = (max_len - 1).min(i);
             for cl in 1..=max_cl {
                 let mut node_pos = 0usize;
                 let mut u = da[0];
@@ -444,7 +505,7 @@ mod tests {
                 if !ok {
                     continue;
                 }
-                let max_wl = (5 - cl).min(slice.len() - i);
+                let max_wl = (max_len - cl).min(slice.len() - i);
                 for wl in 1..=max_wl {
                     let (ref buf, blen) = slice[i + wl - 1];
                     for &b in &buf[..blen as usize] {
@@ -477,6 +538,192 @@ mod tests {
         total / ((slice.len() - 1) as f64)
     }
 
+    /// Minimal Darts-Clone double-array builder for deterministic CI tests without external `.gram`.
+    fn build_synthetic_da(entries: &[(&str, u32)]) -> Vec<u32> {
+        use std::collections::BTreeMap;
+
+        #[derive(Default)]
+        struct Node {
+            children: BTreeMap<u8, Node>,
+            leaf: Option<u32>,
+        }
+
+        fn encode_str(s: &str) -> Vec<u8> {
+            let mut out = Vec::new();
+            for ch in s.chars() {
+                let (buf, len) = encode_char_stack(ch);
+                out.extend_from_slice(&buf[..len as usize]);
+            }
+            out
+        }
+
+        let mut root = Node::default();
+        for &(word, val) in entries {
+            let mut cur = &mut root;
+            for b in encode_str(word) {
+                cur = cur.children.entry(b).or_default();
+            }
+            cur.leaf = Some(val);
+        }
+
+        let mut da: Vec<u32> = vec![0; 256];
+        let mut used: Vec<bool> = vec![false; 256];
+        let mut used_base: Vec<bool> = vec![false; 256];
+        used[0] = true;
+
+        fn place(
+            node: &Node,
+            pos: usize,
+            label: u8,
+            da: &mut Vec<u32>,
+            used: &mut Vec<bool>,
+            used_base: &mut Vec<bool>,
+        ) {
+            let mut edges: Vec<u8> = node.children.keys().copied().collect();
+            let has_leaf = node.leaf.is_some();
+            if !has_leaf && edges.is_empty() {
+                da[pos] = label as u32;
+                return;
+            }
+            edges.sort_unstable();
+            let mut base = 1usize;
+            let offset = loop {
+                let off = pos ^ base;
+                let max_slot = edges
+                    .iter()
+                    .map(|&b| base ^ (b as usize))
+                    .chain(std::iter::once(base))
+                    .max()
+                    .unwrap_or(base);
+                if max_slot >= used.len() {
+                    let new_len = (max_slot + 256).next_power_of_two();
+                    da.resize(new_len, 0);
+                    used.resize(new_len, false);
+                    used_base.resize(new_len, false);
+                }
+                let base_free = !used_base[base];
+                let leaf_free = !has_leaf || !used[base];
+                let kids_free = edges.iter().all(|&b| !used[base ^ (b as usize)]);
+                // Distinct `base` guarantees `base_A ^ b != base_B ^ b` (no cross-node aliasing).
+                if off > 0 && off < (1 << 21) && base_free && leaf_free && kids_free {
+                    break off;
+                }
+                base += 1;
+            };
+
+            used_base[base] = true;
+            let mut unit = (label as u32) | ((offset as u32) << 10);
+            if has_leaf {
+                unit |= 1 << 8;
+                used[pos ^ offset] = true;
+                da[pos ^ offset] = 0x8000_0000 | (node.leaf.unwrap() & 0x7FFF_FFFF);
+            }
+            da[pos] = unit;
+            for &b in &edges {
+                used[pos ^ offset ^ (b as usize)] = true;
+            }
+            for (&b, child) in &node.children {
+                place(child, pos ^ offset ^ (b as usize), b, da, used, used_base);
+            }
+        }
+
+        place(&root, 0, 0, &mut da, &mut used, &mut used_base);
+        da
+    }
+
+    fn write_synthetic_gram_file(path: &Path, da: &[u32]) {
+        let mut buf = vec![0u8; 64 + da.len() * 4];
+        buf[..GRAM_MAGIC_V1.len()].copy_from_slice(GRAM_MAGIC_V1);
+        buf[36..40].copy_from_slice(&(da.len() as u32).to_le_bytes());
+        buf[40..44].copy_from_slice(&24i32.to_le_bytes()); // da_off = 40 + 24 = 64
+        for (i, &u) in da.iter().enumerate() {
+            let off = 64 + i * 4;
+            buf[off..off + 4].copy_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(path, &buf).expect("write synthetic gram");
+    }
+
+    #[test]
+    fn test_synthetic_gram_single_pass_equivalence_overflow_and_max_length() {
+        let da = build_synthetic_da(&[
+            ("你好", 140_000),
+            ("世界", 130_000),
+            ("你好世界", 190_000),
+            ("二〇三一年", 222_231),
+            ("㮾梨街道", 159_748),
+            ("𫟼元素", 131_685),
+            ("中卫市沙坡头区", 246_548),
+        ]);
+        let long_60 = "你好世界".repeat(15); // 60 chars -> exercises `n > 48` heap-overflow branch
+        let samples = [
+            "",
+            "单",
+            "你好",
+            "你好世界",
+            "二〇三一年",
+            "㮾梨街道",
+            "𫟼元素",
+            "中卫市沙坡头区",
+            long_60.as_str(),
+        ];
+        for max_len in [5usize, 7usize] {
+            for s in samples {
+                let fast = score_slice_per_char(&da, s, -15.5, -4.0, max_len);
+                let ref_s = reference_score_slice(&da, s, -15.5, -4.0, max_len);
+                assert_eq!(
+                    fast.to_bits(),
+                    ref_s.to_bits(),
+                    "synthetic mismatch on '{}' (max_len={}): fast={} ref={}",
+                    s,
+                    max_len,
+                    fast,
+                    ref_s
+                );
+            }
+        }
+        // `二〇三一年` (leaf 222231) -> 22.2231 - 15.5 = +6.7231 on every transition
+        let s_2031 = score_slice_per_char(&da, "二〇三一年", -15.5, -4.0, 5);
+        assert!(
+            (s_2031 - 6.7231).abs() < 1e-6,
+            "expected 二〇三一年 hit ~6.7231, got {}",
+            s_2031
+        );
+        // 7-char n-gram `中卫市沙坡头区` misses under max_len=5 (-4.0) and hits under max_len=7 (+9.1548)
+        let s7_cap5 = score_slice_per_char(&da, "中卫市沙坡头区", -15.5, -4.0, 5);
+        let s7_cap7 = score_slice_per_char(&da, "中卫市沙坡头区", -15.5, -4.0, 7);
+        assert!(
+            (s7_cap5 - (-4.0)).abs() < 1e-6,
+            "expected -4.0 under max_len=5, got {}",
+            s7_cap5
+        );
+        assert!(
+            (s7_cap7 - 9.1548).abs() < 1e-6,
+            "expected 9.1548 under max_len=7, got {}",
+            s7_cap7
+        );
+
+        // End-to-end Win32 mmap open + per-call penalties + NaN sanitization
+        let tmp = std::env::temp_dir().join("rime_neural_test_synthetic.gram");
+        write_synthetic_gram_file(&tmp, &da);
+        let mut gram = WanxiangGram::open(&tmp, -15.5, -4.0).expect("open synthetic gram");
+        assert!(
+            (gram.score_sentence_per_char("你好世界") - 3.5).abs() < 1e-6,
+            "expected 19.0 - 15.5 = 3.5"
+        );
+        assert!(
+            (gram.score_sentence_per_char_with("你好世界", -14.0, -4.0, 5) - 5.0).abs() < 1e-6,
+            "expected 19.0 - 14.0 = 5.0"
+        );
+        assert!(
+            (gram.score_sentence_per_char_with("中卫市沙坡头区", -15.5, -4.0, 7) - 9.1548).abs()
+                < 1e-6
+        );
+        gram.update_penalties(f64::NAN, f64::INFINITY);
+        assert!((gram.score_sentence_per_char("你好世界") - 3.5).abs() < 1e-6);
+        drop(gram);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
     #[test]
     fn test_wanxiang_gram_if_present_and_single_pass_equivalence() {
         let Ok(appdata) = std::env::var("APPDATA") else {
@@ -494,13 +741,14 @@ mod tests {
             "所有案件都在传送带上循环滚动",
             "今天天气真不错我们一起去公园散步吧",
             "端侧神经整句重排模型可以在本地实时运行并且无需任何云端请求也不上传隐私",
+            "二〇三一年",
             "你好",
             "a",
             "",
         ];
         for s in sentences {
             let fast = gram.score_sentence_per_char(s);
-            let ref_s = reference_score_slice(gram.da_slice(), s, -15.5, -4.0);
+            let ref_s = reference_score_slice(gram.da_slice(), s, -15.5, -4.0, 5);
             assert_eq!(
                 fast.to_bits(),
                 ref_s.to_bits(),
@@ -518,6 +766,12 @@ mod tests {
             s2,
             s1
         );
+        let s_2031 = gram.score_sentence_per_char("二〇三一年");
+        assert!(
+            s_2031 > 0.0,
+            "expected 二〇三一年 to hit wanxiang trie (> 0.0), got {}",
+            s_2031
+        );
     }
 
     #[test]
@@ -534,9 +788,16 @@ mod tests {
         // CJK low byte != 0 (U+4E2D '中')
         let (b, l) = encode_char_stack('中');
         assert_eq!((&b[..l as usize], l), (&[0x8E, 0x2D][..], 2));
+        // Exact upstream `librime-octagram` general-range encodings (`〇`, CJK Ext A, CJK Ext E)
+        let (b, l) = encode_char_stack('〇');
+        assert_eq!((&b[..l as usize], l), (&[0xE3, 0x86, 0x86, 0x86][..], 4));
+        let (b, l) = encode_char_stack('㮾');
+        assert_eq!((&b[..l as usize], l), (&[0xE3, 0x87, 0x87, 0x87][..], 4));
+        let (b, l) = encode_char_stack('𫟼');
+        assert_eq!((&b[..l as usize], l), (&[0xE3, 0xD6, 0xD6, 0xD6][..], 4));
         // Supplementary plane emoji (U+1F600)
-        let (_, l) = encode_char_stack('😀');
-        assert!((2..=6).contains(&l));
+        let (b, l) = encode_char_stack('😀');
+        assert_eq!((&b[..l as usize], l), (&[0xE3, 0xBE, 0xBE, 0xBE][..], 4));
     }
 
     #[test]
