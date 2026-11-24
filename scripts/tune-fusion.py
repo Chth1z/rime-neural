@@ -6,22 +6,27 @@ Statistical anti-overfitting design:
   1. `lua/rime_neural.lua` logs 100% of multi-candidate sentence commits as zero-plaintext
      numeric feature records (`v: 2`, `sample_weight = 1.0`, bounded by 5 MiB auto-rotation)
      to eliminate selection bias while never persisting user text. Legacy v1 records remain
-     readable, and legacy 10%-sampled Top-1 logs remain supported via `--top1-sample-rate 0.10`.
+     readable (and can be converted in-place to zero-plaintext v2 via `--scrub-legacy-inplace`),
+     and legacy 10%-sampled Top-1 logs remain supported via `--top1-sample-rate 0.10`.
   2. Fits exact damped Newton-Raphson Bayesian MAP estimation around `W_PRIOR` with Gaussian
      prior precision `lam`:
          J(w) = (1 / sum_w) * sum_i w_i * NLL_i(w) + (lam / (2 * sum_w)) * ||w - W_PRIOR||^2
      so prior strength stays fixed in effective sample count and vanishes asymptotically as N -> inf.
   3. Selects prior precision `lam` by contiguous blocked 5-fold out-of-fold weighted **log-loss
      (NLL)** (strictly proper scoring rule; contiguous folds prevent adjacent-session leakage).
-  4. Only recommends an update when ALL THREE guards pass:
-       - Minimum sample guards are met (default >= 100 matched records, >= 15 corrections, >= 30 accepts)
-       - Out-of-fold weighted NLL improvement passes a one-sided paired 95% CI test (z >= 1.645)
+  4. Only recommends an update when ALL FOUR guards pass:
+       - Minimum effective sample guards are met (`min(n, Kish N_eff) >= min_samples`,
+         `>= 15` corrections, `>= 30` accepts)
+       - Out-of-fold weighted NLL improvement passes a one-sided paired 95% CI test (`z >= 1.645`)
          using the heteroscedasticity-robust Hajek sandwich variance estimator
-       - Out-of-fold weighted Top-1 accuracy does not drop below `W_PRIOR`.
+       - Out-of-fold weighted Top-1 accuracy does not drop below `W_PRIOR`
+       - Fitted weights satisfy domain sanity invariants (`w_logit >= 0.1`, `w_rank <= 0.0`,
+         `w_logit + w_ctx_lp >= 0.1`) and differ from `W_PRIOR` after 3-decimal rounding.
 
 Usage:
     python scripts/tune-fusion.py
-    python scripts/tune-fusion.py --log path/to/feedback.jsonl --min-samples 100
+    python scripts/tune-fusion.py --log path/to/feedback.jsonl --schema rime_frost_double_pinyin
+    python scripts/tune-fusion.py --scrub-legacy-inplace
 """
 from __future__ import annotations
 
@@ -30,6 +35,9 @@ import json
 import math
 import os
 import pathlib
+import sys
+import tempfile
+from collections import Counter
 from typing import Any, List, Optional, Tuple
 
 import numpy as np
@@ -38,6 +46,8 @@ import numpy as np
 W_PRIOR = np.array([1.0, -1.4, 0.05, 0.15, 0.0], dtype=np.float64)
 # Prior precision grid (effective prior sample count; scaled by 1 / sum_w in the mean NLL objective)
 LAMBDA_GRID = (0.5, 1.5, 5.0, 15.0, 50.0, 150.0, 500.0)
+MAX_ABS_FEATURE = 1e6
+MAX_SAMPLE_WEIGHT = 1e6
 
 
 def _registry_rime_user_dir() -> Optional[pathlib.Path]:
@@ -78,6 +88,22 @@ def log_softmax(xs: List[float]) -> np.ndarray:
     return arr - (m + math.log(float(np.sum(np.exp(arr - m)))))
 
 
+def _parse_strict_int(raw: Any, default: Optional[int] = None) -> Optional[int]:
+    if raw is None or isinstance(raw, bool):
+        return default
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float):
+        if math.isfinite(raw) and raw.is_integer():
+            return int(raw)
+        return default
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s and (s.isdigit() or (s[0] in "+-" and s[1:].isdigit())):
+            return int(s)
+    return default
+
+
 def _parse_finite_float_list(raw: Any, expected_len: int, allow_empty: bool = False) -> Optional[List[float]]:
     if raw is None or (allow_empty and raw == []):
         return [0.0] * expected_len if allow_empty else None
@@ -91,13 +117,128 @@ def _parse_finite_float_list(raw: Any, expected_len: int, allow_empty: bool = Fa
             fv = float(v)
         except (TypeError, ValueError):
             return None
-        if not math.isfinite(fv):
+        if not math.isfinite(fv) or abs(fv) > MAX_ABS_FEATURE:
             return None
         out.append(fv)
     return out
 
 
-def _iter_log_lines(path: pathlib.Path, include_rotated: bool = True) -> List[str]:
+def _convert_v1_to_v2(rec: dict) -> Optional[dict]:
+    """Convert a legacy v1 record (containing raw text fields) into a zero-plaintext v2 record."""
+    cands = rec.get("cands")
+    if not isinstance(cands, list) or len(cands) < 2:
+        return None
+    num_cands = len(cands)
+    logits = _parse_finite_float_list(rec.get("logits"), num_cands)
+    grams = _parse_finite_float_list(rec.get("gram_deltas"), num_cands, allow_empty=True)
+    clps = _parse_finite_float_list(rec.get("char_lps"), num_cands, allow_empty=True)
+    if logits is None or grams is None or clps is None:
+        return None
+
+    chosen = rec.get("chosen_text") if isinstance(rec.get("chosen_text"), str) else ""
+    shown_top1 = rec.get("shown_top1") if isinstance(rec.get("shown_top1"), str) else ""
+    p2c_cand = rec.get("p2c_cand") if isinstance(rec.get("p2c_cand"), str) else ""
+    ctx = rec.get("context") if isinstance(rec.get("context"), str) else ""
+    schema = rec.get("schema") if isinstance(rec.get("schema"), str) else ""
+
+    chosen_idx = cands.index(chosen) if (chosen and chosen in cands) else -1
+    p2c_shown = bool(p2c_cand)
+    p2c_chosen = bool(p2c_cand and chosen == p2c_cand and chosen_idx < 0)
+    if p2c_cand and shown_top1 == p2c_cand and shown_top1 not in cands:
+        shown_top1_idx = -2
+    elif shown_top1 and shown_top1 in cands:
+        shown_top1_idx = cands.index(shown_top1)
+    else:
+        shown_top1_idx = -1
+
+    chosen_rank = _parse_strict_int(rec.get("chosen_rank"), 0) or 0
+    ts = _parse_strict_int(rec.get("ts"), 0) or 0
+    raw_sw = rec.get("sample_weight")
+    sw = 1.0
+    if raw_sw is not None and not isinstance(raw_sw, bool):
+        try:
+            fsw = float(raw_sw)
+            if math.isfinite(fsw) and 0.0 < fsw <= MAX_SAMPLE_WEIGHT:
+                sw = fsw
+        except (TypeError, ValueError):
+            pass
+
+    reverted = (shown_top1_idx > 0 or shown_top1_idx == -2) and chosen_idx == 0
+    return {
+        "v": 2,
+        "ts": ts,
+        "sample_weight": sw,
+        "schema": schema,
+        "has_ctx": len(ctx.strip()) >= 2,
+        "num_cands": num_cands,
+        "logits": logits,
+        "gram_deltas": grams,
+        "char_lps": clps,
+        "shown_top1_idx": shown_top1_idx,
+        "chosen_idx": chosen_idx,
+        "p2c_shown": p2c_shown,
+        "p2c_chosen": p2c_chosen,
+        "chosen_rank": chosen_rank,
+        "reverted": reverted,
+    }
+
+
+def scrub_legacy_log_files(path: pathlib.Path, include_rotated: bool = True) -> Tuple[int, int]:
+    """Atomically rewrite legacy v1 plaintext records into zero-plaintext v2 numeric records."""
+    targets: List[pathlib.Path] = []
+    if include_rotated:
+        rot = pathlib.Path(str(path) + ".1")
+        if rot.is_file():
+            targets.append(rot)
+    if path.is_file():
+        targets.append(path)
+
+    converted_total = 0
+    kept_total = 0
+    for target in targets:
+        out_lines: List[str] = []
+        changed = False
+        for raw_line in target.read_text(encoding="utf-8", errors="ignore").splitlines():
+            s = raw_line.strip()
+            if not s:
+                continue
+            try:
+                rec = json.loads(s)
+            except json.JSONDecodeError:
+                changed = True
+                continue
+            if not isinstance(rec, dict):
+                changed = True
+                continue
+            has_plaintext = any(
+                k in rec for k in ("raw_input", "context", "cands", "chosen_text", "shown_top1", "p2c_cand")
+            )
+            if has_plaintext:
+                v2 = _convert_v1_to_v2(rec)
+                if v2 is not None:
+                    out_lines.append(json.dumps(v2, ensure_ascii=False, separators=(",", ":")))
+                    converted_total += 1
+                changed = True
+            else:
+                out_lines.append(s)
+                kept_total += 1
+        if changed:
+            fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".fb_scrub_", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                    if out_lines:
+                        fh.write("\n".join(out_lines) + "\n")
+                os.replace(tmp_name, target)
+            except Exception:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+    return converted_total, kept_total
+
+
+def _iter_log_lines(path: pathlib.Path, include_rotated: bool = True) -> Tuple[List[str], int]:
     files: List[pathlib.Path] = []
     if include_rotated:
         rotated = pathlib.Path(str(path) + ".1")
@@ -108,30 +249,37 @@ def _iter_log_lines(path: pathlib.Path, include_rotated: bool = True) -> List[st
     lines: List[str] = []
     for f in files:
         lines.extend(f.read_text(encoding="utf-8", errors="ignore").splitlines())
-    return lines
+    return lines, len(files)
 
 
 def load_samples(
     path: pathlib.Path,
     top1_sample_rate: float = 1.0,
     include_rotated: bool = True,
+    schema_filter: Optional[str] = None,
+    model_filter: Optional[str] = None,
 ) -> Tuple[List[np.ndarray], List[int], np.ndarray, dict]:
-    summary = {
+    summary: dict[str, Any] = {
+        "files_found": 0,
         "total_lines": 0,
+        "legacy_v1": 0,
         "matched": 0,
         "p2c_accepted": 0,
         "disagreed": 0,
         "neural_win": 0,
         "rime_revert": 0,
+        "schemas": Counter(),
+        "models": Counter(),
     }
-    raw_lines = _iter_log_lines(path, include_rotated=include_rotated)
+    raw_lines, files_found = _iter_log_lines(path, include_rotated=include_rotated)
+    summary["files_found"] = files_found
     if not raw_lines:
         return [], [], np.array([], dtype=np.float64), summary
 
     X_list: List[np.ndarray] = []
     y_list: List[int] = []
     w_list: List[float] = []
-    top1_weight = 1.0 / max(1e-3, top1_sample_rate)
+    top1_weight = 1.0 / max(1e-3, min(1.0, top1_sample_rate))
 
     for line in raw_lines:
         line = line.strip()
@@ -145,8 +293,23 @@ def load_samples(
             continue
         summary["total_lines"] += 1
 
-        is_v2 = ("chosen_idx" in rec) or (isinstance(rec.get("v"), int) and rec["v"] >= 2)
-        if is_v2:
+        rec_schema = rec.get("schema") if isinstance(rec.get("schema"), str) else ""
+        rec_model = rec.get("model") if isinstance(rec.get("model"), str) else ""
+        if schema_filter and rec_schema != schema_filter:
+            continue
+        if model_filter and rec_model != model_filter:
+            continue
+
+        is_v2 = ("chosen_idx" in rec) or (
+            isinstance(rec.get("v"), int) and not isinstance(rec.get("v"), bool) and rec["v"] >= 2
+        )
+        if not is_v2:
+            summary["legacy_v1"] += 1
+            converted = _convert_v1_to_v2(rec)
+            if converted is None:
+                continue
+            v2 = converted
+        else:
             raw_logits = rec.get("logits")
             if not isinstance(raw_logits, list) or len(raw_logits) < 2:
                 continue
@@ -156,58 +319,60 @@ def load_samples(
             clps = _parse_finite_float_list(rec.get("char_lps"), num_cands, allow_empty=True)
             if logits is None or grams is None or clps is None:
                 continue
-            try:
-                chosen_idx = int(rec.get("chosen_idx", -1))
-                shown_top1_idx = int(rec.get("shown_top1_idx", -1))
-            except (TypeError, ValueError):
+            chosen_idx = _parse_strict_int(rec.get("chosen_idx"), None)
+            shown_top1_idx = _parse_strict_int(rec.get("shown_top1_idx"), -1)
+            if chosen_idx is None or shown_top1_idx is None:
                 continue
-            p2c_chosen = bool(rec.get("p2c_chosen", False))
-            if p2c_chosen:
-                summary["p2c_accepted"] += 1
-                if shown_top1_idx == -2:
-                    summary["disagreed"] += 1
-                    summary["neural_win"] += 1
-            if chosen_idx < 0 or chosen_idx >= num_cands:
-                continue
-            summary["matched"] += 1
-            if shown_top1_idx != -1 and shown_top1_idx != 0:
-                summary["disagreed"] += 1
-                if chosen_idx == shown_top1_idx:
-                    summary["neural_win"] += 1
-                elif chosen_idx == 0:
-                    summary["rime_revert"] += 1
-            y = chosen_idx
-            has_ctx = 1.0 if bool(rec.get("has_ctx", False)) else 0.0
-        else:
-            cands = rec.get("cands")
-            if not isinstance(cands, list) or len(cands) < 2:
-                continue
-            num_cands = len(cands)
-            logits = _parse_finite_float_list(rec.get("logits"), num_cands)
-            grams = _parse_finite_float_list(rec.get("gram_deltas"), num_cands, allow_empty=True)
-            clps = _parse_finite_float_list(rec.get("char_lps"), num_cands, allow_empty=True)
-            if logits is None or grams is None or clps is None:
-                continue
-            chosen = rec.get("chosen_text") or ""
-            shown_top1 = rec.get("shown_top1") or ""
-            p2c_cand = rec.get("p2c_cand") or ""
-            if p2c_cand and chosen == p2c_cand and chosen not in cands:
-                summary["p2c_accepted"] += 1
-                if shown_top1 == p2c_cand:
-                    summary["disagreed"] += 1
-                    summary["neural_win"] += 1
-            if chosen not in cands:
-                continue
-            summary["matched"] += 1
-            if shown_top1 and shown_top1 != cands[0]:
-                summary["disagreed"] += 1
-                if chosen == shown_top1:
-                    summary["neural_win"] += 1
-                elif chosen == cands[0]:
-                    summary["rime_revert"] += 1
-            y = cands.index(chosen)
-            has_ctx = 1.0 if len((rec.get("context") or "").strip()) >= 2 else 0.0
+            if shown_top1_idx < -2 or shown_top1_idx >= num_cands:
+                shown_top1_idx = -1
+            v2 = {
+                "logits": logits,
+                "gram_deltas": grams,
+                "char_lps": clps,
+                "num_cands": num_cands,
+                "chosen_idx": chosen_idx,
+                "shown_top1_idx": shown_top1_idx,
+                "p2c_chosen": bool(rec.get("p2c_chosen", False)),
+                "has_ctx": bool(rec.get("has_ctx", False)),
+                "sample_weight": rec.get("sample_weight"),
+                "chosen_rank": rec.get("chosen_rank", 0),
+            }
 
+        num_cands = v2["num_cands"]
+        logits = v2["logits"]
+        grams = v2["gram_deltas"]
+        clps = v2["char_lps"]
+        chosen_idx = v2["chosen_idx"]
+        shown_top1_idx = v2["shown_top1_idx"]
+        p2c_chosen = bool(v2["p2c_chosen"])
+
+        if p2c_chosen:
+            summary["p2c_accepted"] += 1
+            if shown_top1_idx == -2:
+                summary["disagreed"] += 1
+                summary["neural_win"] += 1
+        elif chosen_idx < 0 and shown_top1_idx == -2:
+            # P2C was shown as top-1 (disagreeing with Rime #1), and user chose outside Top-K
+            summary["disagreed"] += 1
+
+        if chosen_idx < 0 or chosen_idx >= num_cands:
+            continue
+
+        summary["matched"] += 1
+        if rec_schema:
+            summary["schemas"][rec_schema] += 1
+        if rec_model:
+            summary["models"][rec_model] += 1
+
+        if shown_top1_idx != -1 and shown_top1_idx != 0:
+            summary["disagreed"] += 1
+            if chosen_idx == shown_top1_idx:
+                summary["neural_win"] += 1
+            elif chosen_idx == 0:
+                summary["rime_revert"] += 1
+
+        y = chosen_idx
+        has_ctx = 1.0 if bool(v2["has_ctx"]) else 0.0
         lp = log_softmax(logits)
         X = np.array(
             [
@@ -216,20 +381,20 @@ def load_samples(
             ],
             dtype=np.float64,
         )
+
         sw: Optional[float] = None
-        if "sample_weight" in rec and rec["sample_weight"] is not None:
+        raw_sw = v2.get("sample_weight")
+        if raw_sw is not None and not isinstance(raw_sw, bool):
             try:
-                cand_sw = float(rec["sample_weight"])
-                if math.isfinite(cand_sw) and cand_sw > 0.0:
+                cand_sw = float(raw_sw)
+                if math.isfinite(cand_sw) and 0.0 < cand_sw <= MAX_SAMPLE_WEIGHT:
                     sw = cand_sw
             except (TypeError, ValueError):
                 sw = None
         if sw is None:
-            try:
-                chosen_rank = int(rec.get("chosen_rank", 0))
-            except (TypeError, ValueError):
-                chosen_rank = 0
+            chosen_rank = _parse_strict_int(v2.get("chosen_rank"), 0) or 0
             sw = top1_weight if chosen_rank == 1 else 1.0
+
         X_list.append(X)
         y_list.append(y)
         w_list.append(sw)
@@ -269,7 +434,7 @@ def fit_newton_offset_ridge(
     d = len(w_prior)
     w = w_prior.copy()
     tot_w = float(np.sum(weights))
-    if tot_w <= 0.0:
+    if not math.isfinite(tot_w) or tot_w <= 0.0:
         return w
     eff_lam = lam / tot_w
     eye = np.eye(d, dtype=np.float64)
@@ -283,6 +448,8 @@ def fit_newton_offset_ridge(
             s -= float(np.max(s))
             exp_s = np.exp(s)
             sum_exp = float(np.sum(exp_s))
+            if not math.isfinite(sum_exp) or sum_exp <= 0.0:
+                return w
             p = exp_s / sum_exp
             c = float(wt) / tot_w
             obj_cur += c * (math.log(sum_exp) - float(s[y]))
@@ -292,16 +459,23 @@ def fit_newton_offset_ridge(
             mu = p @ X
             Xc = X - mu
             hess += c * ((Xc * p[:, None]).T @ Xc)
-        step = np.linalg.solve(hess + 1e-8 * eye, grad)
+        if not (np.isfinite(grad).all() and np.isfinite(hess).all()):
+            break
+        try:
+            step = np.linalg.solve(hess + 1e-8 * eye, grad)
+        except np.linalg.LinAlgError:
+            break
+        if not np.isfinite(step).all():
+            break
         dir_deriv = -float(grad @ step)
-        if dir_deriv >= 0.0:
+        if not math.isfinite(dir_deriv) or dir_deriv >= 0.0:
             break
         alpha = 1.0
         accepted = False
         for _ in range(10):
             w_cand = w - alpha * step
             obj_cand = eval_penalized_obj(X_list, y_list, weights, tot_w, lam, w_prior, w_cand)
-            if obj_cand <= obj_cur + 1e-4 * alpha * dir_deriv:
+            if math.isfinite(obj_cand) and obj_cand <= obj_cur + 1e-4 * alpha * dir_deriv:
                 w = w_cand
                 accepted = True
                 break
@@ -311,6 +485,20 @@ def fit_newton_offset_ridge(
         if alpha * float(np.linalg.norm(step)) < 1e-7:
             break
     return w
+
+
+def weights_pass_domain_sanity(w: np.ndarray) -> Tuple[bool, str]:
+    """Reject pathological weight vectors caused by selection-biased logs (e.g. inverted rank prior)."""
+    if not np.isfinite(w).all():
+        return False, "non-finite weight value"
+    w_logit, w_rank, _w_gram, _w_char_lp, w_ctx_lp = [float(x) for x in w]
+    if w_logit < 0.1:
+        return False, f"w_logit={w_logit:.3f} < 0.1 (neural logit weight must stay positive)"
+    if w_rank > 0.0:
+        return False, f"w_rank={w_rank:+.3f} > 0 (positive rank weight would invert Rime rank order)"
+    if (w_logit + w_ctx_lp) < 0.1:
+        return False, f"w_logit + w_ctx_lp={w_logit + w_ctx_lp:.3f} < 0.1"
+    return True, ""
 
 
 def eval_nll_vec(X_list: List[np.ndarray], y_list: List[int], w: np.ndarray) -> np.ndarray:
@@ -326,7 +514,7 @@ def eval_weighted_acc(
     X_list: List[np.ndarray], y_list: List[int], weights: np.ndarray, w: np.ndarray
 ) -> float:
     tot_w = float(np.sum(weights))
-    if tot_w <= 0.0:
+    if not math.isfinite(tot_w) or tot_w <= 0.0:
         return 0.0
     hits = sum(
         float(wt)
@@ -339,14 +527,14 @@ def eval_weighted_acc(
 def kish_effective_n(weights: np.ndarray) -> float:
     s1 = float(np.sum(weights))
     s2 = float(np.sum(weights * weights))
-    return (s1 * s1 / s2) if s2 > 0.0 else 0.0
+    return (s1 * s1 / s2) if (math.isfinite(s1) and math.isfinite(s2) and s2 > 0.0) else 0.0
 
 
 def hajek_paired_se(diff: np.ndarray, weights: np.ndarray, mean_d: float) -> float:
     """Heteroscedasticity-robust Hajek sandwich SE for a weighted ratio mean."""
     n = len(diff)
     s1 = float(np.sum(weights))
-    if n < 2 or s1 <= 0.0:
+    if n < 2 or not math.isfinite(s1) or s1 <= 0.0:
         return 0.0
     var_hat = (n / (n - 1.0)) * float(np.sum((weights * (diff - mean_d)) ** 2)) / (s1 * s1)
     return math.sqrt(max(0.0, var_hat))
@@ -359,54 +547,95 @@ def main() -> None:
         default=default_log_path(),
         help="Path to local feedback.jsonl (defaults to RimeUserDir/%%APPDATA%%\\Rime\\neural\\feedback.jsonl)",
     )
-    ap.add_argument("--min-samples", type=int, default=100, help="Minimum total matched records")
-    ap.add_argument("--min-corrections", type=int, default=15, help="Minimum correction records")
-    ap.add_argument("--min-accepts", type=int, default=30, help="Minimum accepted Top-1 records")
+    ap.add_argument("--min-samples", type=int, default=100, help="Minimum matched records & Kish N_eff")
+    ap.add_argument("--min-corrections", type=int, default=15, help="Minimum prior-miss records")
+    ap.add_argument("--min-accepts", type=int, default=30, help="Minimum prior-hit records")
     ap.add_argument(
         "--top1-sample-rate",
         type=float,
         default=1.0,
-        help="Sampling rate of Top-1 accepts for legacy logs without sample_weight (default 1.0)",
+        help="Sampling rate in (0, 1] of Top-1 accepts for legacy logs without sample_weight (default 1.0)",
     )
+    ap.add_argument("--schema", default="", help="Filter feedback records to a single Rime schema_id")
+    ap.add_argument("--model", default="", help="Filter feedback records to a single ONNX model filename")
     ap.add_argument(
         "--no-rotated",
         action="store_true",
         help="Do not include rotated feedback.jsonl.1 alongside feedback.jsonl",
     )
+    ap.add_argument(
+        "--scrub-legacy-inplace",
+        action="store_true",
+        help="Atomically convert legacy v1 plaintext records in feedback.jsonl(.1) to zero-plaintext v2 and exit",
+    )
     args = ap.parse_args()
 
+    if not (0.0 < args.top1_sample_rate <= 1.0):
+        print("Error: --top1-sample-rate must be in (0, 1].", file=sys.stderr)
+        sys.exit(2)
+
     log_path = pathlib.Path(args.log)
+    if args.scrub_legacy_inplace:
+        if not log_path.is_file() and not pathlib.Path(str(log_path) + ".1").is_file():
+            print(f"No feedback log found at {log_path}.")
+            return
+        converted, kept = scrub_legacy_log_files(log_path, include_rotated=not args.no_rotated)
+        print(f"Scrubbed {log_path}: converted {converted} legacy v1 record(s) to zero-plaintext v2 (kept {kept} v2).")
+        return
+
     X_list, y_list, weights, summary = load_samples(
-        log_path, args.top1_sample_rate, include_rotated=not args.no_rotated
+        log_path,
+        args.top1_sample_rate,
+        include_rotated=not args.no_rotated,
+        schema_filter=args.schema.strip() or None,
+        model_filter=args.model.strip() or None,
     )
+    if summary["files_found"] == 0:
+        print(f"No feedback log file found at {log_path} (enable rime_neural/log_feedback: true first).")
+        print("Current prior fusion_weights:", [round(float(x), 3) for x in W_PRIOR])
+        return
+
     n = len(X_list)
-    n_accepts = sum(1 for X, y in zip(X_list, y_list) if int(np.argmax(X @ W_PRIOR)) == y)
-    n_corrections = n - n_accepts
+    n_prior_hits = sum(1 for X, y in zip(X_list, y_list) if int(np.argmax(X @ W_PRIOR)) == y)
+    n_prior_misses = n - n_prior_hits
     n_eff = kish_effective_n(weights)
 
     print(
         f"Loaded {n}/{summary['total_lines']} matched records from {log_path} "
-        f"(corrections={n_corrections}, accepts={n_accepts}, Kish N_eff={n_eff:.1f})"
+        f"(prior_misses={n_prior_misses}, prior_hits={n_prior_hits}, Kish N_eff={n_eff:.1f})"
     )
     print(
         f"Rerank breakdown: disagreements={summary['disagreed']} "
         f"(neural_win={summary['neural_win']}, rime_revert={summary['rime_revert']}), "
         f"p2c_accepted={summary['p2c_accepted']}"
     )
+    if summary["legacy_v1"] > 0:
+        print(
+            f"Note: {summary['legacy_v1']} legacy v1 record(s) contain plaintext fields; "
+            "run with --scrub-legacy-inplace to convert them to zero-plaintext v2."
+        )
+    if len(summary["schemas"]) > 1 and not args.schema:
+        print(f"Note: multiple schemas pooled ({dict(summary['schemas'])}); pass --schema <id> to tune one.")
+    if len(summary["models"]) > 1 and not args.model:
+        print(f"Note: multiple models pooled ({dict(summary['models'])}); pass --model <file> to isolate one.")
+
+    min_req = max(5, args.min_samples)
+    tot_w = float(np.sum(weights))
     if (
-        n < max(5, args.min_samples)
-        or float(np.sum(weights)) <= 0.0
-        or n_corrections < args.min_corrections
-        or n_accepts < args.min_accepts
+        n < min_req
+        or n_eff < min_req
+        or not math.isfinite(tot_w)
+        or tot_w <= 0.0
+        or n_prior_misses < args.min_corrections
+        or n_prior_hits < args.min_accepts
     ):
         print(
-            f"Safety guard: need >= {max(5, args.min_samples)} total, >= {args.min_corrections} corrections, "
-            f">= {args.min_accepts} Top-1 accepts to prevent overfitting (keeping prior weights)."
+            f"Safety guard: need >= {min_req} total & Kish N_eff, >= {args.min_corrections} prior misses, "
+            f">= {args.min_accepts} prior hits to prevent overfitting (keeping prior weights)."
         )
         print("Current prior fusion_weights:", [round(float(x), 3) for x in W_PRIOR])
         return
 
-    tot_w = float(np.sum(weights))
     prior_nll_vec = eval_nll_vec(X_list, y_list, W_PRIOR)
     prior_nll = float(np.sum(weights * prior_nll_vec) / tot_w)
     prior_acc = eval_weighted_acc(X_list, y_list, weights, W_PRIOR)
@@ -464,7 +693,20 @@ def main() -> None:
         return
 
     w_new = fit_newton_offset_ridge(X_list, y_list, weights, best_lam)
+    sane, reason = weights_pass_domain_sanity(w_new)
+    if not sane:
+        print(
+            f"Safety guard: fitted weights failed domain sanity check ({reason}); "
+            "keeping prior weights (check for selection-biased feedback logs)."
+        )
+        return
+
     w_fmt = [round(float(x), 3) for x in w_new]
+    prior_fmt = [round(float(x), 3) for x in W_PRIOR]
+    if w_fmt == prior_fmt:
+        print("Fitted weights match W_PRIOR after rounding; no update needed.")
+        return
+
     print(f"Statistically significant improvement verified (z={z_score:.2f} >= 1.645)!")
     print("Paste into rime_neural/fusion_weights in your schema custom yaml:")
     print(f"  fusion_weights: {w_fmt}")
