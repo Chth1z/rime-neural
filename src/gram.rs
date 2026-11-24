@@ -311,6 +311,7 @@ fn score_slice_per_char(
 }
 
 impl WanxiangGram {
+    #[cfg(test)]
     pub fn open(
         path: &Path,
         collocation_penalty: f64,
@@ -417,6 +418,7 @@ impl WanxiangGram {
         }
     }
 
+    #[cfg(test)]
     pub fn update_penalties(&mut self, collocation_penalty: f64, non_collocation_penalty: f64) {
         if collocation_penalty.is_finite() {
             self.collocation_penalty = collocation_penalty;
@@ -447,7 +449,6 @@ impl WanxiangGram {
 
     /// Score a sentence with explicit per-schema penalties and max collocation length
     /// without mutating the shared read-only memory mapping.
-    #[allow(dead_code)]
     pub fn score_sentence_per_char_with(
         &self,
         text: &str,

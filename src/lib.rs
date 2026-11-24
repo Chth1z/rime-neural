@@ -9,7 +9,7 @@ use std::ffi::c_int;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 
-use engine::{FusionWeights, InitConfig, P2cConfig};
+use engine::{FusionWeights, GramRequest, InitConfig, P2cConfig};
 use lua_api::{
     LUA_TBOOLEAN, LUA_TSTRING, LUA_TTABLE, LuaApi, LuaInteger, LuaState, check_lua54_abi, get_api,
     pop, push_str, rawset_field, read_str,
@@ -220,6 +220,7 @@ unsafe fn read_init_config(api: &LuaApi, l: LuaState) -> Result<InitConfig, Stri
             gram_path,
             gram_collocation_penalty,
             gram_non_collocation_penalty,
+            gram_max_length: gram::DEFAULT_COLLOCATION_MAX_LENGTH,
             model_file,
             threads,
         })
@@ -446,7 +447,15 @@ unsafe extern "C" fn lua_rerank(l: LuaState) -> c_int {
                 )
             };
 
-            engine::rerank(&ctx, &raw_input, layout, &cands, weights, p2c_cfg)
+            engine::rerank(
+                &ctx,
+                &raw_input,
+                layout,
+                &cands,
+                weights,
+                p2c_cfg,
+                &GramRequest::Default,
+            )
         },
     ));
 

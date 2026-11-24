@@ -15,7 +15,7 @@ use tokenizers::Tokenizer;
 use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 use tokenizers::pre_tokenizers::metaspace::PrependScheme;
 
-use crate::gram::WanxiangGram;
+use crate::gram::{WanxiangGram, sanitize_max_length, sanitize_penalties};
 use crate::pinyin::{PinyinLayout, input_to_units};
 
 const CONTEXT_CHARS: usize = 128;
@@ -130,8 +130,44 @@ pub struct InitConfig {
     pub gram_path: Option<PathBuf>,
     pub gram_collocation_penalty: f64,
     pub gram_non_collocation_penalty: f64,
+    pub gram_max_length: usize,
     pub model_file: Option<String>,
     pub threads: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum GramRequest {
+    /// Use the default `.gram` configured at engine initialization.
+    Default,
+    /// Explicitly disable `.gram` scoring for this schema.
+    #[allow(dead_code)]
+    Disabled,
+    /// Evaluate with an explicit `.gram` path and per-schema penalties / collocation window.
+    #[allow(dead_code)]
+    Custom {
+        path: PathBuf,
+        collocation_penalty: u64,
+        non_collocation_penalty: u64,
+        max_length: usize,
+    },
+}
+
+impl GramRequest {
+    #[allow(dead_code)]
+    pub fn custom(
+        path: PathBuf,
+        collocation_penalty: f64,
+        non_collocation_penalty: f64,
+        max_length: usize,
+    ) -> Self {
+        let (col, non_col) = sanitize_penalties(collocation_penalty, non_collocation_penalty);
+        Self::Custom {
+            path,
+            collocation_penalty: canon_f64_bits(col),
+            non_collocation_penalty: canon_f64_bits(non_col),
+            max_length: sanitize_max_length(max_length),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -142,6 +178,10 @@ pub struct RerankResult {
     pub logits: Vec<f32>,
     pub gram_deltas: Vec<f32>,
     pub char_lps: Vec<f32>,
+    #[allow(dead_code)]
+    pub has_ctx: bool,
+    #[allow(dead_code)]
+    pub has_gram: bool,
 }
 
 #[derive(Clone)]
@@ -153,7 +193,16 @@ struct CachedEval {
     p2c_margin: f32,
     p2c_verified: Option<(f32, f32)>,
     used_fused_kv: bool,
+    has_gram: bool,
     last_used: u64,
+}
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+struct ResolvedGramKey {
+    path: Option<PathBuf>,
+    col_bits: u64,
+    non_col_bits: u64,
+    max_length: usize,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -163,13 +212,17 @@ struct CacheKey {
     layout: PinyinLayout,
     weights_bits: [u64; 5],
     p2c_verify_margin_bits: u32,
+    gram_key: ResolvedGramKey,
     cands: Vec<String>,
 }
 
 struct CharVocab {
     chars: Vec<String>,
     char_to_id: HashMap<char, usize>,
-    syl_to_cids: HashMap<String, Vec<usize>>,
+    /// Simplified character IDs (`cid < old_chars`) allowed per syllable for P2C synthesis.
+    syl_to_p2c_cids: HashMap<String, Vec<usize>>,
+    /// All character IDs (`cid < chars.len()`, including extended/Traditional chars) per syllable.
+    syl_to_all_cids: HashMap<String, Vec<usize>>,
     old_chars: usize,
     max_slots: usize,
 }
@@ -177,12 +230,14 @@ struct CharVocab {
 impl CharVocab {
     /// Decode candidate character log-probabilities and greedy P2C synthesis directly from ORT's
     /// borrowed `char_logits` slice without copying the full `[n_slots, vocab_chars]` tensor.
+    #[allow(clippy::too_many_arguments)]
     fn decode_char_logits(
         &self,
         c_slice: &[f32],
         shape: (usize, usize),
         units: &[(&'static str, String)],
         cands: &[String],
+        readings: &HashMap<String, Vec<String>>,
         orig_units_len: usize,
         shifted_lcp: bool,
     ) -> (Vec<f32>, Option<String>, f32) {
@@ -214,10 +269,13 @@ impl CharVocab {
                 all_full = false;
             }
             let row = &c_slice[j * vocab_chars..(j + 1) * vocab_chars];
-            if let Some(allowed) = self.syl_to_cids.get(syl) {
+            if let Some(p2c_allowed) = self.syl_to_p2c_cids.get(syl) {
                 let mut max_v = f32::NEG_INFINITY;
-                let mut best_cid = allowed[0];
-                for &cid in allowed {
+                let mut best_cid = p2c_allowed[0];
+                for &cid in p2c_allowed {
+                    if cid >= vocab_chars {
+                        continue;
+                    }
                     let v = row[cid];
                     if v.is_finite() && v > max_v {
                         max_v = v;
@@ -230,10 +288,14 @@ impl CharVocab {
                     slot_allowed.push(None);
                     continue;
                 }
-                let sum_e: f32 = allowed
+                let sum_e: f32 = p2c_allowed
                     .iter()
                     .map(|&cid| {
-                        let v = row[cid];
+                        let v = if cid < vocab_chars {
+                            row[cid]
+                        } else {
+                            f32::NAN
+                        };
                         if v.is_finite() {
                             (v - max_v).exp()
                         } else {
@@ -247,7 +309,12 @@ impl CharVocab {
                     gen_chars.push(ch);
                 }
                 slot_lse.push(lse);
-                slot_allowed.push(Some(allowed.as_slice()));
+                slot_allowed.push(
+                    self.syl_to_all_cids
+                        .get(syl)
+                        .map(Vec::as_slice)
+                        .or(Some(p2c_allowed.as_slice())),
+                );
             } else {
                 all_full = false;
                 slot_lse.push(0.0);
@@ -260,6 +327,32 @@ impl CharVocab {
         // a wrong-length P2C candidate or skewed missing-slot penalties.
         let all_same_len = !cands.is_empty() && cands.iter().all(|c| c.chars().count() == n_slots);
         if all_full && all_same_len && gen_chars.len() == n_slots {
+            // Detect equal-length alternate-segmentation / fuzzy-pinyin candidates (e.g. `fangan`:
+            // `他很方案` vs `他很反感`, `dangan`: `档案` vs `单干`): if any candidate contains a known
+            // Hanzi whose pronunciation does not match `cands[0]`'s aligned syllable at slot `j`,
+            // suppress `char_lps` & P2C so valid alternate splits are not penalized by `-15.0`/slot.
+            let mut has_alt_pronunciation = false;
+            let mut ch_buf = [0u8; 4];
+            'alt_check: for c in cands {
+                for (j, ch) in c.chars().enumerate() {
+                    let matched_in_slot = self.char_to_id.get(&ch).is_some_and(|&cid| {
+                        slot_allowed[j].is_some_and(|al| al.binary_search(&cid).is_ok())
+                    });
+                    if !matched_in_slot {
+                        let key = ch.encode_utf8(&mut ch_buf);
+                        if let Some(rlist) = readings.get(key)
+                            && !rlist.iter().any(|r| r == &units[j].1)
+                        {
+                            has_alt_pronunciation = true;
+                            break 'alt_check;
+                        }
+                    }
+                }
+            }
+            if has_alt_pronunciation {
+                return (char_lps, p2c_text, p2c_margin);
+            }
+
             let mut raw_clp = Vec::with_capacity(cands.len());
             for c in cands {
                 let mut s = 0.0f32;
@@ -269,10 +362,13 @@ impl CharVocab {
                         .char_to_id
                         .get(&ch)
                         .and_then(|&cid| {
+                            if cid >= vocab_chars {
+                                return None;
+                            }
                             let allowed = slot_allowed[j]?;
                             allowed.binary_search(&cid).ok().and_then(|_| {
                                 let v = row[cid];
-                                v.is_finite().then_some(v - slot_lse[j])
+                                v.is_finite().then_some((v - slot_lse[j]).min(0.0))
                             })
                         })
                         .unwrap_or(-15.0);
@@ -305,6 +401,8 @@ struct ScratchBufs {
     uids: Vec<i64>,
     slots: Vec<i64>,
     markers: Vec<i64>,
+    att: Vec<i64>,
+    mm: Vec<bool>,
     cand_str: String,
 }
 
@@ -315,6 +413,8 @@ impl ScratchBufs {
             uids: Vec::with_capacity(256),
             slots: Vec::with_capacity(max_slots.max(4)),
             markers: Vec::with_capacity(16),
+            att: Vec::with_capacity(256),
+            mm: Vec::with_capacity(16),
             cand_str: String::with_capacity(64),
         }
     }
@@ -363,6 +463,7 @@ pub struct NeuralEngine {
     tokenizer: Tokenizer,
     tokenizer_no_prepend: Option<Tokenizer>,
     special_tokens: Vec<String>,
+    special_first_bytes: [bool; 256],
     forbidden_special_ids: HashSet<i64>,
     choice_compact: bool,
     full_unit_ids: HashMap<String, i64>,
@@ -377,8 +478,12 @@ pub struct NeuralEngine {
     sep_id: i64,
     mask_id: i64,
     unk_id: i64,
-    gram: Option<WanxiangGram>,
-    gram_penalties: (f64, f64),
+    gram_cache: HashMap<PathBuf, WanxiangGram>,
+    default_gram_path: Option<PathBuf>,
+    default_gram_penalties: (f64, f64),
+    default_gram_max_len: usize,
+    last_ctx_str: String,
+    last_ctx_ids: Vec<i64>,
     kv_cache: VecDeque<(Vec<i64>, ContextKv)>,
     lru_map: HashMap<CacheKey, CachedEval>,
     lru_clock: u64,
@@ -454,44 +559,104 @@ fn resolve_model_path(model_dir: &Path, override_name: Option<&str>) -> Result<P
     ))
 }
 
+/// Recursively set `PrependScheme::Never` on any `Metaspace` pre-tokenizer (including inside
+/// `PreTokenizerWrapper::Sequence`). Returns `true` if at least one `Metaspace` was updated.
+fn disable_metaspace_prepend(pt: &mut PreTokenizerWrapper) -> bool {
+    match pt {
+        PreTokenizerWrapper::Metaspace(ms) => {
+            ms.prepend_scheme = PrependScheme::Never;
+            true
+        }
+        PreTokenizerWrapper::Sequence(seq) => {
+            let mut updated = false;
+            for child in seq.as_mut() {
+                if disable_metaspace_prepend(child) {
+                    updated = true;
+                }
+            }
+            updated
+        }
+        _ => false,
+    }
+}
+
+fn disable_metaspace_prepend_json(val: &mut serde_json::Value) -> bool {
+    let Some(obj) = val.as_object_mut() else {
+        return false;
+    };
+    if obj.get("type").and_then(|v| v.as_str()) == Some("Metaspace") {
+        obj.insert(
+            "prepend_scheme".to_string(),
+            serde_json::Value::String("never".to_string()),
+        );
+        return true;
+    }
+    if let Some(arr) = obj.get_mut("pretokenizers").and_then(|v| v.as_array_mut()) {
+        let mut updated = false;
+        for child in arr {
+            if disable_metaspace_prepend_json(child) {
+                updated = true;
+            }
+        }
+        return updated;
+    }
+    false
+}
+
 /// Build the no-prepend candidate tokenizer for `choice_compact` models by cloning the loaded
-/// tokenizer and updating `Metaspace.prepend_scheme` in memory (avoids re-parsing 32 MB JSON).
+/// tokenizer and updating `Metaspace.prepend_scheme` in memory (handles both standalone
+/// `Metaspace` and composite `Sequence` pre-tokenizers without re-parsing 32 MB JSON).
 fn build_no_prepend_tokenizer(base: &Tokenizer, tok_path: &Path) -> Result<Tokenizer, String> {
-    if let Some(PreTokenizerWrapper::Metaspace(mut ms)) = base.get_pre_tokenizer().cloned() {
-        ms.prepend_scheme = PrependScheme::Never;
+    if let Some(mut pt) = base.get_pre_tokenizer().cloned()
+        && disable_metaspace_prepend(&mut pt)
+    {
         let mut cloned = base.clone();
-        cloned.with_pre_tokenizer(Some(ms));
+        cloned.with_pre_tokenizer(Some(pt));
         return Ok(cloned);
     }
-    // Fallback for non-Metaspace pre-tokenizer layouts
+    // Fallback for non-Metaspace JSON layouts
     let raw = std::fs::read_to_string(tok_path)
         .map_err(|e| format!("read {}: {}", tok_path.display(), e))?;
     let mut val: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse tokenizer.json: {}", e))?;
-    if let Some(pt) = val.get_mut("pre_tokenizer").and_then(|v| v.as_object_mut()) {
-        pt.insert(
-            "prepend_scheme".to_string(),
-            serde_json::Value::String("never".to_string()),
-        );
+    if let Some(pt) = val.get_mut("pre_tokenizer") {
+        let _ = disable_metaspace_prepend_json(pt);
     }
     let bytes = serde_json::to_vec(&val).map_err(|e| format!("serialize tokenizer.json: {}", e))?;
     Tokenizer::from_bytes(&bytes).map_err(|e| format!("build no-prepend tokenizer: {}", e))
 }
 
-/// Extract all special/control added tokens from the tokenizer so untrusted UIA context and
-/// candidate strings cannot inject raw control token IDs (`<pad>`, `<bos>`, `<eos>`, `<mask>`,
-/// `<start_of_turn>`, `<end_of_turn>`, `[@BOS@]`, etc.) into model `input_ids`.
-fn collect_special_tokens(tokenizer: &Tokenizer) -> (Vec<String>, HashSet<i64>) {
+fn build_first_byte_table(special_tokens: &[String]) -> [bool; 256] {
+    let mut tbl = [false; 256];
+    for tok in special_tokens {
+        if let Some(&b) = tok.as_bytes().first() {
+            tbl[b as usize] = true;
+        }
+    }
+    tbl
+}
+
+/// Extract control/special added tokens from the tokenizer so untrusted UIA context and candidate
+/// strings cannot inject raw control token IDs (`<pad>`, `<bos>`, `<eos>`, `<mask>`,
+/// `<start_of_turn>`, `<end_of_turn>`, `<unused*>`, `[@BOS@]`, `[CLS]`, etc.) while preserving
+/// legitimate non-special vocabulary tokens (such as Gemma's HTML `<code>`/`<b>`/`<table>` tokens)
+/// and `<unk>` OOV fallback IDs.
+fn collect_special_tokens(tokenizer: &Tokenizer) -> (Vec<String>, [bool; 256], HashSet<i64>) {
     let mut strs: Vec<String> = Vec::new();
     let mut seen_str: HashSet<String> = HashSet::new();
     let mut ids: HashSet<i64> = HashSet::new();
+    let unk_id = tokenizer.token_to_id("<unk>").map(|id| id as i64);
 
     for (id, added) in tokenizer.get_added_tokens_decoder() {
+        let content = added.content.as_str();
         let is_control_like = added.special
-            || (added.content.starts_with('<') && added.content.ends_with('>'))
-            || added.content == "[@BOS@]";
-        if is_control_like && !added.content.is_empty() {
-            ids.insert(id as i64);
+            || content == "[@BOS@]"
+            || content.starts_with("<unused")
+            || content == "<2mass>";
+        if is_control_like && !content.is_empty() {
+            if Some(id as i64) != unk_id && content != "<unk>" {
+                ids.insert(id as i64);
+            }
             if seen_str.insert(added.content.clone()) {
                 strs.push(added.content);
             }
@@ -502,7 +667,6 @@ fn collect_special_tokens(tokenizer: &Tokenizer) -> (Vec<String>, HashSet<i64>) 
         "<eos>",
         "<mask>",
         "<pad>",
-        "<unk>",
         "<start_of_turn>",
         "<end_of_turn>",
         "[@BOS@]",
@@ -516,7 +680,8 @@ fn collect_special_tokens(tokenizer: &Tokenizer) -> (Vec<String>, HashSet<i64>) 
     }
     // Longest tokens first so `<start_of_turn>` is stripped cleanly before any shorter substring
     strs.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-    (strs, ids)
+    let triggers = build_first_byte_table(&strs);
+    (strs, triggers, ids)
 }
 
 fn introspect_kv_dims(session: &Session) -> (bool, usize, usize, usize, usize) {
@@ -571,6 +736,8 @@ fn introspect_kv_dims(session: &Session) -> (bool, usize, usize, usize, usize) {
     )
 }
 
+/// Attach or preload a `.gram` mapping off-lock so the calling UI thread and active `rerank()`
+/// keystrokes are never blocked on disk/mmap I/O.
 fn maybe_attach_gram(cfg: &InitConfig) {
     let Some(ref gpath) = cfg.gram_path else {
         return;
@@ -578,38 +745,52 @@ fn maybe_attach_gram(cfg: &InitConfig) {
     let Some(mutex) = ENGINE.get() else {
         return;
     };
-    let Ok(mut eng) = mutex.lock() else {
-        return;
-    };
-    if eng.gram.is_some() {
-        let new_p = (
-            cfg.gram_collocation_penalty,
-            cfg.gram_non_collocation_penalty,
-        );
-        if canon_f64_bits(new_p.0) != canon_f64_bits(eng.gram_penalties.0)
-            || canon_f64_bits(new_p.1) != canon_f64_bits(eng.gram_penalties.1)
-        {
-            if let Some(ref mut g) = eng.gram {
-                g.update_penalties(new_p.0, new_p.1);
+    let new_p = sanitize_penalties(
+        cfg.gram_collocation_penalty,
+        cfg.gram_non_collocation_penalty,
+    );
+    let new_max = sanitize_max_length(cfg.gram_max_length);
+
+    // Phase 1: check briefly under lock whether this path is already mapped.
+    let already_cached = {
+        let Ok(mut eng) = mutex.lock() else {
+            return;
+        };
+        if eng.gram_cache.contains_key(gpath) {
+            let changed = eng.default_gram_path.as_ref() != Some(gpath)
+                || canon_f64_bits(eng.default_gram_penalties.0) != canon_f64_bits(new_p.0)
+                || canon_f64_bits(eng.default_gram_penalties.1) != canon_f64_bits(new_p.1)
+                || eng.default_gram_max_len != new_max;
+            eng.default_gram_path = Some(gpath.clone());
+            eng.default_gram_penalties = new_p;
+            eng.default_gram_max_len = new_max;
+            eng.stats.has_gram = true;
+            if changed {
+                eng.lru_map.clear();
             }
-            eng.gram_penalties = new_p;
-            eng.lru_map.clear();
+            true
+        } else {
+            false
         }
+    };
+    if already_cached {
         return;
     }
+
+    // Phase 2: perform blocking filesystem + Win32 mmap I/O strictly outside `ENGINE` lock.
     if !gpath.is_file() {
         return;
     }
-    if let Ok(g) = WanxiangGram::open(
-        gpath,
-        cfg.gram_collocation_penalty,
-        cfg.gram_non_collocation_penalty,
-    ) {
-        eng.gram = Some(g);
-        eng.gram_penalties = (
-            cfg.gram_collocation_penalty,
-            cfg.gram_non_collocation_penalty,
-        );
+    let Ok(g) = WanxiangGram::open_with_max_len(gpath, new_p.0, new_p.1, new_max) else {
+        return;
+    };
+
+    // Phase 3: insert into cache under a brief lock.
+    if let Ok(mut eng) = mutex.lock() {
+        eng.gram_cache.entry(gpath.clone()).or_insert(g);
+        eng.default_gram_path = Some(gpath.clone());
+        eng.default_gram_penalties = new_p;
+        eng.default_gram_max_len = new_max;
         eng.stats.has_gram = true;
         eng.lru_map.clear();
     }
@@ -675,42 +856,49 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
         .unwrap_or(uv.chars.len())
         .min(uv.chars.len());
 
-    // Build merged full-pinyin reading table: start with `uv.readings` and overlay `uv.ml.pinyin`
-    // (adds +2,737 Traditional/variant/extended Hanzi for full-pinyin alignment while `old_chars`
-    // strictly caps `syl_to_cids` for Simplified P2C generation).
+    // Union `uv.readings` and `uv.ml.pinyin` (preserving order and deduplicating per char) so
+    // delta `ml.pinyin` tables never erase base `uv.readings` entries, while `old_chars` strictly
+    // caps `syl_to_p2c_cids` for Simplified P2C generation.
     let mut merged_readings = uv.readings;
     if let Some(ref ml) = uv.ml {
         for (ch, rlist) in &ml.pinyin {
-            merged_readings.insert(ch.clone(), rlist.clone());
-        }
-    }
-
-    let pinyin_src = uv
-        .ml
-        .as_ref()
-        .filter(|m| !m.pinyin.is_empty())
-        .map(|m| &m.pinyin)
-        .unwrap_or(&merged_readings);
-
-    let mut syl_to_cids: HashMap<String, Vec<usize>> = HashMap::with_capacity(450);
-    for (ch_str, rlist) in pinyin_src {
-        if let Some(ch) = ch_str.chars().next()
-            && let Some(&cid) = char_to_id.get(&ch)
-            && cid < old_chars
-        {
-            for syl in rlist {
-                syl_to_cids.entry(syl.clone()).or_default().push(cid);
+            let entry = merged_readings.entry(ch.clone()).or_default();
+            for r in rlist {
+                if !entry.iter().any(|existing| existing == r) {
+                    entry.push(r.clone());
+                }
             }
         }
     }
-    for cids in syl_to_cids.values_mut() {
+
+    let mut syl_to_p2c_cids: HashMap<String, Vec<usize>> = HashMap::with_capacity(450);
+    let mut syl_to_all_cids: HashMap<String, Vec<usize>> = HashMap::with_capacity(450);
+    for (ch_str, rlist) in &merged_readings {
+        if let Some(ch) = ch_str.chars().next()
+            && ch_str.chars().count() == 1
+            && let Some(&cid) = char_to_id.get(&ch)
+        {
+            for syl in rlist {
+                syl_to_all_cids.entry(syl.clone()).or_default().push(cid);
+                if cid < old_chars {
+                    syl_to_p2c_cids.entry(syl.clone()).or_default().push(cid);
+                }
+            }
+        }
+    }
+    for cids in syl_to_p2c_cids.values_mut() {
+        cids.sort_unstable();
+        cids.dedup();
+    }
+    for cids in syl_to_all_cids.values_mut() {
         cids.sort_unstable();
         cids.dedup();
     }
 
     let tokenizer = Tokenizer::from_file(&tok_path)
         .map_err(|e| format!("load {}: {}", tok_path.display(), e))?;
-    let (special_tokens, forbidden_special_ids) = collect_special_tokens(&tokenizer);
+    let (special_tokens, special_first_bytes, forbidden_special_ids) =
+        collect_special_tokens(&tokenizer);
     let tokenizer_no_prepend = if uv.choice_compact {
         Some(build_no_prepend_tokenizer(&tokenizer, &tok_path)?)
     } else {
@@ -746,11 +934,15 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
 
     let (use_fused_kv, enc_layers, choice_layers, num_heads, head_dim) =
         introspect_kv_dims(&session);
-    let has_char_logits = session.outputs().iter().any(|o| o.name() == "char_logits");
-    let has_named_present = session
-        .outputs()
-        .iter()
-        .any(|o| o.name() == "present_enc_k");
+    let output_names: HashSet<&str> = session.outputs().iter().map(|o| o.name()).collect();
+    if !output_names.contains("logits") {
+        return Err(format!(
+            "ONNX model {} is missing required output 'logits'",
+            model_name
+        ));
+    }
+    let has_char_logits = output_names.contains("char_logits");
+    let has_named_present = output_names.contains("present_enc_k");
     let present_names = if has_named_present {
         [
             "present_enc_k",
@@ -761,6 +953,16 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
     } else {
         ["present_0", "present_1", "present_2", "present_3"]
     };
+    if use_fused_kv {
+        for req in present_names {
+            if !output_names.contains(req) {
+                return Err(format!(
+                    "fused KV ONNX model {} is missing required output '{}'",
+                    model_name, req
+                ));
+            }
+        }
+    }
 
     // Pre-build selective RunOptions so ORT skips unused heads & 3 MB/keystroke KV-output copies
     let (ctx_run_opts, key_run_opts, pass2_run_opts) = if use_fused_kv {
@@ -791,23 +993,30 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
         (None, None, None)
     };
 
-    let gram = cfg.gram_path.as_deref().and_then(|gp| {
-        if gp.is_file() {
-            WanxiangGram::open(
-                gp,
-                cfg.gram_collocation_penalty,
-                cfg.gram_non_collocation_penalty,
-            )
-            .ok()
-        } else {
-            None
-        }
-    });
-    let has_gram = gram.is_some();
+    let gram_penalties = sanitize_penalties(
+        cfg.gram_collocation_penalty,
+        cfg.gram_non_collocation_penalty,
+    );
+    let gram_max_len = sanitize_max_length(cfg.gram_max_length);
+    let mut gram_cache = HashMap::new();
+    let mut default_gram_path = None;
+    if let Some(gp) = cfg.gram_path.as_deref()
+        && gp.is_file()
+        && let Ok(g) =
+            WanxiangGram::open_with_max_len(gp, gram_penalties.0, gram_penalties.1, gram_max_len)
+    {
+        gram_cache.insert(gp.to_path_buf(), g);
+        default_gram_path = Some(gp.to_path_buf());
+    }
+    let has_gram = default_gram_path.is_some();
+
+    let max_slots = uv.max_slots.max(1);
+    let context_tokens = uv.choice_context_tokens;
+    let candidate_tokens = uv.choice_candidate_tokens.max(1);
 
     let z_enc = vec![0.0f32; enc_layers * num_heads * head_dim];
     let z_ch = vec![0.0f32; choice_layers * num_heads * head_dim];
-    let true_mask = vec![true; uv.choice_context_tokens + 2];
+    let true_mask = vec![true; context_tokens + 2];
 
     let mut engine = NeuralEngine {
         model_dir: cfg.model_dir.clone(),
@@ -822,13 +1031,14 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
         z_enc,
         z_ch,
         true_mask,
-        scratch: ScratchBufs::new(uv.max_slots),
+        scratch: ScratchBufs::new(max_slots),
         ctx_run_opts,
         key_run_opts,
         pass2_run_opts,
         tokenizer,
         tokenizer_no_prepend,
         special_tokens,
+        special_first_bytes,
         forbidden_special_ids,
         choice_compact: uv.choice_compact,
         full_unit_ids,
@@ -836,24 +1046,26 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
         char_vocab: CharVocab {
             chars: uv.chars,
             char_to_id,
-            syl_to_cids,
+            syl_to_p2c_cids,
+            syl_to_all_cids,
             old_chars,
-            max_slots: uv.max_slots,
+            max_slots,
         },
         readings: merged_readings,
         valid_syllables,
-        max_slots: uv.max_slots,
-        context_tokens: uv.choice_context_tokens,
-        candidate_tokens: uv.choice_candidate_tokens,
+        max_slots,
+        context_tokens,
+        candidate_tokens,
         cls_id,
         sep_id,
         mask_id,
         unk_id,
-        gram,
-        gram_penalties: (
-            cfg.gram_collocation_penalty,
-            cfg.gram_non_collocation_penalty,
-        ),
+        gram_cache,
+        default_gram_path,
+        default_gram_penalties: gram_penalties,
+        default_gram_max_len: gram_max_len,
+        last_ctx_str: String::new(),
+        last_ctx_ids: Vec::new(),
         kv_cache: VecDeque::with_capacity(KV_CACHE_CAPACITY + 2),
         lru_map: HashMap::with_capacity(LRU_CAPACITY + 16),
         lru_clock: 0,
@@ -880,6 +1092,7 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
         &warmup_cands,
         FusionWeights::default(),
         0.0,
+        &GramRequest::Default,
     );
     engine.lru_map.clear();
     engine.lru_clock = 0;
@@ -900,12 +1113,14 @@ struct AsyncInitGuard {
 impl Drop for AsyncInitGuard {
     fn drop(&mut self) {
         if !self.succeeded {
-            ASYNC_STARTED.store(false, Ordering::Release);
+            // Finalize fallback error BEFORE releasing `ASYNC_STARTED` so a retrying thread's
+            // `set_last_init_error(None)` cannot race with this cleanup.
             if last_init_error().is_none() {
                 set_last_init_error(Some(
                     "background init thread exited unexpectedly".to_string(),
                 ));
             }
+            ASYNC_STARTED.store(false, Ordering::Release);
         }
     }
 }
@@ -959,6 +1174,9 @@ pub fn active_feedback_meta() -> (String, bool) {
 }
 
 fn utf8_tail(s: &str, max_chars: usize) -> &str {
+    if max_chars == 0 {
+        return "";
+    }
     let total = s.chars().count();
     if total <= max_chars {
         return s;
@@ -966,7 +1184,7 @@ fn utf8_tail(s: &str, max_chars: usize) -> &str {
     let skip = total - max_chars;
     match s.char_indices().nth(skip) {
         Some((byte_idx, _)) => &s[byte_idx..],
-        None => s,
+        None => "",
     }
 }
 
@@ -1042,9 +1260,12 @@ fn rank_order_from_features(
     scored.into_iter().map(|(idx, _)| idx).collect()
 }
 
-fn sanitize_special_tokens<'a>(text: &'a str, special_tokens: &[String]) -> Cow<'a, str> {
-    // Fast path: skip scanning all special tokens when neither `<` nor `[@BOS@]` appears
-    if !text.contains('<') && !text.contains("[@BOS@]") {
+fn sanitize_special_tokens<'a>(
+    text: &'a str,
+    special_tokens: &[String],
+    first_bytes: &[bool; 256],
+) -> Cow<'a, str> {
+    if special_tokens.is_empty() || !text.bytes().any(|b| first_bytes[b as usize]) {
         return Cow::Borrowed(text);
     }
     let mut owned: Option<String> = None;
@@ -1071,7 +1292,8 @@ impl NeuralEngine {
     }
 
     fn encode_with_tok(&self, tok: &Tokenizer, text: &str) -> Vec<i64> {
-        let cleaned = sanitize_special_tokens(text, &self.special_tokens);
+        let cleaned =
+            sanitize_special_tokens(text, &self.special_tokens, &self.special_first_bytes);
         match tok.encode_fast(cleaned.as_ref(), false) {
             Ok(enc) => enc
                 .get_ids()
@@ -1102,7 +1324,11 @@ impl NeuralEngine {
             self.scratch.cand_str.clear();
             self.scratch.cand_str.push(' ');
             self.scratch.cand_str.push_str(text);
-            let cleaned = sanitize_special_tokens(&self.scratch.cand_str, &self.special_tokens);
+            let cleaned = sanitize_special_tokens(
+                &self.scratch.cand_str,
+                &self.special_tokens,
+                &self.special_first_bytes,
+            );
             match self.tokenizer.encode_fast(cleaned.as_ref(), false) {
                 Ok(enc) => enc
                     .get_ids()
@@ -1124,6 +1350,18 @@ impl NeuralEngine {
             ids.extend_from_slice(&cids[start..]);
         }
         ids.push(self.sep_id);
+        ids
+    }
+
+    fn build_context_token_ids_cached(&mut self, ctx_final: &str) -> Vec<i64> {
+        if !self.last_ctx_ids.is_empty() && self.last_ctx_str == ctx_final {
+            return self.last_ctx_ids.clone();
+        }
+        let ids = self.build_context_token_ids(ctx_final);
+        self.last_ctx_str.clear();
+        self.last_ctx_str.push_str(ctx_final);
+        self.last_ctx_ids.clear();
+        self.last_ctx_ids.extend_from_slice(&ids);
         ids
     }
 
@@ -1189,16 +1427,24 @@ impl NeuralEngine {
         };
         self.stats.total_infer_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
-        let (_, ek) = outputs[self.present_names[0]]
+        let (_, ek) = outputs
+            .get(self.present_names[0])
+            .ok_or_else(|| format!("missing ONNX output: {}", self.present_names[0]))?
             .try_extract_tensor::<f32>()
             .map_err(|e| format!("out ek: {}", e))?;
-        let (_, ev) = outputs[self.present_names[1]]
+        let (_, ev) = outputs
+            .get(self.present_names[1])
+            .ok_or_else(|| format!("missing ONNX output: {}", self.present_names[1]))?
             .try_extract_tensor::<f32>()
             .map_err(|e| format!("out ev: {}", e))?;
-        let (_, ck) = outputs[self.present_names[2]]
+        let (_, ck) = outputs
+            .get(self.present_names[2])
+            .ok_or_else(|| format!("missing ONNX output: {}", self.present_names[2]))?
             .try_extract_tensor::<f32>()
             .map_err(|e| format!("out ck: {}", e))?;
-        let (_, cv) = outputs[self.present_names[3]]
+        let (_, cv) = outputs
+            .get(self.present_names[3])
+            .ok_or_else(|| format!("missing ONNX output: {}", self.present_names[3]))?
             .try_extract_tensor::<f32>()
             .map_err(|e| format!("out cv: {}", e))?;
 
@@ -1212,7 +1458,7 @@ impl NeuralEngine {
     }
 
     fn get_or_compute_kv_index(&mut self, ctx_final: &str) -> Result<usize, String> {
-        let ctx_ids = self.build_context_token_ids(ctx_final);
+        let ctx_ids = self.build_context_token_ids_cached(ctx_final);
         if let Some(pos) = self.kv_cache.iter().position(|(k, _)| k == &ctx_ids) {
             self.stats.kv_hits += 1;
             let last = self.kv_cache.len() - 1;
@@ -1236,6 +1482,82 @@ impl NeuralEngine {
         Ok(self.kv_cache.len() - 1)
     }
 
+    fn resolve_gram_request(
+        &self,
+        req: &GramRequest,
+    ) -> (ResolvedGramKey, Option<(f64, f64, usize)>) {
+        match req {
+            GramRequest::Disabled => (
+                ResolvedGramKey {
+                    path: None,
+                    col_bits: 0,
+                    non_col_bits: 0,
+                    max_length: 0,
+                },
+                None,
+            ),
+            GramRequest::Default => {
+                if let Some(ref p) = self.default_gram_path
+                    && self.gram_cache.contains_key(p)
+                {
+                    let (col, non_col) = self.default_gram_penalties;
+                    let max_len = self.default_gram_max_len;
+                    (
+                        ResolvedGramKey {
+                            path: Some(p.clone()),
+                            col_bits: canon_f64_bits(col),
+                            non_col_bits: canon_f64_bits(non_col),
+                            max_length: max_len,
+                        },
+                        Some((col, non_col, max_len)),
+                    )
+                } else {
+                    (
+                        ResolvedGramKey {
+                            path: None,
+                            col_bits: 0,
+                            non_col_bits: 0,
+                            max_length: 0,
+                        },
+                        None,
+                    )
+                }
+            }
+            GramRequest::Custom {
+                path,
+                collocation_penalty,
+                non_collocation_penalty,
+                max_length,
+            } => {
+                if self.gram_cache.contains_key(path) {
+                    let col = f64::from_bits(*collocation_penalty);
+                    let non_col = f64::from_bits(*non_collocation_penalty);
+                    let max_len = sanitize_max_length(*max_length);
+                    (
+                        ResolvedGramKey {
+                            path: Some(path.clone()),
+                            col_bits: *collocation_penalty,
+                            non_col_bits: *non_collocation_penalty,
+                            max_length: max_len,
+                        },
+                        Some((col, non_col, max_len)),
+                    )
+                } else {
+                    (
+                        ResolvedGramKey {
+                            path: None,
+                            col_bits: 0,
+                            non_col_bits: 0,
+                            max_length: 0,
+                        },
+                        None,
+                    )
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn evaluate(
         &mut self,
         context: &str,
@@ -1244,9 +1566,11 @@ impl NeuralEngine {
         cands: &[String],
         weights: FusionWeights,
         p2c_verify_margin: f32,
+        gram_req: &GramRequest,
     ) -> Result<CachedEval, String> {
         self.stats.calls += 1;
         let ctx_tail = utf8_tail(context, CONTEXT_CHARS);
+        let (gram_key, gram_params) = self.resolve_gram_request(gram_req);
         let key = CacheKey {
             ctx_tail: ctx_tail.to_string(),
             raw_input: raw_input.to_string(),
@@ -1259,6 +1583,7 @@ impl NeuralEngine {
                 canon_f64_bits(weights.w_ctx_lp),
             ],
             p2c_verify_margin_bits: canon_f32_bits(p2c_verify_margin),
+            gram_key: gram_key.clone(),
             cands: cands.to_vec(),
         };
         if let Some(entry) = self.lru_map.get_mut(&key) {
@@ -1302,38 +1627,52 @@ impl NeuralEngine {
         }
 
         let ctx_final = utf8_tail(&eff_ctx, CONTEXT_CHARS).to_string();
-        let (logits, char_lps, p2c_text, p2c_margin) = if self.use_fused_kv {
-            self.run_fused_kv(
-                &ctx_final,
+        let (kv_idx_opt, (logits, char_lps, p2c_text, p2c_margin)) = if self.use_fused_kv {
+            let kv_idx = self.get_or_compute_kv_index(&ctx_final)?;
+            let out = self.run_fused_kv_at(
+                kv_idx,
                 &units,
                 &cand_toks,
                 Some((cands, orig_units_len, shifted_lcp)),
-            )?
+            )?;
+            (Some(kv_idx), out)
         } else {
-            self.run_whole_graph(
+            let out = self.run_whole_graph(
                 &ctx_final,
                 &units,
                 &cand_toks,
                 cands,
                 orig_units_len,
                 shifted_lcp,
-            )?
+            )?;
+            (None, out)
         };
 
-        // Compute exact Wanxiang .gram deltas (~0.004 ms/cand) and retain `raw_g` for Pass-2 reuse
-        let (raw_g, gram_deltas): (Vec<f64>, Vec<f32>) = if let Some(ref g) = self.gram {
-            let rg: Vec<f64> = cands.iter().map(|c| g.score_sentence_per_char(c)).collect();
-            let g0 = rg.first().copied().unwrap_or(0.0);
-            let gd = rg.iter().map(|&x| (x - g0) as f32).collect();
-            (rg, gd)
-        } else {
-            (Vec::new(), vec![0.0f32; cands.len()])
-        };
+        // Compute exact `.gram` deltas (~0.004 ms/cand) using per-schema params and retain `raw_g`
+        let active_gram_ref = gram_key
+            .path
+            .as_ref()
+            .and_then(|p| self.gram_cache.get(p))
+            .zip(gram_params);
+        let has_gram = active_gram_ref.is_some();
+        let (raw_g, gram_deltas): (Vec<f64>, Vec<f32>) =
+            if let Some((g, (col, non_col, max_len))) = active_gram_ref {
+                let rg: Vec<f64> = cands
+                    .iter()
+                    .map(|c| g.score_sentence_per_char_with(c, col, non_col, max_len))
+                    .collect();
+                let g0 = rg.first().copied().unwrap_or(0.0);
+                let gd = rg.iter().map(|&x| (x - g0) as f32).collect();
+                (rg, gd)
+            } else {
+                (Vec::new(), vec![0.0f32; cands.len()])
+            };
 
         // Optional KV-cached Pass-2 Cross-Encoder + .gram verification of promising novel P2C candidates
         let mut p2c_verified: Option<(f32, f32)> = None;
-        if self.use_fused_kv
+        if let Some(kv_idx) = kv_idx_opt
             && p2c_verify_margin > 0.0
+            && p2c_margin.is_finite()
             && p2c_margin > p2c_verify_margin
             && let Some(ref p2c_str) = p2c_text
         {
@@ -1352,20 +1691,29 @@ impl NeuralEngine {
             }
             probe_toks.push(self.encode_candidate_ids(p2c_str));
 
-            if let Ok((l2, _, _, _)) = self.run_fused_kv(&ctx_final, &units, &probe_toks, None)
+            if let Ok((l2, _, _, _)) = self.run_fused_kv_at(kv_idx, &units, &probe_toks, None)
                 && let (Some(&l_best), Some(&l_p2c)) = (l2.first(), l2.last())
+                && l_best.is_finite()
+                && l_p2c.is_finite()
             {
+                let ldiff = l_p2c - l_best;
                 self.stats.p2c_pass2_calls += 1;
-                let gdiff = if let Some(ref g) = self.gram {
-                    let best_g = raw_g
-                        .get(best_idx)
-                        .copied()
-                        .unwrap_or_else(|| g.score_sentence_per_char(&cands[best_idx]));
-                    (g.score_sentence_per_char(p2c_str) - best_g) as f32
+                let gdiff = if let Some((g, (col, non_col, max_len))) = gram_key
+                    .path
+                    .as_ref()
+                    .and_then(|p| self.gram_cache.get(p))
+                    .zip(gram_params)
+                {
+                    let best_g = raw_g.get(best_idx).copied().unwrap_or_else(|| {
+                        g.score_sentence_per_char_with(&cands[best_idx], col, non_col, max_len)
+                    });
+                    (g.score_sentence_per_char_with(p2c_str, col, non_col, max_len) - best_g) as f32
                 } else {
                     0.0
                 };
-                p2c_verified = Some((l_p2c - l_best, gdiff));
+                if ldiff.is_finite() && gdiff.is_finite() {
+                    p2c_verified = Some((ldiff, gdiff));
+                }
             }
         }
 
@@ -1378,6 +1726,7 @@ impl NeuralEngine {
             p2c_margin,
             p2c_verified,
             used_fused_kv: self.use_fused_kv,
+            has_gram,
             last_used: self.lru_clock,
         };
 
@@ -1394,14 +1743,13 @@ impl NeuralEngine {
         Ok(res)
     }
 
-    fn run_fused_kv(
+    fn run_fused_kv_at(
         &mut self,
-        ctx_final: &str,
+        kv_idx: usize,
         units: &[(&'static str, String)],
         cand_toks: &[Vec<i64>],
         decode_p2c: Option<(&[String], usize, bool)>,
     ) -> Result<ForwardResult, String> {
-        let kv_idx = self.get_or_compute_kv_index(ctx_final)?;
         let want_char_logits = decode_p2c.is_some();
 
         self.scratch.ids.clear();
@@ -1513,7 +1861,9 @@ impl NeuralEngine {
         };
         self.stats.total_infer_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
-        let (_, l_slice) = outputs["logits"]
+        let (_, l_slice) = outputs
+            .get("logits")
+            .ok_or_else(|| "missing ONNX output: logits".to_string())?
             .try_extract_tensor::<f32>()
             .map_err(|e| format!("logits: {}", e))?;
         if l_slice.len() < n_markers {
@@ -1526,16 +1876,20 @@ impl NeuralEngine {
         let logits: Vec<f32> = l_slice[..n_markers].to_vec();
 
         if let Some((cands, orig_units_len, shifted_lcp)) = decode_p2c {
-            if self.has_char_logits {
-                let (c_shape, c_slice) = outputs["char_logits"]
+            if self.has_char_logits
+                && let Some(char_val) = outputs.get("char_logits")
+            {
+                let (c_shape, c_slice) = char_val
                     .try_extract_tensor::<f32>()
                     .map_err(|e| format!("char_logits: {}", e))?;
-                let vocab_chars = c_shape.last().copied().unwrap_or(0) as usize;
+                let vocab_chars =
+                    usize::try_from(c_shape.last().copied().unwrap_or(0)).unwrap_or(0);
                 let (char_lps, p2c_text, p2c_margin) = self.char_vocab.decode_char_logits(
                     c_slice,
                     (real_slots, vocab_chars),
                     units,
                     cands,
+                    &self.readings,
                     orig_units_len,
                     shifted_lcp,
                 );
@@ -1556,51 +1910,60 @@ impl NeuralEngine {
         orig_units_len: usize,
         shifted_lcp: bool,
     ) -> Result<ForwardResult, String> {
-        let mut ids = self.build_context_token_ids(ctx_final);
-        let mut uids: Vec<i64> = vec![0; ids.len()];
-        let mut slots: Vec<i64> = Vec::with_capacity(self.max_slots);
-        for (kind, text) in units.iter().take(self.max_slots) {
-            slots.push(ids.len() as i64);
-            ids.push(self.mask_id);
-            uids.push(self.lookup_unit_id(kind, text));
-        }
-        ids.push(self.sep_id);
-        uids.push(0);
+        let ctx_ids = self.build_context_token_ids_cached(ctx_final);
+        self.scratch.ids.clear();
+        self.scratch.ids.extend_from_slice(&ctx_ids);
+        self.scratch.uids.clear();
+        self.scratch.uids.resize(self.scratch.ids.len(), 0);
+        self.scratch.slots.clear();
+        self.scratch.markers.clear();
 
-        let mut markers: Vec<i64> = Vec::with_capacity(cand_toks.len());
+        for (kind, text) in units.iter().take(self.max_slots) {
+            self.scratch.slots.push(self.scratch.ids.len() as i64);
+            self.scratch.ids.push(self.mask_id);
+            let uid = self.lookup_unit_id(kind, text);
+            self.scratch.uids.push(uid);
+        }
+        self.scratch.ids.push(self.sep_id);
+        self.scratch.uids.push(0);
+
         for ctok in cand_toks {
-            markers.push(ids.len() as i64);
+            self.scratch.markers.push(self.scratch.ids.len() as i64);
             if !self.choice_compact {
-                ids.push(self.mask_id);
+                self.scratch.ids.push(self.mask_id);
             }
             let take = ctok.len().min(self.candidate_tokens);
-            ids.extend_from_slice(&ctok[..take]);
+            self.scratch.ids.extend_from_slice(&ctok[..take]);
         }
-        ids.push(self.sep_id);
-        uids.resize(ids.len(), 0);
+        self.scratch.ids.push(self.sep_id);
+        self.scratch.uids.resize(self.scratch.ids.len(), 0);
 
-        let seq_len = ids.len();
-        let n_markers = markers.len();
-        let real_slots = slots.len();
-        if slots.is_empty() {
-            slots.push(0);
+        let seq_len = self.scratch.ids.len();
+        let n_markers = self.scratch.markers.len();
+        let real_slots = self.scratch.slots.len();
+        if self.scratch.slots.is_empty() {
+            self.scratch.slots.push(0);
         }
-        let n_slots_in = slots.len();
+        let n_slots_in = self.scratch.slots.len();
 
-        let att = vec![1i64; seq_len];
-        let mm = vec![true; n_markers];
-        let t_ids = TensorRef::from_array_view(([1usize, seq_len], ids.as_slice()))
+        self.scratch.att.clear();
+        self.scratch.att.resize(seq_len, 1);
+        self.scratch.mm.clear();
+        self.scratch.mm.resize(n_markers, true);
+        let t_ids = TensorRef::from_array_view(([1usize, seq_len], self.scratch.ids.as_slice()))
             .map_err(|e| format!("ids: {}", e))?;
-        let t_att = TensorRef::from_array_view(([1usize, seq_len], att.as_slice()))
+        let t_att = TensorRef::from_array_view(([1usize, seq_len], self.scratch.att.as_slice()))
             .map_err(|e| format!("att: {}", e))?;
-        let t_uid = TensorRef::from_array_view(([1usize, seq_len], uids.as_slice()))
+        let t_uid = TensorRef::from_array_view(([1usize, seq_len], self.scratch.uids.as_slice()))
             .map_err(|e| format!("uid: {}", e))?;
-        let t_mp = TensorRef::from_array_view(([1usize, n_markers], markers.as_slice()))
-            .map_err(|e| format!("mp: {}", e))?;
-        let t_mm = TensorRef::from_array_view(([1usize, n_markers], mm.as_slice()))
+        let t_mp =
+            TensorRef::from_array_view(([1usize, n_markers], self.scratch.markers.as_slice()))
+                .map_err(|e| format!("mp: {}", e))?;
+        let t_mm = TensorRef::from_array_view(([1usize, n_markers], self.scratch.mm.as_slice()))
             .map_err(|e| format!("mm: {}", e))?;
-        let t_sp = TensorRef::from_array_view(([1usize, n_slots_in], slots.as_slice()))
-            .map_err(|e| format!("sp: {}", e))?;
+        let t_sp =
+            TensorRef::from_array_view(([1usize, n_slots_in], self.scratch.slots.as_slice()))
+                .map_err(|e| format!("sp: {}", e))?;
 
         let t0 = Instant::now();
         let outputs = self
@@ -1616,7 +1979,9 @@ impl NeuralEngine {
             .map_err(|e| format!("whole run: {}", e))?;
         self.stats.total_infer_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
-        let (_, l_slice) = outputs["logits"]
+        let (_, l_slice) = outputs
+            .get("logits")
+            .ok_or_else(|| "missing ONNX output: logits".to_string())?
             .try_extract_tensor::<f32>()
             .map_err(|e| format!("logits: {}", e))?;
         if l_slice.len() < n_markers {
@@ -1628,16 +1993,19 @@ impl NeuralEngine {
         }
         let logits: Vec<f32> = l_slice[..n_markers].to_vec();
 
-        if self.has_char_logits {
-            let (c_shape, c_slice) = outputs["char_logits"]
+        if self.has_char_logits
+            && let Some(char_val) = outputs.get("char_logits")
+        {
+            let (c_shape, c_slice) = char_val
                 .try_extract_tensor::<f32>()
                 .map_err(|e| format!("char_logits: {}", e))?;
-            let vocab_chars = c_shape.last().copied().unwrap_or(0) as usize;
+            let vocab_chars = usize::try_from(c_shape.last().copied().unwrap_or(0)).unwrap_or(0);
             let (char_lps, p2c_text, p2c_margin) = self.char_vocab.decode_char_logits(
                 c_slice,
                 (real_slots, vocab_chars),
                 units,
                 cands,
+                &self.readings,
                 orig_units_len,
                 shifted_lcp,
             );
@@ -1648,6 +2016,49 @@ impl NeuralEngine {
     }
 }
 
+/// Pure P2C placement decision with strict finiteness guards on Pass-2 logit/gram deltas and
+/// legacy Pass-1 margins.
+fn select_p2c_placement(
+    p2c_text: Option<&str>,
+    p2c_margin: f32,
+    p2c_verified: Option<(f32, f32)>,
+    used_fused_kv: bool,
+    has_ctx: bool,
+    p2c_cfg: P2cConfig,
+) -> (Option<String>, u8) {
+    let Some(txt) = p2c_text else {
+        return (None, 0);
+    };
+    if let Some((ldiff, gdiff)) = p2c_verified {
+        if !ldiff.is_finite() || !gdiff.is_finite() {
+            return (None, 0);
+        }
+        if p2c_cfg.top1_logit_diff > 0.0
+            && ldiff > p2c_cfg.top1_logit_diff
+            && gdiff > p2c_cfg.top1_min_gram_diff
+        {
+            (Some(txt.to_string()), 1)
+        } else if p2c_cfg.top2_logit_diff > 0.0
+            && ldiff > p2c_cfg.top2_logit_diff
+            && gdiff > (p2c_cfg.top1_min_gram_diff - 1.5)
+        {
+            (Some(txt.to_string()), 2)
+        } else {
+            (None, 0)
+        }
+    } else if !used_fused_kv && has_ctx && p2c_margin.is_finite() {
+        if p2c_cfg.legacy_top1_margin > 0.0 && p2c_margin > p2c_cfg.legacy_top1_margin {
+            (Some(txt.to_string()), 1)
+        } else if p2c_cfg.legacy_top2_margin > 0.0 && p2c_margin > p2c_cfg.legacy_top2_margin {
+            (Some(txt.to_string()), 2)
+        } else {
+            (None, 0)
+        }
+    } else {
+        (None, 0)
+    }
+}
+
 pub fn rerank(
     context: &str,
     raw_input: &str,
@@ -1655,7 +2066,10 @@ pub fn rerank(
     cands: &[String],
     weights: FusionWeights,
     p2c_cfg: P2cConfig,
+    gram_req: &GramRequest,
 ) -> Result<RerankResult, String> {
+    let ctx_tail = utf8_tail(context, CONTEXT_CHARS);
+    let has_ctx_bool = ctx_tail.trim().chars().count() >= 2;
     if cands.len() < 2 {
         return Ok(RerankResult {
             order: (1..=cands.len()).collect(),
@@ -1664,6 +2078,8 @@ pub fn rerank(
             logits: vec![0.0; cands.len()],
             gram_deltas: vec![0.0; cands.len()],
             char_lps: vec![0.0; cands.len()],
+            has_ctx: has_ctx_bool,
+            has_gram: false,
         });
     }
     let mutex = ENGINE.get().ok_or_else(|| "engine not ready".to_string())?;
@@ -1677,14 +2093,10 @@ pub fn rerank(
         cands,
         weights,
         p2c_cfg.verify_margin,
+        gram_req,
     )?;
 
-    let ctx_tail = utf8_tail(context, CONTEXT_CHARS);
-    let has_ctx = if ctx_tail.trim().chars().count() >= 2 {
-        1.0
-    } else {
-        0.0
-    };
+    let has_ctx = if has_ctx_bool { 1.0 } else { 0.0 };
     let order0 = rank_order_from_features(
         &eval.logits,
         &eval.gram_deltas,
@@ -1693,41 +2105,14 @@ pub fn rerank(
         weights,
     );
 
-    // P2C synthesis gating:
-    //   1. Fused KV-cache graphs: strictly require KV-cached Pass-2 Cross-Encoder + .gram verification
-    //      (setting `verify_margin <= 0` cleanly disables P2C on KV graphs without silent legacy fallback)
-    //   2. Legacy non-KV whole graphs: context-gated Pass-1 `char_logits` margin fallback
-    let (p2c_text, p2c_pos) = if let Some(ref txt) = eval.p2c_text {
-        if let Some((ldiff, gdiff)) = eval.p2c_verified {
-            if p2c_cfg.top1_logit_diff > 0.0
-                && ldiff > p2c_cfg.top1_logit_diff
-                && gdiff > p2c_cfg.top1_min_gram_diff
-            {
-                (Some(txt.clone()), 1u8)
-            } else if p2c_cfg.top2_logit_diff > 0.0
-                && ldiff > p2c_cfg.top2_logit_diff
-                && gdiff > (p2c_cfg.top1_min_gram_diff - 1.5)
-            {
-                (Some(txt.clone()), 2u8)
-            } else {
-                (None, 0u8)
-            }
-        } else if !eval.used_fused_kv && has_ctx > 0.5 {
-            if p2c_cfg.legacy_top1_margin > 0.0 && eval.p2c_margin > p2c_cfg.legacy_top1_margin {
-                (Some(txt.clone()), 1u8)
-            } else if p2c_cfg.legacy_top2_margin > 0.0
-                && eval.p2c_margin > p2c_cfg.legacy_top2_margin
-            {
-                (Some(txt.clone()), 2u8)
-            } else {
-                (None, 0u8)
-            }
-        } else {
-            (None, 0u8)
-        }
-    } else {
-        (None, 0u8)
-    };
+    let (p2c_text, p2c_pos) = select_p2c_placement(
+        eval.p2c_text.as_deref(),
+        eval.p2c_margin,
+        eval.p2c_verified,
+        eval.used_fused_kv,
+        has_ctx_bool,
+        p2c_cfg,
+    );
 
     Ok(RerankResult {
         order: order0.into_iter().map(|idx| idx + 1).collect(),
@@ -1736,6 +2121,8 @@ pub fn rerank(
         logits: eval.logits,
         gram_deltas: eval.gram_deltas,
         char_lps: eval.char_lps,
+        has_ctx: has_ctx_bool,
+        has_gram: eval.has_gram,
     })
 }
 
@@ -1812,24 +2199,61 @@ pub fn get_stats() -> StatsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokenizers::AddedToken;
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::pre_tokenizers::metaspace::Metaspace;
+    use tokenizers::pre_tokenizers::sequence::Sequence;
+    use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
 
     fn test_char_vocab() -> CharVocab {
-        let chars = vec!["你".into(), "拟".into(), "好".into(), "号".into()];
+        // Indices 0..4 are core Simplified (`old_chars = 4`), index 4 (`東`, `dong`) is extended
+        // (`cid >= old_chars`), indices 5..9 test alternate segmentation (`方/案/反/感`).
+        let chars: Vec<String> = vec![
+            "你".into(),
+            "拟".into(),
+            "好".into(),
+            "号".into(),
+            "東".into(),
+            "方".into(),
+            "案".into(),
+            "反".into(),
+            "感".into(),
+        ];
         let mut char_to_id = HashMap::new();
-        char_to_id.insert('你', 0);
-        char_to_id.insert('拟', 1);
-        char_to_id.insert('好', 2);
-        char_to_id.insert('号', 3);
-        let mut syl_to_cids = HashMap::new();
-        syl_to_cids.insert("ni".to_string(), vec![0, 1]);
-        syl_to_cids.insert("hao".to_string(), vec![2, 3]);
+        for (i, s) in chars.iter().enumerate() {
+            char_to_id.insert(s.chars().next().unwrap(), i);
+        }
+        let mut syl_to_p2c_cids = HashMap::new();
+        syl_to_p2c_cids.insert("ni".to_string(), vec![0, 1]);
+        syl_to_p2c_cids.insert("hao".to_string(), vec![2, 3]);
+        syl_to_p2c_cids.insert("fang".to_string(), vec![5]);
+        syl_to_p2c_cids.insert("an".to_string(), vec![6]);
+
+        let mut syl_to_all_cids = syl_to_p2c_cids.clone();
+        // Pretend `東` (cid=4 >= old_chars=4) also maps to `hao` for testing extended scoring
+        syl_to_all_cids.insert("hao".to_string(), vec![2, 3, 4]);
         CharVocab {
             chars,
             char_to_id,
-            syl_to_cids,
+            syl_to_p2c_cids,
+            syl_to_all_cids,
             old_chars: 4,
             max_slots: 24,
         }
+    }
+
+    fn test_readings() -> HashMap<String, Vec<String>> {
+        let mut r = HashMap::new();
+        r.insert("你".into(), vec!["ni".into()]);
+        r.insert("拟".into(), vec!["ni".into()]);
+        r.insert("好".into(), vec!["hao".into()]);
+        r.insert("号".into(), vec!["hao".into()]);
+        r.insert("東".into(), vec!["hao".into()]);
+        r.insert("方".into(), vec!["fang".into()]);
+        r.insert("案".into(), vec!["an".into()]);
+        r.insert("反".into(), vec!["fan".into()]);
+        r.insert("感".into(), vec!["gan".into()]);
+        r
     }
 
     #[test]
@@ -1840,6 +2264,8 @@ mod tests {
         assert_eq!(common_prefix_chars(&identical), 0);
         assert_eq!(utf8_tail("你好世界测试", 4), "世界测试");
         assert_eq!(utf8_tail("短", 4), "短");
+        assert_eq!(utf8_tail("abc", 0), "");
+        assert_eq!(utf8_tail("你好", 0), "");
     }
 
     #[test]
@@ -1850,73 +2276,226 @@ mod tests {
         let order = rank_order_from_features(&logits, &grams, &clps, 0.0, FusionWeights::default());
         assert_eq!(order, vec![1, 0, 2]);
 
-        // NaN logit must NOT sort above finite logits
+        // NaN / +Inf / -Inf logits must not crash or sort NaN above finite logits
         let nan_logits = [0.0f32, f32::NAN, 2.0];
         let order_nan =
             rank_order_from_features(&nan_logits, &grams, &clps, 0.0, FusionWeights::default());
         assert_eq!(order_nan[0], 2);
         assert_eq!(order_nan[2], 1);
+
+        // `w_ctx_lp` amplifies neural logits only when `has_ctx = 1.0`
+        let w_ctx = FusionWeights {
+            w_ctx_lp: 2.0,
+            ..FusionWeights::default()
+        };
+        let close_logits = [0.0f32, 0.8];
+        let o_no_ctx =
+            rank_order_from_features(&close_logits, &[0.0, 0.0], &[0.0, 0.0], 0.0, w_ctx);
+        let o_with_ctx =
+            rank_order_from_features(&close_logits, &[0.0, 0.0], &[0.0, 0.0], 1.0, w_ctx);
+        assert_eq!(o_no_ctx[0], 0);
+        assert_eq!(o_with_ctx[0], 1);
     }
 
     #[test]
-    fn test_decode_char_logits_suppresses_p2c_on_length_mismatch() {
+    fn test_decode_char_logits_suppresses_p2c_on_length_mismatch_and_alt_seg() {
         let cv = test_char_vocab();
+        let readings = test_readings();
         let units = vec![("f", "ni".to_string()), ("f", "hao".to_string())];
-        // Strongly prefers "拟号" (cid 1, cid 3)
-        let c_slice = [0.0f32, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0];
+        // Vocab width 9; strongly prefers "拟号" (cid 1, cid 3) and scores extended `東` (cid 4) well
+        let mut c_slice = vec![0.0f32; 2 * 9];
+        c_slice[1] = 5.0; // slot 0: 拟
+        c_slice[9 + 3] = 5.0; // slot 1: 号
+        c_slice[9 + 4] = 4.5; // slot 1: extended `東` (cid=4 >= old_chars=4)
 
         // Same-length candidates -> emits P2C "拟号" with positive margin
         let cands_ok = vec!["你好".to_string(), "你号".to_string()];
         let (clps, p2c, margin) =
-            cv.decode_char_logits(&c_slice, (2, 4), &units, &cands_ok, 2, false);
+            cv.decode_char_logits(&c_slice, (2, 9), &units, &cands_ok, &readings, 2, false);
         assert_eq!(p2c.as_deref(), Some("拟号"));
         assert!(margin > 0.0);
         assert!(clps[1] > clps[0]);
 
+        // Extended char (`cid >= old_chars`) uses true logit instead of `-15.0` penalty, while
+        // P2C synthesis remains capped to `cid < old_chars` (`拟号`, never `拟東`).
+        let cands_ext = vec!["你好".to_string(), "你東".to_string()];
+        let (clps_ext, p2c_ext, _) =
+            cv.decode_char_logits(&c_slice, (2, 9), &units, &cands_ext, &readings, 2, false);
+        assert_eq!(p2c_ext.as_deref(), Some("拟号"));
+        assert!(
+            clps_ext[1] > 0.0,
+            "extended char with high logit should beat baseline, got {}",
+            clps_ext[1]
+        );
+
         // Mismatched candidate length (3 chars vs 2 slots) -> must suppress P2C completely
         let cands_mismatch = vec!["你好啊".to_string(), "你好".to_string()];
-        let (clps2, p2c2, margin2) =
-            cv.decode_char_logits(&c_slice, (2, 4), &units, &cands_mismatch, 2, false);
+        let (clps2, p2c2, margin2) = cv.decode_char_logits(
+            &c_slice,
+            (2, 9),
+            &units,
+            &cands_mismatch,
+            &readings,
+            2,
+            false,
+        );
         assert_eq!(p2c2, None);
         assert_eq!(margin2, -100.0);
         assert_eq!(clps2, vec![0.0, 0.0]);
+
+        // Equal-length alternate segmentation (`方案` vs `反感` on `fangan`): must not penalize `反感` by -15/slot
+        let units_fangan = vec![("f", "fang".to_string()), ("f", "an".to_string())];
+        let cands_alt = vec!["方案".to_string(), "反感".to_string()];
+        let (clps_alt, p2c_alt, _) = cv.decode_char_logits(
+            &c_slice,
+            (2, 9),
+            &units_fangan,
+            &cands_alt,
+            &readings,
+            2,
+            false,
+        );
+        assert_eq!(clps_alt, vec![0.0, 0.0]);
+        assert_eq!(p2c_alt, None);
     }
 
     #[test]
-    fn test_sanitize_special_tokens_strips_all_control_tokens() {
-        let specials: Vec<String> = [
-            "<start_of_turn>",
-            "<end_of_turn>",
-            "[@BOS@]",
-            "<mask>",
-            "<bos>",
-            "<eos>",
-            "<pad>",
-            "<unk>",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
+    fn test_select_p2c_placement_guards_non_finite_and_thresholds() {
+        let cfg = P2cConfig::default();
+        // +Inf / NaN Pass-2 deltas must never promote P2C
         assert_eq!(
-            sanitize_special_tokens("普通文本", &specials).as_ref(),
+            select_p2c_placement(
+                Some("拟号"),
+                1.0,
+                Some((f32::INFINITY, 0.0)),
+                true,
+                true,
+                cfg
+            ),
+            (None, 0)
+        );
+        assert_eq!(
+            select_p2c_placement(Some("拟号"), 1.0, Some((3.0, f32::NAN)), true, true, cfg),
+            (None, 0)
+        );
+        // Valid Pass-2 #1 promotion
+        assert_eq!(
+            select_p2c_placement(Some("拟号"), 1.0, Some((2.5, -1.0)), true, true, cfg),
+            (Some("拟号".to_string()), 1)
+        );
+        // Fails #1 gram floor (-2.5 < -2.0), passes #2 gram floor (-2.5 > -3.5)
+        assert_eq!(
+            select_p2c_placement(Some("拟号"), 1.0, Some((2.5, -2.5)), true, true, cfg),
+            (Some("拟号".to_string()), 2)
+        );
+        // Fails #2 gram floor (-4.0 < -3.5)
+        assert_eq!(
+            select_p2c_placement(Some("拟号"), 1.0, Some((2.5, -4.0)), true, true, cfg),
+            (None, 0)
+        );
+        // Fused KV without Pass-2 verification never falls back to legacy margin
+        assert_eq!(
+            select_p2c_placement(Some("拟号"), 5.0, None, true, true, cfg),
+            (None, 0)
+        );
+    }
+
+    #[test]
+    fn test_sanitize_and_collect_special_tokens_preserves_html_and_strips_non_angle_specials() {
+        let model = WordLevel::builder()
+            .vocab(
+                [("<unk>".to_string(), 0u32), ("hello".to_string(), 1u32)]
+                    .into_iter()
+                    .collect(),
+            )
+            .unk_token("<unk>".to_string())
+            .build()
+            .expect("wordlevel");
+        let mut tok = Tokenizer::new(model);
+        tok.add_special_tokens(&[
+            AddedToken::from("<bos>", true),
+            AddedToken::from("<eos>", true),
+            AddedToken::from("<start_of_turn>", true),
+            AddedToken::from("[CLS]", true),
+        ]);
+        tok.add_tokens(&[
+            AddedToken::from("<code>", false),
+            AddedToken::from("<b>", false),
+            AddedToken::from("<unused0>", false),
+            AddedToken::from("[@BOS@]", false),
+        ]);
+        let (specials, triggers, forbidden) = collect_special_tokens(&tok);
+        assert!(specials.iter().any(|s| s == "<bos>"));
+        assert!(specials.iter().any(|s| s == "[CLS]"));
+        assert!(specials.iter().any(|s| s == "<unused0>"));
+        assert!(specials.iter().any(|s| s == "[@BOS@]"));
+        assert!(
+            !specials.iter().any(|s| s == "<code>" || s == "<b>"),
+            "non-special HTML tokens must not be stripped: {:?}",
+            specials
+        );
+        assert!(
+            !forbidden.contains(&0),
+            "<unk> must not be blocked in forbidden_special_ids"
+        );
+        assert_eq!(
+            sanitize_special_tokens("普通文本", &specials, &triggers).as_ref(),
             "普通文本"
         );
         assert_eq!(
+            sanitize_special_tokens("<code>Vec<T></code>", &specials, &triggers).as_ref(),
+            "<code>Vec<T></code>"
+        );
+        assert_eq!(
             sanitize_special_tokens(
-                "a<bos>b<eos>c<mask>d<pad>e<start_of_turn>f<end_of_turn>g[@BOS@]h",
-                &specials
+                "a<bos>b<start_of_turn>c[CLS]d<unused0>e[@BOS@]f",
+                &specials,
+                &triggers
             )
             .as_ref(),
-            "a b c d e f g h"
+            "a b c d e f"
         );
     }
 
     #[test]
-    fn test_cache_key_distinguishes_fusion_weights_and_canonicalizes_neg_zero() {
+    fn test_build_no_prepend_tokenizer_handles_sequence_pretokenizer() {
+        let model = WordLevel::builder()
+            .vocab([("<unk>".to_string(), 0u32)].into_iter().collect())
+            .unk_token("<unk>".to_string())
+            .build()
+            .expect("wordlevel");
+        let mut tok = Tokenizer::new(model);
+        tok.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
+            PreTokenizerWrapper::WhitespaceSplit(WhitespaceSplit),
+            PreTokenizerWrapper::Metaspace(Metaspace::new('▁', PrependScheme::Always, true)),
+        ]))));
+        let no_prep =
+            build_no_prepend_tokenizer(&tok, Path::new("nonexistent.json")).expect("clone seq");
+        let Some(PreTokenizerWrapper::Sequence(seq)) = no_prep.get_pre_tokenizer() else {
+            panic!("expected Sequence pre-tokenizer");
+        };
+        let Some(PreTokenizerWrapper::Metaspace(ms)) = seq.as_ref().get(1) else {
+            panic!("expected inner Metaspace");
+        };
+        assert_eq!(ms.prepend_scheme, PrependScheme::Never);
+    }
+
+    #[test]
+    fn test_cache_key_distinguishes_fusion_weights_and_gram_params() {
         assert_eq!(canon_f64_bits(-0.0), canon_f64_bits(0.0));
         assert_eq!(canon_f32_bits(-0.0), canon_f32_bits(0.0));
         let w1 = FusionWeights::default();
         let w2 = FusionWeights { w_rank: -0.5, ..w1 };
+        let g1 = ResolvedGramKey {
+            path: Some(PathBuf::from("a.gram")),
+            col_bits: canon_f64_bits(-15.5),
+            non_col_bits: canon_f64_bits(-4.0),
+            max_length: 5,
+        };
+        let g2 = ResolvedGramKey {
+            col_bits: canon_f64_bits(-14.0),
+            ..g1.clone()
+        };
         let k1 = CacheKey {
             ctx_tail: "你好".to_string(),
             raw_input: "nihk".to_string(),
@@ -1929,6 +2508,7 @@ mod tests {
                 canon_f64_bits(w1.w_ctx_lp),
             ],
             p2c_verify_margin_bits: canon_f32_bits(0.2),
+            gram_key: g1,
             cands: vec!["你好".to_string()],
         };
         let k2 = CacheKey {
@@ -1941,6 +2521,11 @@ mod tests {
             ],
             ..k1.clone()
         };
+        let k3 = CacheKey {
+            gram_key: g2,
+            ..k1.clone()
+        };
         assert_ne!(k1, k2);
+        assert_ne!(k1, k3);
     }
 }
