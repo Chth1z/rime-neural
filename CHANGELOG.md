@@ -4,6 +4,21 @@ All notable changes to `rime-neural` are documented in this file.
 
 ## [Unreleased]
 
+## [v1.3.0] - 2026-11-25
+
+### Features
+- **Focus-Bound Ephemeral Context Entity Splice (`src/engine.rs`, `lua/rime_neural.lua`)**:
+  - Scans left- and right-maximal 2+ character reading-matched Han spans from the already-authorized active context (`ctx_tail`) and splices them (individually and as a combined non-overlapping multi-entity splice) into the top Pass-1 candidate whenever strict 1:1 full-syllable reading alignment and `candidate_tokens` bounds hold.
+  - Batches context-entity splices alongside optional greedy `char_logits` P2C proposals into a single KV-cached Pass-2 cross-encoder forward pass, caching all verified proposals so each is evaluated independently against the caller's placement thresholds (with a `+2.0` / `+1.5` prefix-copy bias guard for context-only splices and the standard `.gram` floor). Zero-context keystrokes skip the splice path with zero latency or accuracy regression.
+  - Strictly scoped non-`TextPattern` fallback `commit_history` reads in `lua/rime_neural.lua` to the count of commits recorded within the current `(HWND, focus_epoch)` so prior controls' commits never cross focus boundaries into neural context or entity splicing.
+- **Opt-In Pre-Commit Local Span Repair & Literal Lock (`lua/rime_neural_repair.lua`, `examples/rime_neural_repair.custom.yaml`)**:
+  - Added a standalone opt-in `lua_processor@*rime_neural_repair` (constant-time idle path: at most two `KeyEvent:eq` comparisons) with configurable `rime_neural_repair/repair_key` (default `Alt+r`) and `rime_neural_repair/lock_key` (default `Alt+l`).
+  - Pre-commit homophone repair (`Alt+r`): uses native `Sentence.entrys` / `word_lengths` / `entry.code:print()` and a `ShadowCandidate` menu overlay to step across logical words (`Left`/`Right`) without moving the physical caret, highlight native homophone alternatives (`1..9`/`Space`) pre-commit, and revert cleanly (`Escape`/`Alt+r`) while tolerating bare modifier presses.
+  - Pre-commit literal lock (`Alt+l`): locks verbatim ASCII identifiers (`[A-Za-z0-9._/%-+]`, e.g. `GPUv2`, `OAuth2`, `v1.2.1`, `rime-neural`, `CI/CD`) as native confirmed `raw` segments inside Chinese compositions, supporting `BackSpace` editing, pending ASCII token locking, and in-place confirmation of fully covering Chinese sentences.
+
+### Installer & Release CI
+- Packaged and SHA-256-verified `lua/rime_neural_repair.lua` in `.github/workflows/ci-release.yml` (including `luac5.4 -p` syntax validation) and `scripts/install.ps1` (with full rollback tracking and backward compatibility for older release archives).
+
 ## [v1.2.1] - 2026-11-24
 
 ### Engine, `.gram` & Performance
