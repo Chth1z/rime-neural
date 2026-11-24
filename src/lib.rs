@@ -52,13 +52,8 @@ unsafe fn read_f32_array(api: &LuaApi, l: LuaState, idx: c_int) -> Vec<f32> {
         let mut out = Vec::with_capacity(n);
         for i in 1..=(n as LuaInteger) {
             (api.rawgeti)(l, idx, i);
-            let mut isnum: c_int = 0;
-            let v = (api.tonumberx)(l, -1, &mut isnum);
-            out.push(if isnum != 0 && v.is_finite() {
-                v as f32
-            } else {
-                0.0
-            });
+            // Non-numbers convert to zero. FeedbackRecord sanitizes non-finite f32 features.
+            out.push((api.tonumberx)(l, -1, std::ptr::null_mut()) as f32);
             pop(api, l, 1);
         }
         out
@@ -146,11 +141,11 @@ unsafe fn read_table_f32(
     default_val: f32,
 ) -> f32 {
     // SAFETY: Delegates to `read_table_f64` with the same preconditions.
-    let v = unsafe { read_table_f64(api, l, idx, field, default_val as f64) };
-    if v.is_finite() { v as f32 } else { default_val }
+    let v = unsafe { read_table_f64(api, l, idx, field, default_val as f64) } as f32;
+    if v.is_finite() { v } else { default_val }
 }
 
-unsafe fn read_table_str(api: &LuaApi, l: LuaState, idx: c_int, field: &str) -> Option<String> {
+unsafe fn read_table_path(api: &LuaApi, l: LuaState, idx: c_int, field: &str) -> Option<PathBuf> {
     let tbl_idx = if idx < 0 { idx - 1 } else { idx };
     // SAFETY: Slot `idx` was checked to be `LUA_TTABLE`; `lua_rawget` avoids metamethod dispatch.
     unsafe {
@@ -158,7 +153,7 @@ unsafe fn read_table_str(api: &LuaApi, l: LuaState, idx: c_int, field: &str) -> 
         (api.rawget)(l, tbl_idx);
         let res = read_str(api, l, -1);
         pop(api, l, 1);
-        res.filter(|s| !s.is_empty())
+        res.filter(|s| !s.is_empty()).map(PathBuf::from)
     }
 }
 
@@ -221,14 +216,14 @@ unsafe fn read_p2c_cfg(api: &LuaApi, l: LuaState, idx: c_int) -> P2cConfig {
             return cfg;
         }
         let mut isnum: c_int = 0;
-        let t1 = (api.tonumberx)(l, idx, &mut isnum);
+        let t1 = (api.tonumberx)(l, idx, &mut isnum) as f32;
         if isnum != 0 && t1.is_finite() {
-            cfg.legacy_top1_margin = t1 as f32;
+            cfg.legacy_top1_margin = t1;
         }
         isnum = 0;
-        let t2 = (api.tonumberx)(l, idx + 1, &mut isnum);
+        let t2 = (api.tonumberx)(l, idx + 1, &mut isnum) as f32;
         if isnum != 0 && t2.is_finite() {
-            cfg.legacy_top2_margin = t2 as f32;
+            cfg.legacy_top2_margin = t2;
         }
     }
     cfg
@@ -262,16 +257,10 @@ unsafe fn read_gram_req(api: &LuaApi, l: LuaState, idx: c_int) -> GramRequest {
         if read_table_bool(api, l, idx, "enabled") == Some(false) {
             return GramRequest::Disabled;
         }
-        let mut paths = Vec::with_capacity(2);
-        if let Some(p) = read_table_str(api, l, idx, "path") {
-            paths.push(p);
-        }
-        if let Some(p) = read_table_str(api, l, idx, "fallback_path") {
-            paths.push(p);
-        }
-        let Some(chosen) = pick_existing_gram_path(&paths) else {
-            return GramRequest::Disabled;
-        };
+        let paths = [
+            read_table_path(api, l, idx, "path"),
+            read_table_path(api, l, idx, "fallback_path"),
+        ];
         let col = read_table_f64(
             api,
             l,
@@ -293,7 +282,7 @@ unsafe fn read_gram_req(api: &LuaApi, l: LuaState, idx: c_int) -> GramRequest {
             "max_length",
             gram::DEFAULT_COLLOCATION_MAX_LENGTH,
         );
-        GramRequest::custom(chosen, col, non_col, max_len)
+        GramRequest::custom(paths, col, non_col, max_len)
     }
 }
 
@@ -514,7 +503,7 @@ unsafe extern "C-unwind" fn lua_set_uia_enabled(l: LuaState) -> c_int {
 }
 
 /// query_uia_context(live_preedit, raw_input, [cand_preview])
-///   -> (status_str, text_str, hwnd_int, preedit_stripped_bool)
+///   -> (status_str, text_str, hwnd_int, preedit_stripped_bool, focus_epoch)
 unsafe extern "C-unwind" fn lua_query_uia_context(l: LuaState) -> c_int {
     // SAFETY: Invoked by Lua 5.4 host with valid `lua_State*`.
     let Ok(api) = (unsafe { get_api() }) else {
@@ -531,54 +520,28 @@ unsafe extern "C-unwind" fn lua_query_uia_context(l: LuaState) -> c_int {
     let res = catch_unwind(AssertUnwindSafe(|| {
         uia::query_context(&preedit, &raw_input, &cand_preview)
     }));
-    // SAFETY: Push 4 return values onto `l` after ensuring stack capacity.
+    let (context, hwnd, epoch) =
+        res.unwrap_or_else(|_| (UiaContext::Blocked, uia::foreground_hwnd(), 0));
+    let (status, text, stripped) = match context {
+        UiaContext::Blocked => ("blocked", String::new(), false),
+        UiaContext::Text {
+            text,
+            preedit_stripped,
+        } => ("text", text, preedit_stripped),
+        UiaContext::WindowChanged => ("window_changed", String::new(), false),
+        UiaContext::FallbackSameWindow => ("fallback", String::new(), false),
+    };
+    // SAFETY: Push 5 return values onto `l` after ensuring stack capacity.
     unsafe {
         if (api.checkstack)(l, 6) == 0 {
             return 0;
         }
-        match res {
-            Ok((UiaContext::Blocked, hwnd)) => {
-                push_str(api, l, "blocked");
-                push_str(api, l, "");
-                (api.pushinteger)(l, hwnd as LuaInteger);
-                (api.pushboolean)(l, 0);
-                4
-            }
-            Ok((
-                UiaContext::Text {
-                    text,
-                    preedit_stripped,
-                },
-                hwnd,
-            )) => {
-                push_str(api, l, "text");
-                push_str(api, l, &text);
-                (api.pushinteger)(l, hwnd as LuaInteger);
-                (api.pushboolean)(l, if preedit_stripped { 1 } else { 0 });
-                4
-            }
-            Ok((UiaContext::WindowChanged, hwnd)) => {
-                push_str(api, l, "window_changed");
-                push_str(api, l, "");
-                (api.pushinteger)(l, hwnd as LuaInteger);
-                (api.pushboolean)(l, 0);
-                4
-            }
-            Ok((UiaContext::FallbackSameWindow, hwnd)) => {
-                push_str(api, l, "fallback");
-                push_str(api, l, "");
-                (api.pushinteger)(l, hwnd as LuaInteger);
-                (api.pushboolean)(l, 0);
-                4
-            }
-            Err(_) => {
-                push_str(api, l, "fallback");
-                push_str(api, l, "");
-                (api.pushinteger)(l, uia::foreground_hwnd() as LuaInteger);
-                (api.pushboolean)(l, 0);
-                4
-            }
-        }
+        push_str(api, l, status);
+        push_str(api, l, &text);
+        (api.pushinteger)(l, hwnd as LuaInteger);
+        (api.pushboolean)(l, stripped.into());
+        (api.pushinteger)(l, epoch as LuaInteger);
+        5
     }
 }
 
@@ -1330,6 +1293,35 @@ mod tests {
     }
 
     #[test]
+    fn p2c_thresholds_use_defaults_on_f32_overflow() {
+        let api = mock_lua_api();
+        let mut lua = MockLua {
+            stack: vec![
+                MockVal::Map(HashMap::from([(
+                    "verify_margin".into(),
+                    MockVal::Num(1e200),
+                )])),
+                MockVal::Num(-1e200),
+                MockVal::Num(1.25),
+            ],
+        };
+        let ptr = (&mut lua as *mut MockLua) as LuaState;
+        // SAFETY: `ptr` points to live `MockLua`.
+        unsafe {
+            assert_eq!(
+                read_p2c_cfg(&api, ptr, 1).verify_margin,
+                P2cConfig::default().verify_margin
+            );
+            let legacy = read_p2c_cfg(&api, ptr, 2);
+            assert_eq!(
+                legacy.legacy_top1_margin,
+                P2cConfig::default().legacy_top1_margin
+            );
+            assert_eq!(legacy.legacy_top2_margin, 1.25);
+        }
+    }
+
+    #[test]
     fn test_read_gram_req_handles_disabled_and_custom_tables() {
         let _g = MOCK_LOCK.lock().unwrap();
         let api = mock_lua_api();
@@ -1339,6 +1331,10 @@ mod tests {
         custom_map.insert(
             "path".to_string(),
             MockVal::Str("C:\\fake.gram".to_string()),
+        );
+        custom_map.insert(
+            "fallback_path".to_string(),
+            MockVal::Str("C:\\shared.gram".to_string()),
         );
         custom_map.insert("col_penalty".to_string(), MockVal::Num(-14.0));
         custom_map.insert("non_col_penalty".to_string(), MockVal::Num(-4.0));
@@ -1358,7 +1354,15 @@ mod tests {
             assert_eq!(read_gram_req(&api, ptr, 2), GramRequest::Disabled);
             assert_eq!(
                 read_gram_req(&api, ptr, 3),
-                GramRequest::custom(PathBuf::from("C:\\fake.gram"), -14.0, -4.0, 7)
+                GramRequest::custom(
+                    [
+                        Some(PathBuf::from("C:\\fake.gram")),
+                        Some(PathBuf::from("C:\\shared.gram"))
+                    ],
+                    -14.0,
+                    -4.0,
+                    7
+                )
             );
             assert_eq!(lua.stack.len(), 3);
         }

@@ -3,12 +3,12 @@
 //! Architecture guarantees:
 //! 1. **Zero main-thread blocking**: All COM/UIA calls run on a single dedicated background
 //!    MTA thread (`COINIT_MULTITHREADED`, 200 ms `IUIAutomation6` connection/transaction
-//!    timeouts). The keystroke hot path only calls `GetForegroundWindow()`, `try_send()`,
+//!    timeouts). The keystroke hot path only samples the foreground HWND/PID, calls `try_send()`,
 //!    and a brief `RwLock::read()` (writer never holds the lock during COM I/O), so sluggish apps
 //!    never hang `WeaselServer.exe`.
 //! 2. **Zero cross-app contamination**: Tracks the active foreground `HWND` synchronously on
 //!    every query, verifies focused-element root ancestry and post-read foreground `HWND`, and
-//!    clamps `TextPattern` ranges to `RangeFromChild(focused)` + `\u{FFFC}` boundaries so
+//!    clamps `TextPattern` ranges to `RangeFromChild(&focused)` (falling back to `DocumentRange`) + `\u{FFFC}` boundaries so
 //!    Chromium/Electron apps never bleed surrounding UI labels or stale `commit_history`.
 //! 3. **Fail-closed password protection**: Any control reporting `IsPassword == true`, hosted by
 //!    a password manager / credential UI / remote-session client, or running under an
@@ -38,7 +38,6 @@ pub enum UiaContext {
 }
 
 const MAX_UIA_CHARS: usize = 64;
-const MAX_VALUE_PATTERN_TAIL_CHARS: usize = 256;
 const SNAPSHOT_TTL: Duration = Duration::from_secs(4);
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(35);
 const POST_COMMIT_SETTLE_DELAY: Duration = Duration::from_millis(25);
@@ -320,12 +319,10 @@ mod win_impl {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
     use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
-    use std::sync::{Mutex, OnceLock, RwLock};
+    use std::sync::{OnceLock, RwLock};
     use std::thread;
 
-    use windows::Win32::Foundation::{
-        CloseHandle, E_ACCESSDENIED, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, HWND,
-    };
+    use windows::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER};
     use windows::Win32::System::Com::{
         CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
         CoUninitialize,
@@ -363,14 +360,8 @@ mod win_impl {
     impl Drop for WorkerAliveGuard {
         fn drop(&mut self) {
             WORKER_ALIVE.store(false, Ordering::Release);
-            if let Some(rt) = RUNTIME.get()
-                && let Ok(mut guard) = rt.snapshot.write()
-            {
-                guard.hwnd = 0;
-                guard.is_password = false;
-                guard.readable = false;
-                guard.before_caret.clear();
-                guard.updated_at = None;
+            if let Some(rt) = RUNTIME.get() {
+                rt.invalidate((0, 0), false);
             }
         }
     }
@@ -398,32 +389,14 @@ mod win_impl {
     impl IUIAutomationFocusChangedEventHandler_Impl for FocusChangedHandler_Impl {
         fn HandleFocusChangedEvent(
             &self,
-            sender: Option<&IUIAutomationElement>,
+            _sender: Option<&IUIAutomationElement>,
         ) -> windows::core::Result<()> {
             if !is_enabled() {
                 return Ok(());
             }
-            let is_pw = sender
-                .and_then(|el| {
-                    // SAFETY: `el` is a valid UIA COM element passed by UIA callback.
-                    match unsafe { el.CurrentIsPassword() } {
-                        Ok(b) => Some(b.as_bool()),
-                        Err(e) if e.code() == E_ACCESSDENIED => Some(true),
-                        Err(_) => None,
-                    }
-                })
-                .unwrap_or(false);
-            // SAFETY: `GetForegroundWindow` is safe to invoke on any thread.
-            let hwnd_raw = unsafe { GetForegroundWindow().0 as isize };
             if let Some(rt) = RUNTIME.get() {
-                if let Ok(mut guard) = rt.snapshot.write() {
-                    guard.hwnd = hwnd_raw;
-                    guard.is_password = is_pw;
-                    guard.readable = false;
-                    guard.before_caret.clear();
-                    guard.updated_at = Some(Instant::now());
-                }
-                FOCUS_CHANGED_PENDING.store(true, Ordering::Release);
+                // Suppress context and feedback until the worker checks the newly focused control.
+                rt.invalidate(foreground_window(), true);
                 let _ = rt.tx.try_send(());
             }
             Ok(())
@@ -431,26 +404,38 @@ mod win_impl {
     }
 
     struct UiaSnapshot {
-        hwnd: isize,
-        is_password: bool,
-        readable: bool,
-        before_caret: String,
-        updated_at: Option<Instant>,
+        window: (isize, u32),
+        blocked: bool,
+        before_caret: Option<String>,
+        updated_at: Instant,
     }
 
     struct UiaRuntime {
         tx: SyncSender<()>,
-        snapshot: RwLock<UiaSnapshot>,
+        // Publish the focus epoch and its snapshot together.
+        snapshot: RwLock<(u64, UiaSnapshot)>,
+    }
+
+    impl UiaRuntime {
+        fn invalidate(&self, window: (isize, u32), blocked: bool) {
+            let (epoch, snap) = &mut *self.snapshot.write().unwrap_or_else(|e| e.into_inner());
+            *epoch = epoch.wrapping_add(1);
+            *snap = unreadable_snapshot(window, blocked);
+        }
+
+        fn publish(&self, epoch: u64, result: UiaSnapshot) {
+            let (current, snap) = &mut *self.snapshot.write().unwrap_or_else(|e| e.into_inner());
+            if *current == epoch {
+                *snap = result;
+            }
+        }
     }
 
     static RUNTIME: OnceLock<UiaRuntime> = OnceLock::new();
     static LAST_SEEN_HWND: AtomicIsize = AtomicIsize::new(0);
-    // Cache keyed by `(hwnd, pid)` so OS HWND recycling to a denied process cannot hit stale false.
-    static LAST_DENIED: Mutex<(isize, u32, bool)> = Mutex::new((0, 0, false));
     static ENABLED: AtomicBool = AtomicBool::new(false);
     static WORKER_ALIVE: AtomicBool = AtomicBool::new(false);
     static POST_COMMIT_PENDING: AtomicBool = AtomicBool::new(false);
-    static FOCUS_CHANGED_PENDING: AtomicBool = AtomicBool::new(false);
 
     fn is_denied_pid(pid: u32) -> bool {
         if pid == 0 {
@@ -459,11 +444,7 @@ mod win_impl {
         // SAFETY: `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION` is read-only.
         let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
             Ok(h) => h,
-            Err(e) => {
-                // Fail closed on Protected Processes / hardened credential vaults (`consent.exe`,
-                // `lockapp.exe`, PPL security UIs) where even limited query access is denied.
-                return e.code() == ERROR_ACCESS_DENIED.to_hresult();
-            }
+            Err(_) => return true, // Unable to classify the process.
         };
         let mut cap = 512usize;
         let mut path_opt: Option<String> = None;
@@ -505,94 +486,64 @@ mod win_impl {
         is_denied_exe_name(&exe)
     }
 
-    fn is_denied_hwnd_cached(hwnd: HWND) -> bool {
-        let raw = hwnd.0 as isize;
-        if raw == 0 {
-            return false;
+    fn foreground_window() -> (isize, u32) {
+        // SAFETY: The HWND comes from Windows and `pid` is writable for the call.
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            let mut pid = 0;
+            if !hwnd.0.is_null() {
+                GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            }
+            (hwnd.0 as isize, pid)
         }
-        let mut pid: u32 = 0;
-        // SAFETY: `hwnd` is a window handle from `GetForegroundWindow`; `pid` is a valid out-ptr.
-        let tid = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-        if tid == 0 || pid == 0 {
-            // Fail closed without poisoning cache when foreground window PID cannot be resolved.
-            return true;
-        }
-        if let Ok(guard) = LAST_DENIED.lock()
-            && guard.0 == raw
-            && guard.1 == pid
-        {
-            return guard.2;
-        }
-        let denied = is_denied_pid(pid);
-        if let Ok(mut guard) = LAST_DENIED.lock() {
-            *guard = (raw, pid, denied);
-        }
-        denied
     }
 
-    fn unreadable_snapshot(hwnd_raw: isize, is_password: bool) -> UiaSnapshot {
+    fn unreadable_snapshot(window: (isize, u32), blocked: bool) -> UiaSnapshot {
         UiaSnapshot {
-            hwnd: hwnd_raw,
-            is_password,
-            readable: false,
-            before_caret: String::new(),
-            updated_at: Some(Instant::now()),
+            window,
+            blocked,
+            before_caret: None,
+            updated_at: Instant::now(),
         }
     }
 
     fn probe_once(automation: &IUIAutomation) -> UiaSnapshot {
-        // SAFETY: `GetForegroundWindow` takes no arguments and returns the active window handle.
-        let hwnd = unsafe { GetForegroundWindow() };
-        let hwnd_raw = hwnd.0 as isize;
-        if hwnd_raw == 0 {
-            return unreadable_snapshot(0, false);
-        }
-
-        if is_denied_hwnd_cached(hwnd) {
-            return unreadable_snapshot(hwnd_raw, true);
+        let window = foreground_window();
+        let (hwnd_raw, foreground_pid) = window;
+        if hwnd_raw == 0 || is_denied_pid(foreground_pid) {
+            return unreadable_snapshot(window, true);
         }
 
         // SAFETY: `automation` is a valid COM `IUIAutomation` pointer initialized on this MTA thread.
         let focused = match unsafe { automation.GetFocusedElement() } {
             Ok(el) => el,
-            Err(_) => {
-                return unreadable_snapshot(hwnd_raw, false);
-            }
+            // Foreground PID passed the denylist above; apps without UIA exposure are unreadable,
+            // not password controls.
+            Err(_) => return unreadable_snapshot(window, false),
         };
 
-        // Verify focused element belongs to the sampled foreground root window when a native HWND is reported
-        // SAFETY: `focused` is a valid COM `IUIAutomationElement`.
-        if let Ok(el_hwnd) = unsafe { focused.CurrentNativeWindowHandle() }
-            && !el_hwnd.0.is_null()
-        {
-            // SAFETY: `el_hwnd` is a non-null HWND returned by UIA.
-            let root = unsafe { GetAncestor(el_hwnd, GA_ROOT) };
-            if !root.0.is_null() && root.0 as isize != hwnd_raw {
-                return unreadable_snapshot(hwnd_raw, false);
+        // Windowless controls legitimately report HWND 0. When an HWND is present its
+        // root must match; a failed ownership or password query cannot classify the control.
+        // SAFETY: `focused` is a valid UIA element; GetAncestor takes its native HWND.
+        unsafe {
+            let Ok(el_hwnd) = focused.CurrentNativeWindowHandle() else {
+                return unreadable_snapshot(window, true);
+            };
+            let Ok(pid) = focused.CurrentProcessId() else {
+                return unreadable_snapshot(window, true);
+            };
+            if pid <= 0 || (pid as u32 != foreground_pid && is_denied_pid(pid as u32)) {
+                return unreadable_snapshot(window, true);
             }
-        }
-
-        // Also check focused element's own PID against the password-manager denylist
-        // SAFETY: `focused` is a valid COM `IUIAutomationElement`.
-        if let Ok(fpid) = unsafe { focused.CurrentProcessId() }
-            && fpid > 0
-            && is_denied_pid(fpid as u32)
-        {
-            return unreadable_snapshot(hwnd_raw, true);
-        }
-
-        // Hard password check: fail closed as Blocked on `E_ACCESSDENIED`, refuse UIA text on other COM errors
-        // SAFETY: `focused` is a valid COM `IUIAutomationElement`.
-        match unsafe { focused.CurrentIsPassword() } {
-            Ok(is_pw) if is_pw.as_bool() => {
-                return unreadable_snapshot(hwnd_raw, true);
+            if el_hwnd.0.is_null() {
+                if foreground_pid != pid as u32 {
+                    return unreadable_snapshot(window, true);
+                }
+            } else if GetAncestor(el_hwnd, GA_ROOT).0 as isize != hwnd_raw {
+                return unreadable_snapshot(window, true);
             }
-            Ok(_) => {}
-            Err(e) if e.code() == E_ACCESSDENIED => {
-                return unreadable_snapshot(hwnd_raw, true);
-            }
-            Err(_) => {
-                return unreadable_snapshot(hwnd_raw, false);
+            if !matches!(focused.CurrentIsPassword(), Ok(pw) if !pw.as_bool()) {
+                return unreadable_snapshot(window, true);
             }
         }
 
@@ -604,7 +555,7 @@ mod win_impl {
                 focused.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
                 && let Ok(selection) = text_pat.GetSelection()
                 && let Ok(len) = selection.Length()
-                && len >= 1
+                && len == 1
                 && let Ok(caret_range) = selection.GetElement(0)
                 && let Ok(before) = caret_range.Clone()
                 && before
@@ -618,57 +569,50 @@ mod win_impl {
                     .MoveEndpointByUnit(TextPatternRangeEndpoint_Start, TextUnit_Character, -96)
                     .is_ok()
             {
-                let mut out_of_element = false;
-                // Clamp `before` strictly within `RangeFromChild(&focused)` on BOTH lower and upper
-                // bounds so Chromium/Electron WebArea text providers never bleed across elements.
-                if let Ok(elem_range) = text_pat.RangeFromChild(&focused) {
-                    let starts_before = before.CompareEndpoints(
-                        TextPatternRangeEndpoint_Start,
-                        &elem_range,
-                        TextPatternRangeEndpoint_Start,
-                    );
-                    let end_after_start = before.CompareEndpoints(
-                        TextPatternRangeEndpoint_End,
-                        &elem_range,
-                        TextPatternRangeEndpoint_Start,
-                    );
-                    let end_before_end = before.CompareEndpoints(
-                        TextPatternRangeEndpoint_End,
-                        &elem_range,
-                        TextPatternRangeEndpoint_End,
-                    );
-                    if matches!(end_after_start, Ok(cmp) if cmp < 0)
-                        || matches!(end_before_end, Ok(cmp) if cmp > 0)
-                        || (matches!(starts_before, Ok(cmp) if cmp < 0)
-                            && matches!(end_after_start, Ok(cmp) if cmp >= 0)
-                            && before
-                                .MoveEndpointByRange(
-                                    TextPatternRangeEndpoint_Start,
-                                    &elem_range,
-                                    TextPatternRangeEndpoint_Start,
-                                )
-                                .is_err())
-                    {
-                        out_of_element = true;
-                    }
-                }
-                if out_of_element {
-                    // Abort cleanly instead of falling through to whole-box `ValuePattern`
-                    Some(unreadable_snapshot(hwnd_raw, false))
+                // Prefer `RangeFromChild(&focused)` so Chromium/Electron `WebArea` providers stay
+                // bounded to the focused box; fall back to `DocumentRange()` when `focused` owns
+                // the TextPattern directly.
+                let Ok(bounds) = text_pat
+                    .RangeFromChild(&focused)
+                    .or_else(|_| text_pat.DocumentRange())
+                else {
+                    return unreadable_snapshot(window, false);
+                };
+                let start = before.CompareEndpoints(
+                    TextPatternRangeEndpoint_Start,
+                    &bounds,
+                    TextPatternRangeEndpoint_Start,
+                );
+                let end_vs_start = before.CompareEndpoints(
+                    TextPatternRangeEndpoint_End,
+                    &bounds,
+                    TextPatternRangeEndpoint_Start,
+                );
+                let end_vs_end = before.CompareEndpoints(
+                    TextPatternRangeEndpoint_End,
+                    &bounds,
+                    TextPatternRangeEndpoint_End,
+                );
+                if !matches!(end_vs_start, Ok(n) if n >= 0)
+                    || !matches!(end_vs_end, Ok(n) if n <= 0)
+                    || !matches!(start, Ok(n) if n >= 0 || before.MoveEndpointByRange(
+                        TextPatternRangeEndpoint_Start, &bounds, TextPatternRangeEndpoint_Start
+                    ).is_ok())
+                {
+                    Some(unreadable_snapshot(window, false))
                 } else if let Ok(bstr) = before.GetText(512) {
                     if GetForegroundWindow().0 as isize != hwnd_raw {
-                        Some(unreadable_snapshot(hwnd_raw, false))
+                        Some(unreadable_snapshot(window, true))
                     } else {
                         let txt = bstr.to_string();
                         if looks_like_masked_password(&txt) {
-                            Some(unreadable_snapshot(hwnd_raw, true))
+                            Some(unreadable_snapshot(window, true))
                         } else {
                             Some(UiaSnapshot {
-                                hwnd: hwnd_raw,
-                                is_password: false,
-                                readable: true,
-                                before_caret: txt,
-                                updated_at: Some(Instant::now()),
+                                window,
+                                blocked: false,
+                                before_caret: Some(txt),
+                                updated_at: Instant::now(),
                             })
                         }
                     }
@@ -683,7 +627,8 @@ mod win_impl {
             return snap;
         }
 
-        // Fallback: IUIAutomationValuePattern ONLY for standard non-readonly Edit controls
+        // ValuePattern exposes the entire field, without a selection or caret. It can establish
+        // a masked or empty field, but a nonempty value cannot supply preceding text.
         // SAFETY: `focused` and `val_pat` are validated COM pointers on this MTA thread.
         let val_pat_res: Option<UiaSnapshot> = unsafe {
             if let Ok(ctype) = focused.CurrentControlType()
@@ -697,20 +642,20 @@ mod win_impl {
                     .unwrap_or(true);
                 if !is_ro && let Ok(bstr) = val_pat.CurrentValue() {
                     if GetForegroundWindow().0 as isize != hwnd_raw {
-                        Some(unreadable_snapshot(hwnd_raw, false))
+                        Some(unreadable_snapshot(window, true))
                     } else {
-                        let full = bstr.to_string();
-                        if looks_like_masked_password(&full) {
-                            Some(unreadable_snapshot(hwnd_raw, true))
-                        } else {
-                            let tail = tail_utf8_chars(&full, MAX_VALUE_PATTERN_TAIL_CHARS);
+                        if bstr.is_empty() {
                             Some(UiaSnapshot {
-                                hwnd: hwnd_raw,
-                                is_password: false,
-                                readable: true,
-                                before_caret: tail.to_string(),
-                                updated_at: Some(Instant::now()),
+                                window,
+                                blocked: false,
+                                before_caret: Some(String::new()),
+                                updated_at: Instant::now(),
                             })
+                        } else {
+                            Some(unreadable_snapshot(
+                                window,
+                                looks_like_masked_password(&bstr.to_string()),
+                            ))
                         }
                     }
                 } else {
@@ -724,7 +669,7 @@ mod win_impl {
             return snap;
         }
 
-        unreadable_snapshot(hwnd_raw, false)
+        unreadable_snapshot(window, false)
     }
 
     fn ensure_started() -> &'static UiaRuntime {
@@ -732,18 +677,13 @@ mod win_impl {
             let (tx, rx) = mpsc::sync_channel::<()>(1);
             let runtime = UiaRuntime {
                 tx,
-                snapshot: RwLock::new(UiaSnapshot {
-                    hwnd: 0,
-                    is_password: false,
-                    readable: false,
-                    before_caret: String::new(),
-                    updated_at: None,
-                }),
+                snapshot: RwLock::new((0, unreadable_snapshot((0, 0), false))),
             };
 
             let _ = thread::Builder::new()
                 .name("rime_neural_uia".to_string())
                 .spawn(move || {
+                    let rt = RUNTIME.wait();
                     // SAFETY: Initialize COM MTA on this dedicated UIA worker thread.
                     let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
                     if hr.is_err() {
@@ -789,6 +729,7 @@ mod win_impl {
 
                     let mut last_probe: Option<Instant> = None;
                     let mut last_hwnd: isize = 0;
+                    let mut last_epoch = 0;
                     let mut deferred_until: Option<Instant> = None;
 
                     loop {
@@ -814,40 +755,38 @@ mod win_impl {
                         }
 
                         let post_commit = POST_COMMIT_PENDING.swap(false, Ordering::AcqRel);
-                        let focus_changed = FOCUS_CHANGED_PENDING.swap(false, Ordering::AcqRel);
-                        if post_commit {
+                        let epoch = if post_commit {
                             // Wait briefly off the main thread so TSF finishes inserting committed
                             // text into Chromium / Electron / Word before probing UIA.
                             thread::sleep(POST_COMMIT_SETTLE_DELAY);
-                            if !POST_COMMIT_PENDING.load(Ordering::Acquire) {
-                                while rx.try_recv().is_ok() {}
-                            }
-                        } else if !focus_changed {
-                            // SAFETY: `GetForegroundWindow` is safe to invoke on any thread.
-                            let cur_hwnd = unsafe { GetForegroundWindow().0 as isize };
-                            if cur_hwnd == last_hwnd
-                                && let Some(t) = last_probe
-                            {
-                                let elapsed = t.elapsed();
-                                if elapsed < MIN_REFRESH_INTERVAL {
-                                    deferred_until = Some(t + MIN_REFRESH_INTERVAL);
-                                    continue;
+                            rt.snapshot.read().unwrap_or_else(|e| e.into_inner()).0
+                        } else {
+                            let ep = rt.snapshot.read().unwrap_or_else(|e| e.into_inner()).0;
+                            if ep == last_epoch {
+                                // SAFETY: `GetForegroundWindow` is safe to invoke on any thread.
+                                let cur_hwnd = unsafe { GetForegroundWindow().0 as isize };
+                                if cur_hwnd == last_hwnd
+                                    && let Some(t) = last_probe
+                                {
+                                    let elapsed = t.elapsed();
+                                    if elapsed < MIN_REFRESH_INTERVAL {
+                                        deferred_until = Some(t + MIN_REFRESH_INTERVAL);
+                                        continue;
+                                    }
                                 }
                             }
-                        }
+                            ep
+                        };
 
                         let snap = probe_once(&automation);
-                        last_hwnd = snap.hwnd;
-                        last_probe = snap.updated_at;
+                        last_hwnd = snap.window.0;
+                        last_probe = Some(snap.updated_at);
+                        last_epoch = epoch;
                         // Avoid overwriting a fresh post-commit refresh with an older in-flight probe.
                         if !post_commit && POST_COMMIT_PENDING.load(Ordering::Acquire) {
                             continue;
                         }
-                        if let Some(rt) = RUNTIME.get()
-                            && let Ok(mut guard) = rt.snapshot.write()
-                        {
-                            *guard = snap;
-                        }
+                        rt.publish(epoch, snap);
                     }
                 });
 
@@ -864,14 +803,8 @@ mod win_impl {
             let _ = rt.tx.try_send(());
         } else {
             ENABLED.store(false, Ordering::Release);
-            if let Some(rt) = RUNTIME.get()
-                && let Ok(mut guard) = rt.snapshot.write()
-            {
-                guard.hwnd = 0;
-                guard.is_password = false;
-                guard.readable = false;
-                guard.before_caret.clear();
-                guard.updated_at = None;
+            if let Some(rt) = RUNTIME.get() {
+                rt.invalidate((0, 0), false);
             }
         }
     }
@@ -884,18 +817,16 @@ mod win_impl {
         WORKER_ALIVE.load(Ordering::Acquire)
     }
 
-    /// Non-blocking hot-path query (< 2 µs). Returns `(context, foreground_hwnd)` sampled
-    /// atomically from the same `GetForegroundWindow()` call. Never waits on COM or UIA.
+    /// Return the sampled foreground HWND and the focus epoch of the snapshot used for context.
     pub fn query_context(
         live_preedit: &str,
         raw_input: &str,
         cand_preview: &str,
-    ) -> (UiaContext, isize) {
-        // SAFETY: `GetForegroundWindow` takes no arguments and never blocks.
-        let hwnd = unsafe { GetForegroundWindow() };
-        let cur_hwnd = hwnd.0 as isize;
+    ) -> (UiaContext, isize, u64) {
+        let window = foreground_window();
+        let (cur_hwnd, pid) = window;
         if !is_enabled() {
-            return (UiaContext::FallbackSameWindow, cur_hwnd);
+            return (UiaContext::FallbackSameWindow, cur_hwnd, 0);
         }
         let rt = ensure_started();
         let prev_hwnd = LAST_SEEN_HWND.swap(cur_hwnd, Ordering::AcqRel);
@@ -904,54 +835,40 @@ mod win_impl {
         let _ = rt.tx.try_send(());
 
         if cur_hwnd == 0 {
-            return (UiaContext::FallbackSameWindow, 0);
+            return (UiaContext::WindowChanged, 0, 0);
         }
 
-        // Immediate synchronous password-manager / terminal / PPL check (cached per (HWND, PID))
-        if is_denied_hwnd_cached(hwnd) {
-            return (UiaContext::Blocked, cur_hwnd);
+        if pid == 0 {
+            return (UiaContext::Blocked, cur_hwnd, 0);
+        }
+        if !is_worker_alive() {
+            return (UiaContext::WindowChanged, cur_hwnd, 0);
         }
 
-        let worker_alive = is_worker_alive();
         // Read latest cached snapshot (writer only holds lock for a ~100 ns struct move, never I/O)
-        if let Ok(snap) = rt.snapshot.read() {
-            let fresh = snap.updated_at.is_some_and(|t| t.elapsed() <= SNAPSHOT_TTL);
-            if snap.hwnd == cur_hwnd {
-                if snap.is_password {
-                    return (UiaContext::Blocked, cur_hwnd);
+        let cache = rt.snapshot.read().unwrap_or_else(|e| e.into_inner());
+        let (epoch, snap) = &*cache;
+        let context = if snap.window == window {
+            if snap.blocked {
+                UiaContext::Blocked
+            } else if snap.updated_at.elapsed() > SNAPSHOT_TTL {
+                UiaContext::WindowChanged
+            } else if let Some(raw) = &snap.before_caret {
+                let (text, preedit_stripped) =
+                    normalize_before_caret(raw, live_preedit, raw_input, cand_preview);
+                UiaContext::Text {
+                    text,
+                    preedit_stripped,
                 }
-                if worker_alive && snap.readable && fresh {
-                    let (text, preedit_stripped) = normalize_before_caret(
-                        &snap.before_caret,
-                        live_preedit,
-                        raw_input,
-                        cand_preview,
-                    );
-                    return (
-                        UiaContext::Text {
-                            text,
-                            preedit_stripped,
-                        },
-                        cur_hwnd,
-                    );
-                }
-                if prev_hwnd != 0 && prev_hwnd != cur_hwnd {
-                    return (UiaContext::WindowChanged, cur_hwnd);
-                }
-                return (UiaContext::FallbackSameWindow, cur_hwnd);
+            } else if prev_hwnd != 0 && prev_hwnd != cur_hwnd {
+                UiaContext::WindowChanged
+            } else {
+                UiaContext::FallbackSameWindow
             }
-            // Background worker has not yet finished probing `cur_hwnd` after a window switch:
-            // suppress stale cross-app `commit_history` only while worker is alive and snapshot is fresh.
-            if worker_alive && snap.hwnd != 0 && fresh {
-                return (UiaContext::WindowChanged, cur_hwnd);
-            }
-        }
-
-        if prev_hwnd != 0 && prev_hwnd != cur_hwnd {
-            (UiaContext::WindowChanged, cur_hwnd)
         } else {
-            (UiaContext::FallbackSameWindow, cur_hwnd)
-        }
+            UiaContext::WindowChanged
+        };
+        (context, cur_hwnd, *epoch)
     }
 
     pub fn foreground_hwnd() -> isize {
@@ -975,6 +892,27 @@ mod win_impl {
             let _ = rt.tx.try_send(());
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn in_flight_probe_cannot_replace_new_focus_at_same_hwnd() {
+            let window = (123, 456);
+            let (tx, _rx) = mpsc::sync_channel(1);
+            let rt = UiaRuntime {
+                tx,
+                snapshot: RwLock::new((0, unreadable_snapshot(window, false))),
+            };
+            let old_probe = unreadable_snapshot(window, false);
+            rt.invalidate(window, true);
+            rt.publish(0, old_probe);
+            assert!(rt.snapshot.read().unwrap().1.blocked);
+            rt.publish(1, unreadable_snapshot(window, false));
+            assert!(!rt.snapshot.read().unwrap().1.blocked);
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -991,8 +929,8 @@ mod win_impl {
         _live_preedit: &str,
         _raw_input: &str,
         _cand_preview: &str,
-    ) -> (UiaContext, isize) {
-        (UiaContext::FallbackSameWindow, 0)
+    ) -> (UiaContext, isize, u64) {
+        (UiaContext::FallbackSameWindow, 0, 0)
     }
     pub fn foreground_hwnd() -> isize {
         0

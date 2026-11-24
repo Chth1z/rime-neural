@@ -1,5 +1,5 @@
 use std::ffi::{c_char, c_double, c_int, c_longlong, c_void};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 pub type LuaState = *mut c_void;
 /// Lua 5.4 C function ABI using `extern "C-unwind"` so Lua 5.4 C++ exceptions / SEH unwinding
@@ -71,14 +71,7 @@ pub struct LuaApi {
     pub settop: unsafe extern "C-unwind" fn(LuaState, c_int),
 }
 
-// SAFETY: `LuaApi` holds only immutable C function pointers exported by the host Lua 5.4 module
-// which stays loaded for the lifetime of the process.
-unsafe impl Sync for LuaApi {}
-// SAFETY: Function pointers have no thread affinity.
-unsafe impl Send for LuaApi {}
-
 static API: OnceLock<LuaApi> = OnceLock::new();
-static API_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(windows)]
 pub unsafe fn get_api() -> Result<&'static LuaApi, &'static str> {
@@ -86,10 +79,6 @@ pub unsafe fn get_api() -> Result<&'static LuaApi, &'static str> {
     use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
     use windows::core::PCSTR;
 
-    if let Some(api) = API.get() {
-        return Ok(api);
-    }
-    let _guard = API_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(api) = API.get() {
         return Ok(api);
     }
@@ -177,8 +166,7 @@ pub unsafe fn get_api() -> Result<&'static LuaApi, &'static str> {
         rawseti: sym!("lua_rawseti"),
         settop: sym!("lua_settop"),
     };
-    let _ = API.set(api);
-    API.get().ok_or("LuaApi initialization race")
+    Ok(API.get_or_init(|| api))
 }
 
 #[cfg(not(windows))]

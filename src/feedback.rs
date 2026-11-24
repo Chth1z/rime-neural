@@ -189,97 +189,44 @@ enum RotateError {
 
 fn atomic_rotate(src: &Path, dst: &Path) -> Result<(), RotateError> {
     reject_symlink_or_dir(dst).map_err(RotateError::Hard)?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MoveFileExW};
-        use windows::core::PCWSTR;
-
-        let wsrc: Vec<u16> = src
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let wdst: Vec<u16> = dst
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        // SAFETY: Both `wsrc` and `wdst` are valid NUL-terminated UTF-16 paths; `MoveFileExW`
-        // with `MOVEFILE_REPLACE_EXISTING` replaces `dst` atomically without deleting it first.
-        match unsafe {
-            MoveFileExW(
-                PCWSTR(wsrc.as_ptr()),
-                PCWSTR(wdst.as_ptr()),
-                MOVEFILE_REPLACE_EXISTING,
-            )
-        } {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let os_err = std::io::Error::last_os_error();
-                let msg = format!("MoveFileExW rotating {}: {} ({})", src.display(), e, os_err);
-                // Sharing violation (32) / lock violation (33) can happen transiently while
-                // `tune-fusion.py` or antivirus reads `feedback.jsonl.1`.
-                if matches!(os_err.raw_os_error(), Some(32 | 33)) {
-                    Err(RotateError::Transient(msg))
-                } else {
-                    Err(RotateError::Hard(msg))
-                }
-            }
+    fs::rename(src, dst).map_err(|e| {
+        let msg = format!("rename {}: {}", src.display(), e);
+        // A reader or antivirus may briefly lock either name during a Windows replacement.
+        if cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33)) {
+            RotateError::Transient(msg)
+        } else {
+            RotateError::Hard(msg)
         }
-    }
-    #[cfg(not(windows))]
-    {
-        fs::rename(src, dst)
-            .map_err(|e| RotateError::Hard(format!("rename {}: {}", src.display(), e)))
-    }
+    })
 }
 
 fn open_append_no_reparse(log_path: &Path) -> Result<File, String> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        use std::os::windows::io::AsRawHandle;
-        use windows::Win32::Foundation::HANDLE;
-        use windows::Win32::Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-            FILE_FLAG_OPEN_REPARSE_POINT, GetFileInformationByHandle,
-        };
-
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-            .open(log_path)
-            .map_err(|e| format!("open {}: {}", log_path.display(), e))?;
-        let mut info = BY_HANDLE_FILE_INFORMATION::default();
-        // SAFETY: `file.as_raw_handle()` is a valid open Win32 file handle and `info` is writable.
-        unsafe {
-            GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info)
-                .map_err(|e| format!("GetFileInformationByHandle {}: {}", log_path.display(), e))?;
-        }
-        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0 {
-            return Err(format!(
-                "refusing to write reparse point handle: {}",
-                log_path.display()
-            ));
-        }
-        if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) != 0 {
-            return Err(format!(
-                "refusing to write directory handle: {}",
-                log_path.display()
-            ));
-        }
-        Ok(file)
+        use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
     }
-    #[cfg(not(windows))]
+    let file = options
+        .open(log_path)
+        .map_err(|e| format!("open {}: {}", log_path.display(), e))?;
+    #[cfg(windows)]
     {
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-            .map_err(|e| format!("open {}: {}", log_path.display(), e))
+        // File::metadata queries the opened handle, so a replacement after the path check
+        // cannot turn this append into a write through a reparse point.
+        let meta = file
+            .metadata()
+            .map_err(|e| format!("opened file metadata {}: {}", log_path.display(), e))?;
+        if !meta.is_file() || is_reparse_point(&meta) {
+            return Err(format!(
+                "refusing to write non-regular file or reparse point handle: {}",
+                log_path.display()
+            ));
+        }
     }
+    Ok(file)
 }
 
 fn append_feedback_with_cap(

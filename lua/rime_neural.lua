@@ -483,30 +483,31 @@ end
 --- Resolve preceding context with strict cross-app isolation, password protection, and per-
 --- composition freezing (preventing 1-keystroke lagged inline-preedit pollution and KV-cache
 --- thrashing under Weasel's default `inline_preedit: true`).
---- Returns `(normalized_ctx_str, is_password_blocked, comp_prefix)`.
+--- Returns the model context and whether this focus permits feedback.
 local function get_preceding_context(context, segment_start, first_preedit, raw_seg, first_cand_text, env)
     local comp_prefix = collect_composition_prefix(context, segment_start)
-    local is_trad = is_traditional_mode(context)
     local base_ctx = ""
 
-    if env.enable_uia and native_mod and type(native_mod.query_uia_context) == "function" then
+    if env.enable_uia then
+        if type(native_mod.query_uia_context) ~= "function" then
+            return utf8_tail_bytes(comp_prefix, 384), false
+        end
         local full_preedit = preedit_before_caret(context, first_preedit)
         local frozen = env.comp_ctx
-        -- Only pass `cand_preview` on the initial capture of a composition so repeated words
-        -- mid-composition are never falsely stripped.
-        local preview_arg = (frozen == nil) and (first_cand_text or "") or ""
-        local status, uia_text, hwnd, preedit_stripped = native_mod.query_uia_context(
-            full_preedit, raw_seg or "", preview_arg
+        local status, uia_text, hwnd, preedit_stripped, focus_epoch = native_mod.query_uia_context(
+            full_preedit, raw_seg, first_cand_text
         )
-        if status == "blocked" then
+        if status ~= "text" and status ~= "fallback" then
             env.comp_ctx = nil
-            return "", true, comp_prefix
-        end
-
-        if frozen and frozen.hwnd == hwnd and status ~= "window_changed" then
+            env.last_commit_focus = nil
+            return status == "window_changed" and utf8_tail_bytes(comp_prefix, 384) or "", false
+        elseif frozen and frozen.base_ctx
+            and frozen.hwnd == hwnd and frozen.focus_epoch == focus_epoch
+        then
             base_ctx = frozen.base_ctx
         elseif status == "text" then
             if uia_text and #uia_text > 0 then
+                local is_trad = is_traditional_mode(context)
                 base_ctx = normalize_to_simplified(utf8_tail_bytes(uia_text, 384), is_trad, env)
                 -- Under Traditional mode + `preedit_type: preview`, Weasel echoes the Traditional
                 -- candidate inline; only strip its Simplified equivalent on initial capture when
@@ -521,77 +522,97 @@ local function get_preceding_context(context, segment_start, first_preedit, raw_
                     base_ctx = trim_ws(base_ctx:sub(1, #base_ctx - #first_cand_text))
                 end
             end
-            env.comp_ctx = { hwnd = hwnd, base_ctx = base_ctx }
-        elseif status == "window_changed" then
-            base_ctx = ""
-            env.comp_ctx = nil
+            env.comp_ctx = { hwnd = hwnd, focus_epoch = focus_epoch, base_ctx = base_ctx }
         else
-            local hist_parts = {}
-            append_commit_history(hist_parts, context)
-            if #hist_parts > 0 then
-                base_ctx = normalize_to_simplified(utf8_tail_bytes(table.concat(hist_parts), 384), is_trad, env)
+            -- Non-TextPattern classified control (e.g. WeChat, QQ, IDE canvas): reuse Rime's
+            -- session commit history only while (hwnd, focus_epoch) matches the last commit in
+            -- this same control, preventing cross-control bleed on focus moves.
+            local prev_commit = env.last_commit_focus
+            if prev_commit and prev_commit.hwnd == hwnd and prev_commit.focus_epoch == focus_epoch then
+                local hist_parts = {}
+                append_commit_history(hist_parts, context)
+                if #hist_parts > 0 then
+                    local history = utf8_tail_bytes(table.concat(hist_parts), 384)
+                    base_ctx = normalize_to_simplified(history, is_traditional_mode(context), env)
+                end
+                env.comp_ctx = { hwnd = hwnd, focus_epoch = focus_epoch, base_ctx = base_ctx }
+            else
+                env.comp_ctx = { hwnd = hwnd, focus_epoch = focus_epoch }
             end
-            env.comp_ctx = { hwnd = hwnd, base_ctx = base_ctx }
         end
     else
         local hist_parts = {}
         append_commit_history(hist_parts, context)
         if #hist_parts > 0 then
-            base_ctx = normalize_to_simplified(utf8_tail_bytes(table.concat(hist_parts), 384), is_trad, env)
+            local history = utf8_tail_bytes(table.concat(hist_parts), 384)
+            base_ctx = normalize_to_simplified(history, is_traditional_mode(context), env)
         end
     end
 
     if #base_ctx == 0 then
-        return utf8_tail_bytes(comp_prefix, 384), false, comp_prefix
+        return utf8_tail_bytes(comp_prefix, 384), true
     end
     -- Deduplicate confirmed multi-segment prefix after Simplified normalization so Traditional UIA
     -- text (`我們`) and Simplified `comp_prefix` (`我们`) never double up.
     if #comp_prefix > 0 and base_ctx:sub(-#comp_prefix) ~= comp_prefix then
-        return utf8_tail_bytes(base_ctx .. comp_prefix, 384), false, comp_prefix
+        return utf8_tail_bytes(base_ctx .. comp_prefix, 384), true
     end
-    return utf8_tail_bytes(base_ctx, 384), false, comp_prefix
+    return utf8_tail_bytes(base_ctx, 384), true
 end
 
---- Extract the pre-OpenCC genuine Simplified committed text strictly for the reranked segment
---- range `[seg_start, seg_end)` when available. Preserves accurate matching even when the user
---- commits a sentence by pressing trailing punctuation (`,`, `.`, `?`, `!`, `:`, `;`).
-local function extract_genuine_commit(ctx, env, seg_start, seg_end)
-    if ctx.composition and type(ctx.composition.toSegmentation) == "function" then
-        local ok_s, segs = pcall(ctx.composition.toSegmentation, ctx.composition)
-        if ok_s and segs and segs.size and segs.size > 0 then
-            local parts = {}
-            local all_ok = true
-            local matched_range = false
-            for i = 0, segs.size - 1 do
-                local seg = segs:get_at(i)
-                if seg then
-                    local in_range = (seg_start == nil or seg_end == nil)
-                        or (seg.start >= seg_start and seg._end <= seg_end)
-                    if in_range then
-                        matched_range = true
-                        local cand = seg:get_selected_candidate()
-                        local g = cand and cand:get_genuine()
-                        local txt = (g and g.text and #g.text > 0) and g.text or (cand and cand.text)
-                        if txt and #txt > 0 then
-                            parts[#parts + 1] = txt
-                        else
-                            all_ok = false
+-- OpenCC followed by uniquifier can merge distinct source sentences into one visible choice.
+local function menu_source_text(cand, snap)
+    if not cand or cand.start ~= snap.seg_start or cand._end ~= snap.seg_end then
+        return nil
+    end
+    local sources = cand:get_genuines()
+    if not sources or #sources == 0 then
+        return nil
+    end
+    local text = sources[1].text
+    for i = 2, #sources do
+        if sources[i].text ~= text then
+            return nil
+        end
+    end
+    return text
+end
+
+-- The commit notifier runs before Rime clears the composition. Read the actual menu after
+-- downstream filtering (including OpenCC and uniquifier), matching the selected input range.
+local function committed_choice(ctx, snap)
+    if not ctx.input or ctx.input:sub(1, snap.seg_end) ~= snap.input_prefix then
+        return
+    end
+    local segs = ctx.composition and ctx.composition:toSegmentation()
+    if not segs then
+        return
+    end
+    for i = 0, segs.size - 1 do
+        local seg = segs:get_at(i)
+        if seg and seg.start == snap.seg_start then
+            local cand = seg:get_selected_candidate()
+            local chosen = menu_source_text(cand, snap)
+            if not chosen then
+                return
+            end
+            local top1 = menu_source_text(seg:get_candidate_at(0), snap)
+            local p2c_shown = false
+            if snap.p2c_text then
+                p2c_shown = chosen == snap.p2c_text or top1 == snap.p2c_text
+                if not p2c_shown and seg.menu then
+                    -- Only inspect entries Rime has already prepared for this menu.
+                    for j = 1, seg.menu:candidate_count() - 1 do
+                        if menu_source_text(seg:get_candidate_at(j), snap) == snap.p2c_text then
+                            p2c_shown = true
                             break
                         end
                     end
                 end
             end
-            if matched_range and all_ok and #parts > 0 then
-                return table.concat(parts), true
-            end
+            return chosen, top1, seg.selected_index + 1, p2c_shown
         end
     end
-
-    local committed = ctx:get_commit_text() or ""
-    if #committed > 0 then
-        return normalize_to_simplified(committed, is_traditional_mode(ctx), env), false
-    end
-    return committed, false
 end
 
 local function detect_namespace(cfg)
@@ -697,24 +718,26 @@ local function load_allowed_tags(cfg, ns)
     return { abc = true }
 end
 
-local function segment_matches_tags(ctx, allowed_tags)
-    local comp = ctx.composition
-    if not comp or type(comp.back) ~= "function" then
-        return true, nil
+local function clear_unless_trailing_punct(env, is_punct, start)
+    local snap = env.last_rerank
+    if snap and is_punct and start == snap.seg_end
+        and env.engine.context.input:sub(1, start) == snap.input_prefix
+    then
+        return
     end
-    local ok_b, seg = pcall(comp.back, comp)
-    if not ok_b or not seg then
-        return true, nil
-    end
-    if type(seg.has_tag) ~= "function" then
-        return true, seg
-    end
-    for tag, _ in pairs(allowed_tags) do
+    env.last_rerank = nil
+end
+
+-- librime calls this for the segment whose menu it is building. composition:back() may
+-- already be a later punctuation or reverse-lookup segment.
+function M.tags_match(seg, env)
+    for tag in pairs(env.tags) do
         if seg:has_tag(tag) then
-            return true, seg
+            return true
         end
     end
-    return false, seg
+    clear_unless_trailing_punct(env, seg:has_tag("punct"), seg.start)
+    return false
 end
 
 function M.init(env)
@@ -863,17 +886,44 @@ function M.init(env)
     if env.ready and (env.log_feedback or env.enable_uia)
         and env.engine.context and env.engine.context.commit_notifier
     then
+        -- Clear() also runs on cancellation, when there is no commit or new segment to filter.
+        if env.engine.context.update_notifier then
+            env.update_conn = env.engine.context.update_notifier:connect(function(ctx)
+                if (env.comp_ctx or env.last_rerank) and not ctx:is_composing() then
+                    env.comp_ctx = nil
+                    env.last_rerank = nil
+                end
+            end)
+        end
         env.commit_conn = env.engine.context.commit_notifier:connect(function(ctx)
             -- Always unfreeze per-composition UIA snapshot on commit so next sentence reads fresh text
+            local prev_focus = env.comp_ctx
             env.comp_ctx = nil
 
             local rerank_on = is_rerank_enabled(ctx, env)
-            if env.enable_uia
+            local uia_ok = env.enable_uia
                 and rerank_on
                 and not ctx:get_option("ascii_mode")
                 and native_mod
                 and native_mod.is_ready()
+
+            -- Sample live focus once so both same-control fallback history and feedback verification
+            -- share a single non-blocking check.
+            local live_status, live_hwnd, live_epoch = nil, 0, 0
+            if env.enable_uia and native_mod and type(native_mod.query_uia_context) == "function"
+                and (prev_focus or (env.last_rerank and env.last_rerank.focus))
             then
+                live_status, _, live_hwnd, _, live_epoch = native_mod.query_uia_context("", "", "")
+            end
+            if prev_focus and (live_status == "text" or live_status == "fallback")
+                and live_hwnd == prev_focus.hwnd and live_epoch == prev_focus.focus_epoch
+            then
+                env.last_commit_focus = { hwnd = live_hwnd, focus_epoch = live_epoch }
+            else
+                env.last_commit_focus = nil
+            end
+
+            if uia_ok then
                 if type(native_mod.kick_uia_after_commit) == "function" then
                     native_mod.kick_uia_after_commit()
                 elseif type(native_mod.kick_uia_refresh) == "function" then
@@ -886,68 +936,39 @@ function M.init(env)
             end
             local snap = env.last_rerank
             env.last_rerank = nil
-            if not snap or snap.blocked or not native_mod or type(native_mod.log_feedback) ~= "function" then
+            if not snap or not rerank_on or not native_mod or type(native_mod.log_feedback) ~= "function" then
                 return
             end
             if ctx:get_option("ascii_mode") then
                 return
             end
 
-            local norm_commit, from_range = extract_genuine_commit(ctx, env, snap.seg_start, snap.seg_end)
-            if not from_range
-                and snap.comp_prefix and #snap.comp_prefix > 0
-                and norm_commit:sub(1, #snap.comp_prefix) == snap.comp_prefix
-            then
-                norm_commit = norm_commit:sub(#snap.comp_prefix + 1)
-            end
-            if #norm_commit < 6 or is_pure_ascii(norm_commit) then
-                return
-            end
-
-            local chosen_rank = 0
-            for i = 1, #snap.shown do
-                if snap.shown[i] == norm_commit then
-                    chosen_rank = i
-                    break
-                end
-            end
-            if chosen_rank == 0 then
-                local top1 = snap.shown[1] or ""
-                if math.abs(#norm_commit - #top1) > 6 then
+            if snap.focus then
+                if (live_status ~= "text" and live_status ~= "fallback")
+                    or live_hwnd ~= snap.focus.hwnd or live_epoch ~= snap.focus.focus_epoch
+                then
                     return
                 end
+            end
+            local chosen, top1, chosen_rank, p2c_shown = committed_choice(ctx, snap)
+            if not chosen then
+                return
             end
 
             -- Derive purely numeric indices in memory; never persist user text, keystrokes, or UIA context.
             local chosen_idx = -1
+            local shown_top1_idx = (p2c_shown and top1 == snap.p2c_text) and -2 or -1
             for i = 1, #snap.cands do
-                if snap.cands[i] == norm_commit then
+                if snap.cands[i] == chosen then
                     chosen_idx = i - 1
-                    break
+                end
+                if snap.cands[i] == top1 then
+                    shown_top1_idx = i - 1
                 end
             end
-            local p2c_shown = (type(snap.p2c_text) == "string" and #snap.p2c_text > 0)
-            local p2c_chosen = p2c_shown and (chosen_idx < 0) and (norm_commit == snap.p2c_text)
-            local shown_top1_idx = -1
-            local top1_text = snap.shown[1] or ""
-            if p2c_shown and top1_text == snap.p2c_text then
-                shown_top1_idx = -2
-                for i = 1, #snap.cands do
-                    if snap.cands[i] == top1_text then
-                        shown_top1_idx = i - 1
-                        break
-                    end
-                end
-            else
-                for i = 1, #snap.cands do
-                    if snap.cands[i] == top1_text then
-                        shown_top1_idx = i - 1
-                        break
-                    end
-                end
-            end
+            local p2c_chosen = chosen_idx < 0 and chosen == snap.p2c_text
 
-            -- Log 100% of multi-candidate commits as zero-plaintext numeric features
+            -- Log every eligible multi-candidate commit as zero-plaintext numeric features
             -- (bounded by feedback.rs 5 MiB auto-rotation).
             native_mod.log_feedback(
                 env.schema_id,
@@ -1012,45 +1033,10 @@ function M.func(input, env)
     end
 
     local cur_input = ctx.input or ""
-    if #cur_input <= 1 then
-        -- Brand-new composition: unfreeze previous composition's UIA snapshot and pre-warm UIA
-        env.comp_ctx = nil
-    end
     -- Pre-warm UIA snapshot asynchronously on early keystrokes (< 1 µs) so context is already
     -- fresh when keystroke 4+ triggers neural reranking (even after window switch or idle pause).
     if env.enable_uia and #cur_input <= 2 and type(native_mod.kick_uia_refresh) == "function" then
         native_mod.kick_uia_refresh()
-    end
-
-    -- Clear snapshot on every non-rerank transition EXCEPT when a trailing punctuation segment
-    -- (`,`, `.`, `?`, `!`, `:`, `;`) immediately follows the reranked sentence right before auto-commit.
-    local function maybe_clear_snapshot(is_trailing_punct, cand_start)
-        local snap = env.last_rerank
-        if not snap then
-            return
-        end
-        if is_trailing_punct
-            and cand_start == snap.seg_end
-            and #cur_input > #snap.full_input
-            and cur_input:sub(1, #snap.full_input) == snap.full_input
-        then
-            return
-        end
-        env.last_rerank = nil
-    end
-
-    -- Respect configured segment tags (default `abc`) so reverse-lookup / radical / stroke
-    -- `script_translator` segments are never sent to the Mandarin pinyin reranker.
-    local tags_ok, active_seg = segment_matches_tags(ctx, env.tags)
-    if not tags_ok then
-        local is_punct = active_seg ~= nil
-            and type(active_seg.has_tag) == "function"
-            and active_seg:has_tag("punct")
-        maybe_clear_snapshot(is_punct, active_seg and active_seg.start or -1)
-        for cand in input:iter() do
-            yield(cand)
-        end
-        return
     end
 
     local max_k = env.max_candidates
@@ -1071,7 +1057,7 @@ function M.func(input, env)
             return
         end
         if #sent_cands >= 2 then
-            local pre_ctx, is_blocked, comp_prefix = get_preceding_context(
+            local pre_ctx, allow_feedback = get_preceding_context(
                 ctx,
                 seg_start,
                 first_preedit,
@@ -1095,37 +1081,17 @@ function M.func(input, env)
                     p2c_cand.preedit = first_preedit
                 end
 
-                local emit_list = {}
-                local shown_texts = {}
-                if p2c_cand and res.p2c_pos == 1 then
-                    emit_list[#emit_list + 1] = p2c_cand
-                    shown_texts[#shown_texts + 1] = res.p2c_text
-                end
-                for i = 1, #res.order do
-                    local idx = res.order[i]
-                    local c = sent_cands[idx]
-                    if c then
-                        emit_list[#emit_list + 1] = c
-                        shown_texts[#shown_texts + 1] = sent_texts[idx]
-                        if #emit_list == 1 and p2c_cand and res.p2c_pos == 2 then
-                            emit_list[#emit_list + 1] = p2c_cand
-                            shown_texts[#shown_texts + 1] = res.p2c_text
-                        end
-                    end
-                end
-
-                local has_ctx_flag = res.has_ctx
-                if type(has_ctx_flag) ~= "boolean" then
-                    has_ctx_flag = (utf8_char_count(trim_ws(pre_ctx)) >= 2)
-                end
-
                 -- Record snapshot BEFORE yielding (Rime Menu is lazy and pauses coroutine after page 1)
-                if env.log_feedback then
+                if env.log_feedback and allow_feedback then
+                    local has_ctx_flag = res.has_ctx
+                    if type(has_ctx_flag) ~= "boolean" then
+                        has_ctx_flag = (utf8_char_count(trim_ws(pre_ctx)) >= 2)
+                    end
                     env.last_rerank = {
-                        full_input = cur_input,
+                        input_prefix = cur_input:sub(1, seg_end),
                         seg_start = seg_start,
                         seg_end = seg_end,
-                        comp_prefix = comp_prefix,
+                        focus = env.comp_ctx,
                         has_ctx = has_ctx_flag,
                         has_gram = (res.has_gram == true),
                         cands = sent_texts,
@@ -1133,13 +1099,16 @@ function M.func(input, env)
                         gram_deltas = res.gram_deltas or {},
                         char_lps = res.char_lps or {},
                         p2c_text = (p2c_cand and res.p2c_text) or nil,
-                        shown = shown_texts,
-                        blocked = is_blocked,
                     }
+                else
+                    env.last_rerank = nil
                 end
 
-                for i = 1, #emit_list do
-                    yield(emit_list[i])
+                for i, idx in ipairs(res.order) do
+                    if p2c_cand and i == res.p2c_pos then
+                        yield(p2c_cand)
+                    end
+                    yield(sent_cands[idx])
                 end
                 return
             else
@@ -1160,7 +1129,7 @@ function M.func(input, env)
             is_first = false
             local g0 = cand:get_genuine()
             if not g0 or g0.type ~= "sentence" then
-                maybe_clear_snapshot(g0 ~= nil and g0.type == "punct", cand.start)
+                clear_unless_trailing_punct(env, g0 ~= nil and g0.type == "punct", cand.start)
                 passthrough = true
                 yield(cand)
             else
@@ -1226,19 +1195,23 @@ function M.func(input, env)
 
     if is_first then
         env.last_rerank = nil
-        env.comp_ctx = nil
     elseif not passthrough and not flushed and sent_cands then
         flush_sentences()
     end
 end
 
 function M.fini(env)
+    if env.update_conn then
+        pcall(function() env.update_conn:disconnect() end)
+        env.update_conn = nil
+    end
     if env.commit_conn then
         pcall(function() env.commit_conn:disconnect() end)
         env.commit_conn = nil
     end
     env.last_rerank = nil
     env.comp_ctx = nil
+    env.last_commit_focus = nil
     env.norm_cache = nil
     env.t2s_override = nil
 end
