@@ -142,9 +142,9 @@ fn reject_symlink_or_dir(path: &Path) -> Result<(), String> {
                     path.display()
                 ));
             }
-            if meta.is_dir() {
+            if !meta.file_type().is_file() {
                 return Err(format!(
-                    "refusing to write directory path: {}",
+                    "refusing to write non-regular file path: {}",
                     path.display()
                 ));
             }
@@ -209,13 +209,17 @@ fn open_append_no_reparse(log_path: &Path) -> Result<File, String> {
         use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
     let file = options
         .open(log_path)
         .map_err(|e| format!("open {}: {}", log_path.display(), e))?;
-    #[cfg(windows)]
     {
-        // File::metadata queries the opened handle, so a replacement after the path check
-        // cannot turn this append into a write through a reparse point.
+        // File::metadata queries the opened handle/fd, so a replacement after the path check
+        // cannot turn this append into a write through a symlink or reparse point.
         let meta = file
             .metadata()
             .map_err(|e| format!("opened file metadata {}: {}", log_path.display(), e))?;

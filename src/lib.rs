@@ -3,6 +3,7 @@ mod feedback;
 mod gram;
 mod lua_api;
 mod pinyin;
+mod typo;
 mod uia;
 
 use std::ffi::c_int;
@@ -502,8 +503,30 @@ unsafe extern "C-unwind" fn lua_set_uia_enabled(l: LuaState) -> c_int {
     1
 }
 
+/// set_doc_entities_enabled(bool)
+unsafe extern "C-unwind" fn lua_set_doc_entities_enabled(l: LuaState) -> c_int {
+    // SAFETY: Invoked by Lua 5.4 host with valid `lua_State*`.
+    let Ok(api) = (unsafe { get_api() }) else {
+        return 0;
+    };
+    // SAFETY: `l` is valid for this C call.
+    let enable = unsafe { (api.toboolean)(l, 1) != 0 };
+    let ok = catch_unwind(AssertUnwindSafe(|| {
+        uia::set_doc_entities_enabled(enable);
+    }))
+    .is_ok();
+    // SAFETY: Push 1 boolean onto `l`.
+    unsafe {
+        if (api.checkstack)(l, 2) == 0 {
+            return 0;
+        }
+        (api.pushboolean)(l, if ok { 1 } else { 0 });
+    }
+    1
+}
+
 /// query_uia_context(live_preedit, raw_input, [cand_preview])
-///   -> (status_str, text_str, hwnd_int, preedit_stripped_bool, focus_epoch)
+///   -> (status_str, text_str, hwnd_int, preedit_stripped_bool, focus_epoch, entity_text_str)
 unsafe extern "C-unwind" fn lua_query_uia_context(l: LuaState) -> c_int {
     // SAFETY: Invoked by Lua 5.4 host with valid `lua_State*`.
     let Ok(api) = (unsafe { get_api() }) else {
@@ -522,18 +545,20 @@ unsafe extern "C-unwind" fn lua_query_uia_context(l: LuaState) -> c_int {
     }));
     let (context, hwnd, epoch) =
         res.unwrap_or_else(|_| (UiaContext::Blocked, uia::foreground_hwnd(), 0));
-    let (status, text, stripped) = match context {
-        UiaContext::Blocked => ("blocked", String::new(), false),
+    let (status, text, stripped, entity_text) = match context {
+        UiaContext::Blocked => ("blocked", String::new(), false, String::new()),
         UiaContext::Text {
             text,
             preedit_stripped,
-        } => ("text", text, preedit_stripped),
-        UiaContext::WindowChanged => ("window_changed", String::new(), false),
-        UiaContext::FallbackSameWindow => ("fallback", String::new(), false),
+            entity_text,
+        } => ("text", text, preedit_stripped, entity_text),
+        UiaContext::WindowChanged => ("window_changed", String::new(), false, String::new()),
+        UiaContext::FallbackSameWindow => ("fallback", String::new(), false, String::new()),
+        UiaContext::Unavailable => ("unavailable", String::new(), false, String::new()),
     };
-    // SAFETY: Push 5 return values onto `l` after ensuring stack capacity.
+    // SAFETY: Push 6 return values onto `l` after ensuring stack capacity.
     unsafe {
-        if (api.checkstack)(l, 6) == 0 {
+        if (api.checkstack)(l, 7) == 0 {
             return 0;
         }
         push_str(api, l, status);
@@ -541,7 +566,8 @@ unsafe extern "C-unwind" fn lua_query_uia_context(l: LuaState) -> c_int {
         (api.pushinteger)(l, hwnd as LuaInteger);
         (api.pushboolean)(l, stripped.into());
         (api.pushinteger)(l, epoch as LuaInteger);
-        5
+        push_str(api, l, &entity_text);
+        6
     }
 }
 
@@ -557,7 +583,7 @@ unsafe extern "C-unwind" fn lua_kick_uia_after_commit(_l: LuaState) -> c_int {
     0
 }
 
-/// rerank(context, raw_input, layout_str_or_bool, cands_tbl, weights_tbl, [p2c_cfg_tbl], [gram_cfg_tbl])
+/// rerank(context, raw_input, layout_str_or_bool, cands_tbl, weights_tbl, [p2c_cfg_tbl], [gram_cfg_tbl], [entity_ctx_str])
 unsafe extern "C-unwind" fn lua_rerank(l: LuaState) -> c_int {
     // SAFETY: Invoked by Lua 5.4 host with valid `lua_State*`.
     let Ok(api) = (unsafe { get_api() }) else {
@@ -577,16 +603,24 @@ unsafe extern "C-unwind" fn lua_rerank(l: LuaState) -> c_int {
             read_weights(api, l, 5),
             read_p2c_cfg(api, l, 6),
             read_gram_req(api, l, 7),
+            read_str(api, l, 8).unwrap_or_default(),
         )
     };
-    let (ctx, raw_input, layout, cands, weights, p2c_cfg, gram_req) = args;
+    let (ctx, raw_input, layout, cands, weights, p2c_cfg, gram_req, entity_ctx) = args;
     let res = catch_unwind(AssertUnwindSafe(
         || -> Result<engine::RerankResult, String> {
             if !engine::is_ready() {
                 return Err("not ready".to_string());
             }
             engine::rerank(
-                &ctx, &raw_input, layout, &cands, weights, p2c_cfg, &gram_req,
+                &ctx,
+                &entity_ctx,
+                &raw_input,
+                layout,
+                &cands,
+                weights,
+                p2c_cfg,
+                &gram_req,
             )
         },
     ));
@@ -928,6 +962,93 @@ unsafe extern "C-unwind" fn lua_log_feedback(l: LuaState) -> c_int {
     }
 }
 
+/// suggest_typo_inputs(raw_input, layout_str_or_bool, [mode_str], [max_results])
+///   -> array of { input = "...", cost = f64, kind = "..." }
+unsafe extern "C-unwind" fn lua_suggest_typo_inputs(l: LuaState) -> c_int {
+    // SAFETY: Invoked by Lua 5.4 host with valid `lua_State*`.
+    let Ok(api) = (unsafe { get_api() }) else {
+        return 0;
+    };
+    // SAFETY: Extract arguments outside `catch_unwind`.
+    let (raw_input, layout, span_mode, max_results) = unsafe {
+        let raw = read_str(api, l, 1).unwrap_or_default();
+        let layout = read_layout(api, l, 2);
+        let mode = read_str(api, l, 3).unwrap_or_default();
+        let mut isnum: c_int = 0;
+        let max_n = (api.tointegerx)(l, 4, &mut isnum);
+        let cap = if isnum != 0 && max_n > 0 {
+            (max_n as usize).min(32)
+        } else {
+            6
+        };
+        (raw, layout, mode == "span", cap)
+    };
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        engine::suggest_typo_inputs(&raw_input, layout, span_mode, max_results)
+    }));
+    // SAFETY: Push Lua array of tables using `rawset_field`.
+    unsafe {
+        if (api.checkstack)(l, 8) == 0 {
+            return 0;
+        }
+        match res {
+            Ok(Ok(items)) => {
+                (api.createtable)(l, items.len() as c_int, 0);
+                for (i, item) in items.iter().enumerate() {
+                    (api.createtable)(l, 0, 3);
+                    rawset_field(api, l, "input", |api, l| push_str(api, l, &item.input));
+                    rawset_field(api, l, "cost", |api, l| {
+                        (api.pushnumber)(l, item.edit_cost as f64)
+                    });
+                    rawset_field(api, l, "kind", |api, l| push_str(api, l, item.kind));
+                    (api.rawseti)(l, -2, (i + 1) as LuaInteger);
+                }
+                1
+            }
+            _ => {
+                (api.createtable)(l, 0, 0);
+                1
+            }
+        }
+    }
+}
+
+/// score_gram(cands_tbl, [gram_cfg_tbl]) -> (scores_tbl, has_gram_bool)
+unsafe extern "C-unwind" fn lua_score_gram(l: LuaState) -> c_int {
+    // SAFETY: Invoked by Lua 5.4 host with valid `lua_State*`.
+    let Ok(api) = (unsafe { get_api() }) else {
+        return 0;
+    };
+    // SAFETY: Extract arguments outside `catch_unwind`.
+    let (cands, gram_req) = unsafe {
+        if (api.checkstack)(l, 6) == 0 {
+            return 0;
+        }
+        (read_str_array(api, l, 1), read_gram_req(api, l, 2))
+    };
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        engine::score_gram_sentences(&cands, &gram_req)
+    }));
+    // SAFETY: Push `(scores_tbl, has_gram_bool)`.
+    unsafe {
+        if (api.checkstack)(l, 4) == 0 {
+            return 0;
+        }
+        match res {
+            Ok(Ok((scores, has_gram))) => {
+                push_f32_array(api, l, &scores);
+                (api.pushboolean)(l, if has_gram { 1 } else { 0 });
+                2
+            }
+            _ => {
+                (api.createtable)(l, 0, 0);
+                (api.pushboolean)(l, 0);
+                2
+            }
+        }
+    }
+}
+
 unsafe extern "C-unwind" fn lua_stats(l: LuaState) -> c_int {
     // SAFETY: Invoked by Lua 5.4 host with valid `lua_State*`.
     let Ok(api) = (unsafe { get_api() }) else {
@@ -1024,7 +1145,7 @@ pub unsafe extern "C-unwind" fn luaopen_rime_neural(l: LuaState) -> c_int {
             return 1;
         }
 
-        (api.createtable)(l, 0, 12);
+        (api.createtable)(l, 0, 15);
 
         macro_rules! export_fn {
             ($name:literal, $func:ident) => {
@@ -1040,10 +1161,13 @@ pub unsafe extern "C-unwind" fn luaopen_rime_neural(l: LuaState) -> c_int {
         export_fn!("is_ready", lua_is_ready);
         export_fn!("resolve_layout", lua_resolve_layout);
         export_fn!("set_uia_enabled", lua_set_uia_enabled);
+        export_fn!("set_doc_entities_enabled", lua_set_doc_entities_enabled);
         export_fn!("query_uia_context", lua_query_uia_context);
         export_fn!("kick_uia_refresh", lua_kick_uia_refresh);
         export_fn!("kick_uia_after_commit", lua_kick_uia_after_commit);
         export_fn!("rerank", lua_rerank);
+        export_fn!("suggest_typo_inputs", lua_suggest_typo_inputs);
+        export_fn!("score_gram", lua_score_gram);
         export_fn!("log_feedback", lua_log_feedback);
         export_fn!("stats", lua_stats);
         1

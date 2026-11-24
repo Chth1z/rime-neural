@@ -1,17 +1,28 @@
+#[cfg(windows)]
 use std::ffi::c_void;
+#[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
+#[cfg(windows)]
 const GENERIC_READ: u32 = 0x8000_0000;
+#[cfg(windows)]
 const FILE_SHARE_READ: u32 = 0x0000_0001;
+#[cfg(windows)]
 const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+#[cfg(windows)]
 const OPEN_EXISTING: u32 = 3;
+#[cfg(windows)]
 const FILE_FLAG_RANDOM_ACCESS: u32 = 0x1000_0000;
+#[cfg(windows)]
 const PAGE_READONLY: u32 = 0x02;
+#[cfg(windows)]
 const FILE_MAP_READ: u32 = 0x0004;
+#[cfg(windows)]
 const INVALID_HANDLE_VALUE: *mut c_void = -1isize as *mut c_void;
 const GRAM_MAGIC_V1: &[u8] = b"Rime::Grammar/1.0\0";
 
+#[cfg(windows)]
 unsafe extern "system" {
     fn CreateFileW(
         lpFileName: *const u16,
@@ -71,24 +82,35 @@ pub fn sanitize_max_length(max_length: usize) -> usize {
     }
 }
 
-/// Zero-dependency read-only memory-mapped reader for `Rime::Grammar/1.0` (`.gram`) files
-/// (such as `wanxiang-lts-zh-hans.gram`). Shares the OS page cache with `rime.dll`
-/// (0 MB extra physical RAM) and scores a candidate sentence in ~0.004 ms via a single-pass
-/// forward trie walk with zero per-char allocations.
+/// Zero-dependency read-only reader for `Rime::Grammar/1.0` (`.gram`) files (such as
+/// `wanxiang-lts-zh-hans.gram`). On Windows, uses kernel-pinned read-only `MapViewOfFile`
+/// (sharing OS page cache with `rime.dll`). On Unix, loads an immutable `Vec<u32>` snapshot so
+/// in-place `.gram` truncation/updates can never raise `SIGBUS`. Scores a candidate sentence in
+/// ~0.004 ms via a single-pass forward trie walk with zero per-char allocations.
 pub struct WanxiangGram {
+    #[cfg(windows)]
     _file: *mut c_void,
+    #[cfg(windows)]
     _mapping: *mut c_void,
+    #[cfg(windows)]
     view: *const u8,
+    #[cfg(windows)]
     da_ptr: *const u32,
+    #[cfg(windows)]
     da_len: usize,
+    #[cfg(not(windows))]
+    da_owned: Vec<u32>,
 }
 
-// SAFETY: `WanxiangGram` holds read-only Win32 file/mapping handles and an immutable `PAGE_READONLY`
-// memory view that is never mutated through this struct; handles are closed once in `Drop`.
+#[cfg(windows)]
+// SAFETY: `WanxiangGram` holds read-only Win32 mapping handles and an immutable read-only memory
+// view that is never mutated through this struct; resources are released once in `Drop`.
 unsafe impl Send for WanxiangGram {}
-// SAFETY: Concurrent shared reads of the immutable `PAGE_READONLY` mapping are thread-safe.
+#[cfg(windows)]
+// SAFETY: Concurrent shared reads of the immutable read-only memory mapping are thread-safe.
 unsafe impl Sync for WanxiangGram {}
 
+#[cfg(windows)]
 impl Drop for WanxiangGram {
     fn drop(&mut self) {
         // SAFETY: Each handle/view was obtained from Win32 and is unmapped/closed in reverse order
@@ -301,6 +323,7 @@ fn score_slice_per_char(
 }
 
 impl WanxiangGram {
+    #[cfg(windows)]
     pub fn open(path: &Path) -> Result<Self, String> {
         let wide: Vec<u16> = path
             .as_os_str()
@@ -383,11 +406,48 @@ impl WanxiangGram {
         }
     }
 
+    #[cfg(not(windows))]
+    pub fn open(path: &Path) -> Result<Self, String> {
+        use std::fs::File;
+        use std::io::Read;
+
+        let mut file = File::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
+        let meta = file
+            .metadata()
+            .map_err(|e| format!("stat {}: {}", path.display(), e))?;
+        if !meta.is_file() {
+            return Err(format!("not a regular file: {}", path.display()));
+        }
+        let len = usize::try_from(meta.len())
+            .map_err(|_| format!("invalid .gram size: {}", meta.len()))?;
+        if len < 64 || len > 512 * 1024 * 1024 {
+            return Err(format!("invalid .gram size: {}", len));
+        }
+
+        let mut bytes = Vec::with_capacity(len);
+        file.read_to_end(&mut bytes)
+            .map_err(|e| format!("read {}: {}", path.display(), e))?;
+        let (da_off, da_size) = validate_gram_header(&bytes)?;
+        let da_bytes = &bytes[da_off..da_off + da_size * 4];
+        let mut da_owned = Vec::with_capacity(da_size);
+        for chunk in da_bytes.as_chunks::<4>().0 {
+            da_owned.push(u32::from_le_bytes(*chunk));
+        }
+        Ok(Self { da_owned })
+    }
+
     #[inline]
     fn da_slice(&self) -> &[u32] {
-        // SAFETY: `self.da_ptr` is 4-byte aligned (validated via `da_off % 4 == 0` and page-aligned
-        // `MapViewOfFile` base) and valid for `self.da_len` `u32` elements for the lifetime of `self`.
-        unsafe { std::slice::from_raw_parts(self.da_ptr, self.da_len) }
+        #[cfg(windows)]
+        {
+            // SAFETY: `self.da_ptr` is 4-byte aligned (validated via `da_off % 4 == 0` and page-aligned
+            // `MapViewOfFile` base) and valid for `self.da_len` `u32` elements for the lifetime of `self`.
+            unsafe { std::slice::from_raw_parts(self.da_ptr, self.da_len) }
+        }
+        #[cfg(not(windows))]
+        {
+            &self.da_owned
+        }
     }
 
     /// Score a sentence with explicit per-schema penalties and max collocation length

@@ -16,32 +16,50 @@
 //!    immediately (forcing empty context AND disabling local feedback logging). Errors from
 //!    `CurrentIsPassword()` refuse UIA text extraction rather than failing open.
 
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiaContext {
     /// Password control or sensitive process -> force empty context and suppress logging.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Blocked,
     /// Authoritative text strictly before the caret in the active control (may be empty if the
     /// user is typing in a fresh/empty box). `preedit_stripped` is `true` when inline pinyin/preview
-    /// composition text was already stripped during normalization.
+    /// composition text was already stripped during normalization. `entity_text` holds up to 1,024
+    /// characters from earlier paragraphs inside the same focused control when opt-in document
+    /// entity scanning is enabled (empty otherwise).
+    #[cfg_attr(not(windows), allow(dead_code))]
     Text {
         text: String,
         preedit_stripped: bool,
+        entity_text: String,
     },
     /// Foreground window just changed and fresh UIA snapshot is not ready yet -> do not reuse
     /// previous window's `commit_history`.
+    #[cfg_attr(not(windows), allow(dead_code))]
     WindowChanged,
     /// Active window unchanged, control does not expose UIA text -> safe to fall back to Rime's
     /// same-window `commit_history`.
+    #[cfg_attr(not(windows), allow(dead_code))]
     FallbackSameWindow,
+    /// Platform does not provide UIA focus verification (non-Windows hosts).
+    #[cfg_attr(windows, allow(dead_code))]
+    Unavailable,
 }
 
+#[cfg(any(windows, test))]
 const MAX_UIA_CHARS: usize = 64;
+#[cfg(any(windows, test))]
+const MAX_DOC_ENTITY_CHARS: usize = 1024;
+#[cfg(windows)]
 const SNAPSHOT_TTL: Duration = Duration::from_secs(4);
+#[cfg(windows)]
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(35);
+#[cfg(windows)]
 const POST_COMMIT_SETTLE_DELAY: Duration = Duration::from_millis(25);
 
+#[cfg(any(windows, test))]
 const DENIED_PROCESSES: &[&str] = &[
     // Password managers & 2FA vaults
     "keepass.exe",
@@ -88,6 +106,7 @@ const DENIED_PROCESSES: &[&str] = &[
     "mintty.exe",
 ];
 
+#[cfg(any(windows, test))]
 const DENIED_PROCESS_PREFIXES: &[&str] = &[
     "mobaxterm_",
     "mobaxterm-",
@@ -98,6 +117,7 @@ const DENIED_PROCESS_PREFIXES: &[&str] = &[
     "1password-",
 ];
 
+#[cfg(any(windows, test))]
 fn is_denied_exe_name(exe_lower: &str) -> bool {
     DENIED_PROCESSES.contains(&exe_lower)
         || (exe_lower.ends_with(".exe")
@@ -106,6 +126,7 @@ fn is_denied_exe_name(exe_lower: &str) -> bool {
                 .any(|&prefix| exe_lower.starts_with(prefix)))
 }
 
+#[cfg(any(windows, test))]
 fn is_invisible_format_char(c: char) -> bool {
     matches!(
         c,
@@ -118,12 +139,14 @@ fn is_invisible_format_char(c: char) -> bool {
     )
 }
 
+#[cfg(any(windows, test))]
 fn is_mask_bullet(c: char) -> bool {
     matches!(c, '•' | '●' | '◦' | '▪' | '∗' | '*' | '∙' | '⬤' | '⦁')
 }
 
 /// Heuristic detector for custom `ValuePattern` / `TextPattern` password fields that omit
 /// `IsPassword = true` and expose masked bullets (`••••` or `****`).
+#[cfg(any(windows, test))]
 pub fn looks_like_masked_password(s: &str) -> bool {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -152,6 +175,7 @@ pub fn looks_like_masked_password(s: &str) -> bool {
     (non_ws >= 2 && bullets == non_ws) || (max_run >= 4 && bullets * 2 >= non_ws)
 }
 
+#[cfg(any(windows, test))]
 fn tail_utf8_chars(s: &str, max_chars: usize) -> &str {
     let count = s.chars().count();
     if count <= max_chars {
@@ -164,6 +188,7 @@ fn tail_utf8_chars(s: &str, max_chars: usize) -> &str {
 }
 
 /// Find the byte end of the last blank line (`\n[ \t]*\n`) in `s`, if any.
+#[cfg(any(windows, test))]
 fn last_blank_line_end(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut last_end: Option<usize> = None;
@@ -188,6 +213,7 @@ fn last_blank_line_end(s: &str) -> Option<usize> {
 /// Strip a stale partial inline-preedit prefix (from an earlier keystroke captured asynchronously
 /// before the current keystroke arrived) when `s` ends with a non-trivial ASCII prefix of `lp` or
 /// `ri` separated from preceding context by start-of-string, whitespace, or a non-ASCII boundary.
+#[cfg(any(windows, test))]
 fn strip_stale_preedit_prefix(s: &mut String, lp: &str, ri: &str) -> bool {
     let mut best_cut: Option<usize> = None;
     for target in [lp, ri] {
@@ -222,24 +248,20 @@ fn strip_stale_preedit_prefix(s: &mut String, lp: &str, ri: &str) -> bool {
     }
 }
 
-/// Strip embedded-object chrome (`\u{FFFC}`), zero-width format characters, live inline
-/// composition/preview text, and control characters into a clean 64-char preceding-text tail.
-/// Returns `(cleaned_text, preedit_stripped)`.
-pub fn normalize_before_caret(
+/// Shared sanitizer stripping `U+FFFC` embedded-object chrome, invisible zero-width format chars,
+/// and live uncommitted preedit/preview suffixes. Returns `(sanitized_with_newlines, preedit_stripped)`.
+#[cfg(any(windows, test))]
+fn sanitize_raw_before_caret(
     raw: &str,
     live_preedit: &str,
     raw_input: &str,
     cand_preview: &str,
 ) -> (String, bool) {
-    // Chromium / Electron / Word insert U+FFFC (Object Replacement Character) at DOM widget /
-    // toolbar / attachment boundaries. Never bleed across embedded UI elements.
     let base = match raw.rfind('\u{FFFC}') {
         Some(pos) => &raw[pos + '\u{FFFC}'.len_utf8()..],
         None => raw,
     };
 
-    // Strip invisible zero-width format anchors before suffix matching so Chromium/Electron
-    // editors wrapping composition ranges with U+200B do not defeat preedit stripping.
     let mut s = String::with_capacity(base.len());
     let mut prev_cr = false;
     for c in base.chars() {
@@ -260,8 +282,6 @@ pub fn normalize_before_caret(
         }
     }
 
-    // Strip uncommitted inline composition echoed into the text control (longest match first, once).
-    // Trim ASCII spaces, tabs, and U+00A0 NBSP emitted by contenteditable editors before matching.
     let trimmed_tail = s.trim_end_matches([' ', '\t', '\u{00A0}']);
     if trimmed_tail.len() != s.len() {
         s.truncate(trimmed_tail.len());
@@ -293,25 +313,55 @@ pub fn normalize_before_caret(
             stripped = true;
         }
     }
+    (s, stripped)
+}
 
-    // Keep strictly the active paragraph after blank-line breaks (`\n[ \t]*\n`): if the user
-    // started a fresh paragraph after a blank line, return empty instead of bleeding prior text.
-    if let Some(pos) = last_blank_line_end(&s) {
-        s = s[pos..].trim_start().to_string();
-    }
-
-    // Flatten remaining line breaks and trim trailing spaces
+#[cfg(any(windows, test))]
+fn flatten_and_tail(s: &str, max_chars: usize) -> String {
     let cleaned: String = s
         .chars()
         .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
         .filter(|&c| !c.is_control())
         .collect();
-    let trimmed = cleaned.trim_end();
+    tail_utf8_chars(cleaned.trim_end(), max_chars).to_string()
+}
 
-    (
-        tail_utf8_chars(trimmed, MAX_UIA_CHARS).to_string(),
-        stripped,
-    )
+/// Strip embedded-object chrome (`\u{FFFC}`), zero-width format characters, live inline
+/// composition/preview text, and control characters into a clean 64-char active-paragraph tail.
+/// Returns `(cleaned_text, preedit_stripped)`.
+#[cfg(test)]
+pub fn normalize_before_caret(
+    raw: &str,
+    live_preedit: &str,
+    raw_input: &str,
+    cand_preview: &str,
+) -> (String, bool) {
+    let (text, stripped, _) =
+        normalize_before_caret_with_doc(raw, live_preedit, raw_input, cand_preview, false);
+    (text, stripped)
+}
+
+/// Normalize up to `MAX_DOC_ENTITY_CHARS` (1,024 chars) across paragraph breaks within the same
+/// focused control for ephemeral entity-splice matching only (never enters the ONNX KV-cache).
+#[cfg(any(windows, test))]
+pub fn normalize_before_caret_with_doc(
+    raw: &str,
+    live_preedit: &str,
+    raw_input: &str,
+    cand_preview: &str,
+    include_doc_entities: bool,
+) -> (String, bool, String) {
+    let (s, stripped) = sanitize_raw_before_caret(raw, live_preedit, raw_input, cand_preview);
+    let doc_text = if include_doc_entities {
+        flatten_and_tail(&s, MAX_DOC_ENTITY_CHARS)
+    } else {
+        String::new()
+    };
+    let para = match last_blank_line_end(&s) {
+        Some(pos) => s[pos..].trim_start(),
+        None => s.as_str(),
+    };
+    (flatten_and_tail(para, MAX_UIA_CHARS), stripped, doc_text)
 }
 
 #[cfg(windows)]
@@ -434,6 +484,7 @@ mod win_impl {
     static RUNTIME: OnceLock<UiaRuntime> = OnceLock::new();
     static LAST_SEEN_HWND: AtomicIsize = AtomicIsize::new(0);
     static ENABLED: AtomicBool = AtomicBool::new(false);
+    static DOC_ENTITIES_ENABLED: AtomicBool = AtomicBool::new(false);
     static WORKER_ALIVE: AtomicBool = AtomicBool::new(false);
     static POST_COMMIT_PENDING: AtomicBool = AtomicBool::new(false);
 
@@ -550,6 +601,11 @@ mod win_impl {
         // Primary path: IUIAutomationTextPattern (Chrome, Edge, VS Code, Electron, Word, Notepad, WPF, WinUI)
         // SAFETY: All UIA COM interface calls operate on validated COM smart pointers on this MTA thread,
         // and `GetForegroundWindow` is thread-safe.
+        let doc_mode = DOC_ENTITIES_ENABLED.load(Ordering::Acquire);
+        let walk_back: i32 = if doc_mode { -1024 } else { -96 };
+        let fetch_limit: i32 = if doc_mode { 2048 } else { 512 };
+        // SAFETY: All UIA COM interface calls operate on validated COM smart pointers on this MTA
+        // thread, and `GetForegroundWindow` is thread-safe.
         let text_pat_res: Option<UiaSnapshot> = unsafe {
             if let Ok(text_pat) =
                 focused.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
@@ -566,7 +622,11 @@ mod win_impl {
                     )
                     .is_ok()
                 && before
-                    .MoveEndpointByUnit(TextPatternRangeEndpoint_Start, TextUnit_Character, -96)
+                    .MoveEndpointByUnit(
+                        TextPatternRangeEndpoint_Start,
+                        TextUnit_Character,
+                        walk_back,
+                    )
                     .is_ok()
             {
                 // Prefer `RangeFromChild(&focused)` so Chromium/Electron `WebArea` providers stay
@@ -600,12 +660,14 @@ mod win_impl {
                     ).is_ok())
                 {
                     Some(unreadable_snapshot(window, false))
-                } else if let Ok(bstr) = before.GetText(512) {
+                } else if let Ok(bstr) = before.GetText(fetch_limit) {
                     if GetForegroundWindow().0 as isize != hwnd_raw {
                         Some(unreadable_snapshot(window, true))
                     } else {
                         let txt = bstr.to_string();
-                        if looks_like_masked_password(&txt) {
+                        if looks_like_masked_password(&txt)
+                            || looks_like_masked_password(tail_utf8_chars(&txt, 96))
+                        {
                             Some(unreadable_snapshot(window, true))
                         } else {
                             Some(UiaSnapshot {
@@ -809,6 +871,21 @@ mod win_impl {
         }
     }
 
+    pub fn set_doc_entities_enabled(enable: bool) {
+        let prev = DOC_ENTITIES_ENABLED.swap(enable, Ordering::AcqRel);
+        if prev != enable {
+            if let Some(rt) = RUNTIME.get() {
+                // Immediately drop any snapshot captured under the previous mode so turning off
+                // 1,024-char document scanning leaves zero retained multi-paragraph text in RAM.
+                rt.invalidate(foreground_window(), false);
+            }
+            if is_enabled() {
+                let rt = ensure_started();
+                let _ = rt.tx.try_send(());
+            }
+        }
+    }
+
     pub fn is_enabled() -> bool {
         ENABLED.load(Ordering::Acquire)
     }
@@ -854,11 +931,18 @@ mod win_impl {
             } else if snap.updated_at.elapsed() > SNAPSHOT_TTL {
                 UiaContext::WindowChanged
             } else if let Some(raw) = &snap.before_caret {
-                let (text, preedit_stripped) =
-                    normalize_before_caret(raw, live_preedit, raw_input, cand_preview);
+                let doc_mode = DOC_ENTITIES_ENABLED.load(Ordering::Acquire);
+                let (text, preedit_stripped, entity_text) = normalize_before_caret_with_doc(
+                    raw,
+                    live_preedit,
+                    raw_input,
+                    cand_preview,
+                    doc_mode,
+                );
                 UiaContext::Text {
                     text,
                     preedit_stripped,
+                    entity_text,
                 }
             } else if prev_hwnd != 0 && prev_hwnd != cur_hwnd {
                 UiaContext::WindowChanged
@@ -917,8 +1001,9 @@ mod win_impl {
 
 #[cfg(not(windows))]
 mod win_impl {
-    use super::*;
+    use super::UiaContext;
     pub fn set_enabled(_enable: bool) {}
+    pub fn set_doc_entities_enabled(_enable: bool) {}
     pub fn is_enabled() -> bool {
         false
     }
@@ -930,7 +1015,7 @@ mod win_impl {
         _raw_input: &str,
         _cand_preview: &str,
     ) -> (UiaContext, isize, u64) {
-        (UiaContext::FallbackSameWindow, 0, 0)
+        (UiaContext::Unavailable, 0, 0)
     }
     pub fn foreground_hwnd() -> isize {
         0
@@ -941,7 +1026,7 @@ mod win_impl {
 
 pub use win_impl::{
     foreground_hwnd, is_enabled, is_worker_alive, kick_after_commit, kick_refresh, query_context,
-    set_enabled,
+    set_doc_entities_enabled, set_enabled,
 };
 
 #[cfg(test)]
@@ -963,6 +1048,24 @@ mod tests {
             normalize_before_caret("旧段落\r\n   \r\n新段落内容", "", "", ""),
             ("新段落内容".to_string(), false)
         );
+        // Document-wide entity mode retains earlier paragraphs (separated by spaces so adjacent
+        // paragraph edges cannot fuse into fake entities) while keeping `text` strictly in the
+        // active paragraph and stopping at U+FFFC object boundaries.
+        let (para, stripped, doc) = normalize_before_caret_with_doc(
+            "工具栏\u{FFFC}第一段提到沈珂\n\n第二段继续写jntm",
+            "jntm",
+            "jntm",
+            "",
+            true,
+        );
+        assert_eq!(para, "第二段继续写");
+        assert!(stripped);
+        assert_eq!(doc, "第一段提到沈珂  第二段继续写");
+        // Blank new paragraph leaves `para` empty while still surfacing earlier authorized entities
+        let (para2, _, doc2) =
+            normalize_before_caret_with_doc("前面提到乌比莫斯环\n\n", "", "", "", true);
+        assert_eq!(para2, "");
+        assert_eq!(doc2, "前面提到乌比莫斯环");
         // Embedded object separator U+FFFC must block Chromium/Electron UI chrome bleed
         assert_eq!(
             normalize_before_caret(
@@ -1013,6 +1116,17 @@ mod tests {
         assert!(!looks_like_masked_password("普通中文句子***"));
         assert!(!looks_like_masked_password(""));
         assert!(!looks_like_masked_password("a*b*c"));
+        // Long document text followed by masked bullets near the caret must still trigger on the 96-char tail
+        let doc_with_pw = format!(
+            "{}{}",
+            "这是一段普通文档正文内容。".repeat(40),
+            "•".repeat(60)
+        );
+        assert!(!looks_like_masked_password(&doc_with_pw));
+        assert!(looks_like_masked_password(tail_utf8_chars(
+            &doc_with_pw,
+            96
+        )));
     }
 
     #[test]

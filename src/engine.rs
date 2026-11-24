@@ -17,8 +17,10 @@ use tokenizers::pre_tokenizers::metaspace::PrependScheme;
 
 use crate::gram::{WanxiangGram, sanitize_max_length, sanitize_penalties};
 use crate::pinyin::{PinyinLayout, input_to_units};
+use crate::typo::{TypoSuggestion, suggest_broken_input_repairs, suggest_span_typo_repairs};
 
 const CONTEXT_CHARS: usize = 128;
+const ENTITY_CONTEXT_CHARS: usize = 1024;
 const LRU_CAPACITY: usize = 256;
 const KV_CACHE_CAPACITY: usize = 16;
 
@@ -211,6 +213,7 @@ struct ResolvedGramKey {
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct CacheKey {
     ctx_tail: String,
+    entity_tail: String,
     raw_input: String,
     layout: PinyinLayout,
     weights_bits: [u64; 5],
@@ -1007,6 +1010,7 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
     engine
         .evaluate(
             "",
+            "",
             "nihk",
             PinyinLayout::Zrm,
             &warmup_cands,
@@ -1580,6 +1584,7 @@ impl NeuralEngine {
     fn evaluate(
         &mut self,
         context: &str,
+        entity_ctx: &str,
         raw_input: &str,
         layout: PinyinLayout,
         cands: &[String],
@@ -1589,9 +1594,11 @@ impl NeuralEngine {
     ) -> Result<CachedEval, String> {
         self.stats.calls += 1;
         let ctx_tail = utf8_tail(context, CONTEXT_CHARS);
+        let entity_tail = utf8_tail(entity_ctx, ENTITY_CONTEXT_CHARS);
         let (gram_key, gram_params) = self.resolve_gram_request(gram_req);
         let key = CacheKey {
             ctx_tail: ctx_tail.to_string(),
+            entity_tail: entity_tail.to_string(),
             raw_input: raw_input.to_string(),
             layout,
             weights_bits: [
@@ -1695,9 +1702,10 @@ impl NeuralEngine {
             && p2c_margin.is_finite()
             && p2c_margin > p2c_verify_margin
             && p2c_text.is_some();
+        let has_entity_source = !ctx_tail.is_empty() || !entity_tail.is_empty();
         if let Some(kv_idx) = kv_idx_opt
             && p2c_verify_margin > 0.0
-            && (has_greedy_p2c || !ctx_tail.is_empty())
+            && (has_greedy_p2c || has_entity_source)
         {
             let has_ctx_f = if ctx_tail.trim().chars().count() >= 2 {
                 1.0
@@ -1713,19 +1721,27 @@ impl NeuralEngine {
                 let toks = self.encode_candidate_ids(p2c_str);
                 proposals.push((p2c_str.clone(), toks, false));
             }
-            if !ctx_tail.is_empty()
+            if has_entity_source
                 && !shifted_lcp
                 && units.len() == orig_units_len
                 && units.len() <= self.max_slots
                 && cand_toks[best_idx].len() <= self.candidate_tokens
             {
-                let ctx_props = build_context_entity_proposals(
-                    ctx_tail,
-                    &units,
-                    &cands[best_idx],
-                    cands,
-                    &self.readings,
-                );
+                // First scan active KV context (`ctx_tail`), which carries cross-encoder prefix-copy
+                // bias (`from_ctx = true`). Then scan any extended same-document window (`entity_tail`
+                // up to 1,024 chars outside `ctx_tail`) with zero extra KV tokens: since those spans
+                // are absent from the ONNX prefix, they incur no prefix-copy bias (`from_ctx = false`).
+                let ctx_props = if !ctx_tail.is_empty() {
+                    build_context_entity_proposals(
+                        ctx_tail,
+                        &units,
+                        &cands[best_idx],
+                        cands,
+                        &self.readings,
+                    )
+                } else {
+                    Vec::new()
+                };
                 for prop in ctx_props {
                     if proposals.iter().any(|(p, _, _)| p == &prop) {
                         continue;
@@ -1733,6 +1749,27 @@ impl NeuralEngine {
                     let toks = self.encode_candidate_ids(&prop);
                     if toks.len() <= self.candidate_tokens {
                         proposals.push((prop, toks, true));
+                    }
+                }
+                if !entity_tail.is_empty() && proposals.len() < 4 {
+                    let doc_props = build_context_entity_proposals(
+                        entity_tail,
+                        &units,
+                        &cands[best_idx],
+                        cands,
+                        &self.readings,
+                    );
+                    for prop in doc_props {
+                        if proposals.len() >= 4 {
+                            break;
+                        }
+                        if proposals.iter().any(|(p, _, _)| p == &prop) {
+                            continue;
+                        }
+                        let toks = self.encode_candidate_ids(&prop);
+                        if toks.len() <= self.candidate_tokens {
+                            proposals.push((prop, toks, false));
+                        }
                     }
                 }
             }
@@ -2164,8 +2201,10 @@ fn select_p2c_placement(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn rerank(
     context: &str,
+    entity_ctx: &str,
     raw_input: &str,
     layout: PinyinLayout,
     cands: &[String],
@@ -2193,6 +2232,7 @@ pub fn rerank(
         .map_err(|_| "engine mutex poisoned".to_string())?;
     let eval = eng.evaluate(
         context,
+        entity_ctx,
         raw_input,
         layout,
         cands,
@@ -2229,6 +2269,64 @@ pub fn rerank(
         has_ctx: has_ctx_bool,
         has_gram: eval.has_gram,
     })
+}
+
+/// Suggest 1-edit QWERTY/transposition/dedup/insertion repairs using the loaded syllable table.
+pub fn suggest_typo_inputs(
+    raw_input: &str,
+    layout: PinyinLayout,
+    span_mode: bool,
+    max_results: usize,
+) -> Result<Vec<TypoSuggestion>, String> {
+    let mutex = ENGINE.get().ok_or_else(|| "engine not ready".to_string())?;
+    let eng = mutex
+        .lock()
+        .map_err(|_| "engine mutex poisoned".to_string())?;
+    let cap = max_results.clamp(1, 16);
+    if span_mode {
+        Ok(suggest_span_typo_repairs(
+            raw_input,
+            layout,
+            &eng.valid_syllables,
+            cap,
+        ))
+    } else {
+        Ok(suggest_broken_input_repairs(
+            raw_input,
+            layout,
+            &eng.valid_syllables,
+            cap,
+        ))
+    }
+}
+
+/// Score candidate sentences directly with the active memory-mapped `.gram` (~0.004 ms/cand).
+/// Returns `(scores, has_gram)` so callers can distinguish a missing/disabled `.gram` from a real
+/// score of `0.0`.
+pub fn score_gram_sentences(
+    cands: &[String],
+    gram_req: &GramRequest,
+) -> Result<(Vec<f32>, bool), String> {
+    let mutex = ENGINE.get().ok_or_else(|| "engine not ready".to_string())?;
+    let eng = mutex
+        .lock()
+        .map_err(|_| "engine mutex poisoned".to_string())?;
+    let (gram_key, gram_params) = eng.resolve_gram_request(gram_req);
+    let Some((g, (col, non_col, max_len))) = gram_key
+        .path
+        .as_ref()
+        .and_then(|p| eng.gram_cache.get(p))
+        .zip(gram_params)
+    else {
+        return Ok((Vec::new(), false));
+    };
+    Ok((
+        cands
+            .iter()
+            .map(|c| g.score_sentence_per_char(c, col, non_col, max_len) as f32)
+            .collect(),
+        true,
+    ))
 }
 
 pub struct StatsSnapshot {
@@ -2803,6 +2901,7 @@ mod tests {
         };
         let k1 = CacheKey {
             ctx_tail: "你好".to_string(),
+            entity_tail: String::new(),
             raw_input: "nihk".to_string(),
             layout: PinyinLayout::Zrm,
             weights_bits: [

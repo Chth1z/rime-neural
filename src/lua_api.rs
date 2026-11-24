@@ -40,7 +40,28 @@ pub unsafe fn pin_self_module(addr_inside_dll: *const c_void) -> bool {
     ok.is_ok() && !hmod.is_invalid()
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+pub unsafe fn pin_self_module(addr_inside_dll: *const c_void) -> bool {
+    // SAFETY: `libc::Dl_info` is a plain C struct of pointers/integers where all-zeros is valid.
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    // SAFETY: `addr_inside_dll` points to code inside this shared library; `dladdr` resolves
+    // its loaded path and `dlopen(..., RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE)` pins it in-process
+    // so Rime redeploys (`lua_close` -> `dlclose`) never unmap the live ONNX Runtime engine.
+    let ok = unsafe { libc::dladdr(addr_inside_dll, &mut info) };
+    if ok == 0 || info.dli_fname.is_null() {
+        return false;
+    }
+    // SAFETY: `info.dli_fname` is a NUL-terminated path returned by `dladdr`.
+    let handle = unsafe {
+        libc::dlopen(
+            info.dli_fname,
+            libc::RTLD_NOW | libc::RTLD_NOLOAD | libc::RTLD_NODELETE,
+        )
+    };
+    !handle.is_null()
+}
+
+#[cfg(not(any(windows, unix)))]
 pub unsafe fn pin_self_module(_addr_inside_dll: *const c_void) -> bool {
     false
 }
@@ -169,9 +190,103 @@ pub unsafe fn get_api() -> Result<&'static LuaApi, &'static str> {
     Ok(API.get_or_init(|| api))
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 pub unsafe fn get_api() -> Result<&'static LuaApi, &'static str> {
-    Err("dynamic Lua 5.4 host resolution is only supported on Windows")
+    if let Some(api) = API.get() {
+        return Ok(api);
+    }
+
+    // Locate the exact shared object providing Lua 5.4's exclusive `lua_newuserdatauv` symbol,
+    // pin that provider handle with `RTLD_NODELETE`, and resolve every symbol strictly from that
+    // same provider (verifying `dli_fbase` identity) so a host that also loaded Lua 5.3 earlier
+    // in global scope can never mix incompatible ABIs.
+    // SAFETY: `RTLD_DEFAULT` searches loaded global symbols; `c"lua_newuserdatauv"` is NUL-terminated.
+    let marker = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"lua_newuserdatauv".as_ptr()) };
+    if marker.is_null() {
+        return Err("host process does not export Lua 5.4 C API (missing lua_newuserdatauv)");
+    }
+    // SAFETY: `libc::Dl_info` is a plain C struct of pointers/integers where all-zeros is valid.
+    let mut marker_info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    // SAFETY: `marker` is a valid resolved function address inside the host's Lua 5.4 provider.
+    if unsafe { libc::dladdr(marker, &mut marker_info) } == 0
+        || marker_info.dli_fbase.is_null()
+        || marker_info.dli_fname.is_null()
+    {
+        return Err("failed to identify Lua 5.4 symbol provider via dladdr");
+    }
+
+    // Open and pin the exact provider DSO (`RTLD_NOLOAD | RTLD_NODELETE`); fall back to the
+    // main executable handle (`dlopen(NULL, ...)`) when Lua 5.4 is statically linked into it.
+    // SAFETY: `marker_info.dli_fname` is a NUL-terminated path returned by `dladdr`.
+    let mut provider = unsafe {
+        libc::dlopen(
+            marker_info.dli_fname,
+            libc::RTLD_NOW | libc::RTLD_NOLOAD | libc::RTLD_NODELETE,
+        )
+    };
+    if provider.is_null() {
+        // SAFETY: Passing NULL to `dlopen` returns a handle to the main host executable.
+        provider = unsafe { libc::dlopen(std::ptr::null(), libc::RTLD_NOW) };
+    }
+    if provider.is_null() {
+        return Err("failed to open Lua 5.4 symbol provider handle");
+    }
+    let expected_base = marker_info.dli_fbase;
+
+    macro_rules! sym {
+        ($name:literal) => {{
+            // SAFETY: `provider` is a valid handle returned by `dlopen` for the Lua 5.4 provider,
+            // and `concat!($name, "\0")` is NUL-terminated.
+            let p =
+                unsafe { libc::dlsym(provider, concat!($name, "\0").as_ptr() as *const c_char) };
+            if p.is_null() {
+                return Err(concat!("missing symbol in Lua 5.4 host: ", $name));
+            }
+            // SAFETY: `libc::Dl_info` is a plain C struct where all-zeros is valid.
+            let mut sym_info: libc::Dl_info = unsafe { std::mem::zeroed() };
+            // SAFETY: `p` is a non-null symbol address returned by `dlsym`.
+            if unsafe { libc::dladdr(p, &mut sym_info) } == 0 || sym_info.dli_fbase != expected_base
+            {
+                return Err(concat!("ambiguous Lua symbol provider for: ", $name));
+            }
+            #[allow(clippy::missing_transmute_annotations)]
+            // SAFETY: Transmuting verified single-provider Lua 5.4 symbol pointer to matching
+            // `extern "C-unwind"` signature.
+            unsafe {
+                std::mem::transmute(p)
+            }
+        }};
+    }
+
+    let api = LuaApi {
+        version: sym!("lua_version"),
+        checkstack: sym!("lua_checkstack"),
+        gettop: sym!("lua_gettop"),
+        createtable: sym!("lua_createtable"),
+        pushcclosure: sym!("lua_pushcclosure"),
+        rawget: sym!("lua_rawget"),
+        rawset: sym!("lua_rawset"),
+        lua_type: sym!("lua_type"),
+        tolstring: sym!("lua_tolstring"),
+        pushlstring: sym!("lua_pushlstring"),
+        pushboolean: sym!("lua_pushboolean"),
+        pushinteger: sym!("lua_pushinteger"),
+        pushnumber: sym!("lua_pushnumber"),
+        pushnil: sym!("lua_pushnil"),
+        toboolean: sym!("lua_toboolean"),
+        tointegerx: sym!("lua_tointegerx"),
+        tonumberx: sym!("lua_tonumberx"),
+        rawlen: sym!("lua_rawlen"),
+        rawgeti: sym!("lua_rawgeti"),
+        rawseti: sym!("lua_rawseti"),
+        settop: sym!("lua_settop"),
+    };
+    Ok(API.get_or_init(|| api))
+}
+
+#[cfg(not(any(windows, unix)))]
+pub unsafe fn get_api() -> Result<&'static LuaApi, &'static str> {
+    Err("dynamic Lua 5.4 host resolution is only supported on Windows and Unix")
 }
 
 /// Verify that the host Lua VM is strictly Lua 5.4 (`504.0 <= ver < 505.0`), matching our 64-bit
