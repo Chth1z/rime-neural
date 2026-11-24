@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.dll binary
+*.onnx binary
+*.gram binary
+*.zip binary
