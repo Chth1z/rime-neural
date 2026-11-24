@@ -1,0 +1,9 @@
+# Opt-in pre-commit local span repair & literal-lock processor for rime-neural (>= v1.3.0)
+# Merge these keys into your schema's `*.custom.yaml` (e.g. `rime_frost_double_pinyin.custom.yaml`).
+# Requires `lua/rime_neural_repair.lua` in your Rime user `lua/` directory.
+patch:
+  translator/max_sentences: 8   # Expose sentence homophone alternatives (already set when using rime_neural)
+  "engine/processors/@before 0": lua_processor@*rime_neural_repair
+  rime_neural_repair:
+    repair_key: "Alt+r"         # Pre-commit word-level homophone repair (Left/Right, 1-9/Space, Escape); set "" to disable
+    lock_key: "Alt+l"           # Pre-commit verbatim ASCII literal lock (GPUv2, OAuth2, v1.2.1); set "" to disable
