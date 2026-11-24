@@ -1,7 +1,8 @@
 [package]
 name = "rime_neural"
 version = "1.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.92"
 license = "Apache-2.0"
 repository = "https://github.com/Chth1z/rime-neural"
 description = "Zero-patch in-process ONNX neural sentence reranker for official Rime/Weasel (KV-cache, .gram mmap fusion, Pass-2 verified P2C, universal pinyin layouts, non-blocking UIA context, and unbiased MAP feedback tuning)"
@@ -23,6 +24,10 @@ windows = { version = "0.58", features = [
     "Win32_UI_Accessibility",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[lints.clippy]
+all = "warn"
+undocumented_unsafe_blocks = "warn"
 
 [profile.release]
 lto = "thin"
