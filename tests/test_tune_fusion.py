@@ -1,9 +1,12 @@
 import importlib.util
+import io
 import json
 import math
 import pathlib
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from unittest.mock import patch
 
 import numpy as np
 
@@ -104,6 +107,7 @@ class TestTuneFusion(unittest.TestCase):
                         "char_lps": [0.0, 0.0],
                         "shown_top1_idx": 1,
                         "chosen_idx": 1,
+                        "cands": ["甲", "乙"],
                         "raw_input": "stray_plaintext",
                     }
                 )
@@ -150,6 +154,32 @@ class TestTuneFusion(unittest.TestCase):
             self.assertEqual(conv, 1)
             self.assertGreaterEqual(kept, 1)
             self.assertNotIn("stray_plaintext", p1.read_text(encoding="utf-8"))
+            scrubbed = json.loads(p1.read_text(encoding="utf-8"))
+            self.assertNotIn("cands", scrubbed)
+            self.assertEqual((scrubbed["chosen_idx"], scrubbed["shown_top1_idx"]), (1, 1))
+
+    def test_cv_freezes_from_training_fold_and_controls_grid_search(self):
+        # Uniform predictions keep the same top-1 and improve NLL with z ~ 1.9,
+        # between the single-comparison and seven-comparison critical values.
+        with tempfile.TemporaryDirectory() as td:
+            log = pathlib.Path(td) / "feedback.jsonl"
+            log.write_text("\n".join(json.dumps({
+                "v": 2, "logits": [0, 0], "chosen_idx": int(i < 26), "has_ctx": i < 20,
+            }) for i in range(50)), encoding="utf-8")
+            uniform = tf.W_PRIOR.copy()
+            uniform[1] = 0.0
+            out = io.StringIO()
+            argv = ["tune-fusion", "--log", str(log), "--min-samples", "50", "--min-accepts", "20"]
+            with patch.object(tf.sys, "argv", argv), redirect_stdout(out), patch.object(
+                tf, "fit_newton_offset_ridge", return_value=uniform,
+            ) as fit:
+                tf.main()
+            self.assertEqual(
+                [c.kwargs["freeze_ctx_lp"] for c in fit.call_args_list[:5]],
+                [True, True, False, False, False],
+            )
+            self.assertIn("Best lambda=", out.getvalue())
+            self.assertNotIn("Paste into", out.getvalue())
 
     def test_newton_solver_is_weight_scale_invariant_and_freezes_collinear_ctx_lp(self):
         rng = np.random.default_rng(7)

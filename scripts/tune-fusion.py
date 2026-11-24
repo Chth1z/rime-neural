@@ -3,9 +3,9 @@
 Personal fusion weight tuner for rime-neural (unbiased Newton-Raphson MAP shrinkage).
 
 Statistical anti-overfitting design:
-  1. `lua/rime_neural.lua` logs 100% of multi-candidate sentence commits as zero-plaintext
+  1. `lua/rime_neural.lua` logs eligible multi-candidate sentence commits at full sampling probability as zero-plaintext
      numeric feature records (`v: 2`, `sample_weight = 1.0`, bounded by 5 MiB auto-rotation)
-     to eliminate selection bias while never persisting user text. Legacy v1 records remain
+     to avoid top-1 subsampling while keeping user text in memory. Legacy v1 records remain
      readable (and can be converted in-place to zero-plaintext v2 via `--scrub-legacy-inplace`),
      and legacy 10%-sampled Top-1 logs remain supported via `--top1-sample-rate 0.10`.
   2. Fits exact damped Newton-Raphson Bayesian MAP estimation around `W_PRIOR` with Gaussian
@@ -15,12 +15,12 @@ Statistical anti-overfitting design:
      Freezes `w_ctx_lp` at `W_PRIOR[4]` unless both `has_ctx=True` and `has_ctx=False` have >= 20 samples
      so collinear features cannot arbitrarily split weight between `w_logit` and `w_ctx_lp`.
   3. Selects prior precision `lam` by contiguous blocked 5-fold out-of-fold weighted **log-loss
-     (NLL)** (strictly proper scoring rule; contiguous folds prevent adjacent-session leakage).
+     (NLL)**, scoring each fit at the same three-decimal precision used in YAML.
   4. Only recommends an update when ALL FOUR guards pass:
        - Minimum effective sample guards are met (`min(n, Kish N_eff) >= min_samples`,
          `>= 15` corrections, `>= 30` accepts)
-       - Out-of-fold weighted NLL improvement passes a one-sided paired 95% CI test (`z >= 1.645`)
-         using the heteroscedasticity-robust Hajek sandwich variance estimator
+       - Out-of-fold weighted NLL improvement passes a one-sided paired normal approximation
+         using the Hajek sandwich SE and a Bonferroni adjustment across the precision grid
        - Out-of-fold weighted Top-1 accuracy does not drop below `W_PRIOR`
        - Fitted (and 3-decimal rounded) weights satisfy domain sanity invariants (`w_logit >= 0.1`,
          `w_rank <= 0.0`, `w_logit + w_ctx_lp >= 0.1`) and differ from `W_PRIOR`.
@@ -37,6 +37,7 @@ import json
 import math
 import os
 import pathlib
+from statistics import NormalDist
 import sys
 import tempfile
 import time
@@ -250,14 +251,12 @@ def scrub_legacy_log_files(path: pathlib.Path, include_rotated: bool = True) -> 
                 continue
             has_plaintext = any(k in rec for k in PLAINTEXT_KEYS)
             if has_plaintext:
-                if "cands" in rec:
-                    v2 = _convert_v1_to_v2(rec)
-                elif "chosen_idx" in rec and isinstance(rec.get("logits"), list):
-                    # Hybrid v2 record with stray plaintext keys: strip plaintext keys in place
+                if "chosen_idx" in rec and isinstance(rec.get("logits"), list):
+                    # Numeric outcomes are authoritative even when a stray cands array is present.
                     v2 = {k: v for k, v in rec.items() if k not in PLAINTEXT_KEYS}
                     v2["v"] = 2
                 else:
-                    v2 = None
+                    v2 = _convert_v1_to_v2(rec)
                 if v2 is not None:
                     out_lines.append(json.dumps(v2, ensure_ascii=False, separators=(",", ":")))
                     converted_total += 1
@@ -526,8 +525,6 @@ def fit_newton_offset_ridge(
             step = np.linalg.solve(hess + 1e-8 * eye, grad)
         except np.linalg.LinAlgError:
             break
-        if freeze_ctx_lp and d > 4:
-            step[4] = 0.0
         if not np.isfinite(step).all():
             break
         dir_deriv = -float(grad @ step)
@@ -547,8 +544,6 @@ def fit_newton_offset_ridge(
             break
         if alpha * float(np.linalg.norm(step)) < 1e-7:
             break
-    if freeze_ctx_lp and d > 4:
-        w[4] = w_prior[4]
     return w
 
 
@@ -619,7 +614,6 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Unbiased MAP personal fusion weight tuner for rime-neural")
     ap.add_argument(
         "--log",
-        default=default_log_path(),
         help="Path to local feedback.jsonl (defaults to RimeUserDir/%%APPDATA%%\\Rime\\neural\\feedback.jsonl)",
     )
     ap.add_argument("--min-samples", type=int, default=100, help="Minimum matched records & Kish N_eff")
@@ -658,7 +652,7 @@ def main() -> None:
         print("Error: --min-corrections and --min-accepts must be >= 0.", file=sys.stderr)
         sys.exit(2)
 
-    log_path = pathlib.Path(args.log)
+    log_path = pathlib.Path(args.log or default_log_path())
     if args.scrub_legacy_inplace:
         has_primary = log_path.is_file() or log_path.is_symlink()
         has_rot = (not args.no_rotated) and (
@@ -750,24 +744,29 @@ def main() -> None:
     print(f"Prior weights: weighted NLL={prior_nll:.4f} | weighted Top-1 acc={prior_acc:.2f}%")
 
     folds = 5
-    fold_bounds = [(f * n // folds, (f + 1) * n // folds) for f in range(folds)]
+    train_folds = []
+    for f in range(folds):
+        lo, hi = f * n // folds, (f + 1) * n // folds
+        train_x = X_list[:lo] + X_list[hi:]
+        # With >= 2 candidates the log-softmax column cannot be identically zero.
+        n_ctx = sum(bool(X[:, 4].any()) for X in train_x)
+        freeze_fold = min(n_ctx, len(train_x) - n_ctx) < MIN_CTX_STRATUM
+        train_y = y_list[:lo] + y_list[hi:]
+        train_weights = np.concatenate((weights[:lo], weights[hi:]))
+        train_folds.append((lo, hi, train_x, train_y, train_weights, freeze_fold))
+    z_critical = NormalDist().inv_cdf(1.0 - 0.05 / len(LAMBDA_GRID))
     best_raw: Optional[dict[str, Any]] = None
     best_valid: Optional[dict[str, Any]] = None
 
     for lam in LAMBDA_GRID:
         oof_nll = np.zeros(n, dtype=np.float64)
         oof_hit_w = 0.0
-        for lo, hi in fold_bounds:
-            va_i = list(range(lo, hi))
-            tr_i = list(range(0, lo)) + list(range(hi, n))
+        for lo, hi, train_x, train_y, train_weights, freeze_fold in train_folds:
             wf = fit_newton_offset_ridge(
-                [X_list[i] for i in tr_i],
-                [y_list[i] for i in tr_i],
-                weights[tr_i],
-                lam,
-                freeze_ctx_lp=freeze_ctx,
+                train_x, train_y, train_weights, lam, freeze_ctx_lp=freeze_fold,
             )
-            for i in va_i:
+            wf = np.array(format_weights(wf))
+            for i in range(lo, hi):
                 s = X_list[i] @ wf
                 s -= float(np.max(s))
                 oof_nll[i] = math.log(float(np.sum(np.exp(s)))) - float(s[y_list[i]])
@@ -792,15 +791,17 @@ def main() -> None:
             }
             if best_raw is None or wl < best_raw["nll"] - 1e-9:
                 best_raw = cand_info
-            if z_score >= 1.645 and wa >= prior_acc - 1e-6:
+            if z_score >= z_critical and wa >= prior_acc - 1e-6:
                 w_cand = fit_newton_offset_ridge(
                     X_list, y_list, weights, lam, freeze_ctx_lp=freeze_ctx
                 )
                 w_fmt_cand = format_weights(w_cand)
                 sane_raw, _ = weights_pass_domain_sanity(w_cand)
                 sane_fmt, _ = weights_pass_domain_sanity(np.array(w_fmt_cand, dtype=np.float64))
-                if sane_raw and sane_fmt and (best_valid is None or wl < best_valid["nll"] - 1e-9):
-                    best_valid = {**cand_info, "w_new": w_cand, "w_fmt": w_fmt_cand}
+                if sane_raw and sane_fmt and w_fmt_cand != format_weights(W_PRIOR) and (
+                    best_valid is None or wl < best_valid["nll"] - 1e-9
+                ):
+                    best_valid = {**cand_info, "w_fmt": w_fmt_cand}
 
     if best_raw is None:
         print("\nPrior weights already achieve the lowest 5-fold log-loss; no update needed.")
@@ -811,33 +812,15 @@ def main() -> None:
             f"\nBest lambda={best_raw['lam']}: delta_NLL={best_raw['mean_d']:+.4f} +/- {best_raw['se_d']:.4f} "
             f"(z={best_raw['z']:.2f}, acc {prior_acc:.2f}% -> {best_raw['acc']:.2f}%)"
         )
-        w_check = fit_newton_offset_ridge(
-            X_list, y_list, weights, best_raw["lam"], freeze_ctx_lp=freeze_ctx
-        )
-        sane, reason = weights_pass_domain_sanity(w_check)
-        if not sane:
-            print(
-                f"Safety guard: fitted weights failed domain sanity check ({reason}); "
-                "keeping prior weights (check for selection-biased feedback logs)."
-            )
-        else:
-            print(
-                "Improvement is NOT statistically significant at 95% confidence (or drops Top-1 acc); "
-                "keeping prior weights to avoid overfitting."
-            )
+        print("No update passed the grid-adjusted NLL, Top-1 accuracy and weight guards; keeping prior weights.")
         return
 
     w_fmt = best_valid["w_fmt"]
-    prior_fmt = format_weights(W_PRIOR)
     print(
         f"\nBest lambda={best_valid['lam']}: delta_NLL={best_valid['mean_d']:+.4f} +/- {best_valid['se_d']:.4f} "
         f"(z={best_valid['z']:.2f}, acc {prior_acc:.2f}% -> {best_valid['acc']:.2f}%)"
     )
-    if w_fmt == prior_fmt:
-        print("Fitted weights match W_PRIOR after rounding; no update needed.")
-        return
-
-    print(f"Statistically significant improvement verified (z={best_valid['z']:.2f} >= 1.645)!")
+    print(f"Passed the grid-adjusted one-sided NLL test (z={best_valid['z']:.2f} >= {z_critical:.3f}).")
     print("Paste into rime_neural/fusion_weights in your schema custom yaml:")
     print(f"  fusion_weights: {w_fmt}")
 

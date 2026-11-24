@@ -139,8 +139,9 @@ function Test-Pe64Dll {
             if ($peOff -lt 0 -or ($peOff + 26) -gt $read) { return $false }
             if ($head[$peOff] -ne 0x50 -or $head[$peOff + 1] -ne 0x45 -or $head[$peOff + 2] -ne 0 -or $head[$peOff + 3] -ne 0) { return $false }
             $machine = [BitConverter]::ToUInt16($head, $peOff + 4)
+            $characteristics = [BitConverter]::ToUInt16($head, $peOff + 22)
             $magic = [BitConverter]::ToUInt16($head, $peOff + 24)
-            return ($machine -eq 0x8664 -and $magic -eq 0x20B)
+            return ($machine -eq 0x8664 -and $magic -eq 0x20B -and ($characteristics -band 0x2000) -ne 0)
         } finally {
             $fs.Dispose()
         }
@@ -534,7 +535,7 @@ try {
             Write-Output "Downloading pinned Microsoft.ML.OnnxRuntime $pinnedOrtVersion (win-x64) from NuGet..."
             Invoke-CurlDownload -Url $pinnedOrtUrl -OutFile $nupkg -Label "ONNX Runtime"
             $gotSha512 = Get-FileSha512Base64 -Path $nupkg
-            if ($gotSha512 -ne $pinnedOrtSha512) {
+            if ($gotSha512 -cne $pinnedOrtSha512) {
                 throw "SHA-512 mismatch on Microsoft.ML.OnnxRuntime $pinnedOrtVersion! Expected=$pinnedOrtSha512 Got=$gotSha512"
             }
             Write-Output "Verified Microsoft.ML.OnnxRuntime $pinnedOrtVersion NuGet SHA-512."
