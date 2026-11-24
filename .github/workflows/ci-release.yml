@@ -15,6 +15,33 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
+  lint-lua:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate Lua 5.4 syntax
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends lua5.4
+          luac5.4 -p lua/rime_neural.lua
+
+  msrv-windows-x64:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust MSRV (1.92)
+        uses: dtolnay/rust-toolchain@1.92
+
+      - name: Cache Cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check MSRV compatibility
+        run: cargo check --locked --all-targets
+
   build-windows-x64:
     runs-on: windows-latest
     steps:
@@ -29,79 +56,75 @@ jobs:
       - name: Cache Cargo registry & build
         uses: Swatinem/rust-cache@v2
 
-      - name: Validate tag matches Cargo.toml version
+      - name: Validate tag matches Cargo.toml, Cargo.lock & CHANGELOG.md
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         env:
           TAG: ${{ github.ref_name }}
         run: |
+          $ErrorActionPreference = "Stop"
           $cargo = Get-Content Cargo.toml -Raw -Encoding UTF8
           if ($cargo -notmatch '(?m)^version\s*=\s*"([^"]+)"') { throw "Failed to parse version in Cargo.toml" }
-          $expectedTag = "v$($Matches[1])"
+          $cargoVer = $Matches[1]
+          $expectedTag = "v$cargoVer"
           if ($env:TAG -ne $expectedTag) {
             throw "Git tag '$($env:TAG)' does not match Cargo.toml version '$expectedTag'"
           }
+          $lock = Get-Content Cargo.lock -Raw -Encoding UTF8
+          if ($lock -notmatch 'name = "rime_neural"\r?\nversion = "([^"]+)"') {
+            throw "Failed to locate rime_neural version in Cargo.lock"
+          }
+          if ($Matches[1] -ne $cargoVer) {
+            throw "Cargo.lock rime_neural version '$($Matches[1])' does not match Cargo.toml '$cargoVer'"
+          }
+          $changelog = Get-Content CHANGELOG.md -Raw -Encoding UTF8
+          $escapedTag = [regex]::Escape($env:TAG)
+          if ($changelog -notmatch "(?m)^## \[$escapedTag\]") {
+            throw "CHANGELOG.md is missing a section header for '$($env:TAG)'"
+          }
 
-      - name: Validate PowerShell scripts, Python tuner & YAML examples
-        shell: pwsh
+      - name: Validate PowerShell scripts (Windows PowerShell 5.1)
+        shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          # 1. PowerShell AST syntax + UTF-8 no-BOM pure-ASCII validation across all scripts
           foreach ($ps in @("scripts/install.ps1", "skills/rime-neural-setup/scripts/inspect-env.ps1", "skills/rime-neural-setup/scripts/verify-install.ps1")) {
             $full = (Resolve-Path $ps).Path
             $bytes = [System.IO.File]::ReadAllBytes($full)
             if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
-              throw "UTF-8 BOM detected in ${ps}"
+              throw "UTF-8 BOM detected in $ps"
             }
-            if ($bytes | Where-Object { $_ -gt 127 } | Select-Object -First 1) {
-              throw "Non-ASCII byte detected in ${ps}"
+            foreach ($b in $bytes) {
+              if ($b -gt 127) { throw "Non-ASCII byte detected in $ps" }
             }
             $tokens = $null
             $errs = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile($full, [ref]$tokens, [ref]$errs)
             if ($errs -and $errs.Count -gt 0) {
-              throw "PowerShell syntax error in ${ps}: $($errs | Out-String)"
+              throw "PowerShell 5.1 syntax error in ${ps}: $($errs | Out-String)"
             }
           }
-          # 2. Ensure Python test deps (numpy, pyyaml) & run tuner edge-case self-test
+
+      - name: Validate Python tuner & YAML files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
           python -c "import numpy, yaml" 2>$null
           if ($LASTEXITCODE -ne 0) {
             python -m pip install --quiet numpy pyyaml
             if ($LASTEXITCODE -ne 0) { throw "Failed to install numpy/pyyaml for CI checks" }
           }
-          python -m py_compile scripts/tune-fusion.py
+          python -m py_compile scripts/tune-fusion.py tests/test_tune_fusion.py
           if ($LASTEXITCODE -ne 0) { throw "py_compile failed" }
-          @'
-          import importlib.util, json, pathlib, tempfile, numpy as np
-          spec = importlib.util.spec_from_file_location("tf", "scripts/tune-fusion.py")
-          m = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(m)
-          with tempfile.TemporaryDirectory() as td:
-              p = pathlib.Path(td) / "feedback.jsonl"
-              p.write_text("\n".join([
-                  json.dumps({"v": 2, "logits": [1.0, 2.0], "gram_deltas": [0.0, 0.1], "char_lps": [0.0, 0.0], "shown_top1_idx": 1, "chosen_idx": 1, "has_ctx": True}),
-                  json.dumps({"cands": ["\u7532", "\u4e59"], "logits": [0.0, 1.0], "context": 123, "chosen_text": "\u4e59", "shown_top1": "\u4e59"}),
-                  json.dumps({"v": 2, "logits": [1.0, 2.0], "chosen_idx": True, "shown_top1_idx": False}),
-              ]) + "\n", encoding="utf-8")
-              X, y, w, s = m.load_samples(p)
-              assert len(X) == 2 and s["legacy_v1"] == 1, (len(X), s)
-              conv, kept = m.scrub_legacy_log_files(p)
-              assert conv == 1 and kept == 2, (conv, kept)
-              assert "chosen_text" not in p.read_text(encoding="utf-8")
-          assert not m.weights_pass_domain_sanity(np.array([1.0, 0.5, 0.0, 0.0, 0.0]))[0]
-          assert m.weights_pass_domain_sanity(m.W_PRIOR)[0]
-          print("tune-fusion self-test OK")
-          '@ | python -
-          if ($LASTEXITCODE -ne 0) { throw "tune-fusion self-test failed" }
-          # 3. Validate example YAML files
-          python -c "import glob, yaml; [yaml.safe_load(open(f, encoding='utf-8')) for f in glob.glob('examples/*.custom.yaml')]; print('YAML examples OK')"
+          python -m unittest discover -s tests -v
+          if ($LASTEXITCODE -ne 0) { throw "Python unit tests failed" }
+          python -c "import glob, yaml; files = glob.glob('examples/*.custom.yaml') + ['.github/workflows/ci-release.yml']; [yaml.safe_load(open(f, encoding='utf-8')) for f in files]; print(f'YAML OK ({len(files)} files)')"
           if ($LASTEXITCODE -ne 0) { throw "YAML validation failed" }
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Run Clippy (strict)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Run unit tests
         run: cargo test --locked
@@ -113,6 +136,13 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $cargo = Get-Content Cargo.toml -Raw -Encoding UTF8
+          if ($cargo -notmatch '(?m)^version\s*=\s*"([^"]+)"') { throw "Failed to parse Cargo.toml version" }
+          $cargoVer = $Matches[1]
+          $vi = (Get-Item target/release/rime_neural.dll).VersionInfo
+          if ($vi.ProductVersion -ne $cargoVer) {
+            throw "Embedded DLL ProductVersion '$($vi.ProductVersion)' does not match Cargo.toml '$cargoVer'"
+          }
           $tag = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "dev" }
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target/release/rime_neural.dll dist/rime_neural.dll
@@ -128,10 +158,19 @@ jobs:
           $hZip = (Get-FileHash "dist/$zipName" -Algorithm SHA256).Hash.ToLowerInvariant()
           $outerSums = "$innerSums$hZip  $zipName`n"
           [System.IO.File]::WriteAllText((Join-Path (Resolve-Path dist).Path "SHA256SUMS.txt"), $outerSums, $utf8NoBom)
-          # Self-verify generated SHA256SUMS.txt
-          foreach ($entry in @(@("rime_neural.dll", $hDll), @("rime_neural.lua", $hLua), @($zipName, $hZip))) {
-            $got = (Get-FileHash "dist/$($entry[0])" -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($got -ne $entry[1]) { throw "Self-verification failed for $($entry[0])" }
+          # Parse generated SHA256SUMS.txt using the exact installer regex and verify all entries
+          $parsed = @{}
+          foreach ($line in (Get-Content dist/SHA256SUMS.txt -Encoding UTF8)) {
+            if ($line -match '^([0-9a-fA-F]{64})\s+\*?(.+?)\s*$') {
+              $parsed[$Matches[2].Trim()] = $Matches[1].ToLowerInvariant()
+            } elseif ($line.Trim()) {
+              throw "Malformed SHA256SUMS.txt line: $line"
+            }
+          }
+          foreach ($name in @("rime_neural.dll", "rime_neural.lua", $zipName)) {
+            if (-not $parsed.ContainsKey($name)) { throw "Missing entry '$name' in SHA256SUMS.txt" }
+            $got = (Get-FileHash "dist/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($got -ne $parsed[$name]) { throw "SHA256SUMS.txt verification failed for $name" }
           }
 
       - name: Upload workflow artifact
@@ -144,7 +183,7 @@ jobs:
 
   publish-release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build-windows-x64
+    needs: [build-windows-x64, lint-lua, msrv-windows-x64]
     runs-on: windows-latest
     permissions:
       contents: write
@@ -163,16 +202,35 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $tag = $env:TAG
-          $zipItem = Get-ChildItem dist -Filter "rime-neural-*-win-x64.zip" | Select-Object -First 1
-          if (-not $zipItem) { throw "Release zip artifact not found in dist/" }
-          $zip = $zipItem.FullName
-          $sums = "dist/SHA256SUMS.txt"
-          if (-not (Test-Path $sums)) { throw "SHA256SUMS.txt missing from dist/" }
+          $zipName = "rime-neural-$tag-win-x64.zip"
+          $zip = Join-Path (Resolve-Path dist).Path $zipName
+          if (-not (Test-Path -LiteralPath $zip -PathType Leaf)) {
+            throw "Expected release zip artifact not found: $zip"
+          }
+          $sums = Join-Path (Resolve-Path dist).Path "SHA256SUMS.txt"
+          if (-not (Test-Path -LiteralPath $sums -PathType Leaf)) {
+            throw "SHA256SUMS.txt missing from dist/"
+          }
+          $expectedZipHash = $null
+          foreach ($line in (Get-Content -LiteralPath $sums -Encoding UTF8)) {
+            if ($line -match '^([0-9a-fA-F]{64})\s+\*?(.+?)\s*$' -and $Matches[2].Trim() -eq $zipName) {
+              $expectedZipHash = $Matches[1].ToLowerInvariant()
+            }
+          }
+          if (-not $expectedZipHash) { throw "Missing '$zipName' hash in SHA256SUMS.txt" }
+          $actualZipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualZipHash -ne $expectedZipHash) {
+            throw "Downloaded artifact hash mismatch for ${zipName}: expected $expectedZipHash, got $actualZipHash"
+          }
           $viewOut = & gh release view $tag 2>&1 | Out-String
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag $zip $sums --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed with exit code $LASTEXITCODE" }
           } elseif ($viewOut -match 'release not found|404') {
-            gh release create $tag $zip $sums --title "rime-neural $tag" --generate-notes
+            $createArgs = @("release", "create", $tag, $zip, $sums, "--title", "rime-neural $tag", "--generate-notes")
+            if ($tag -match '-') { $createArgs += "--prerelease" }
+            & gh @createArgs
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit code $LASTEXITCODE" }
           } else {
             throw "gh release view failed unexpectedly: $viewOut"
           }

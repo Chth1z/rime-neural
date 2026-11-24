@@ -5,6 +5,13 @@
 *.onnx
 *.gram
 onnxruntime.dll
+rime_neural.dll
+tokenizer.json
+unified_vocab.json
+feedback.jsonl*
+*.zip
+*.nupkg
+.venv/
 __pycache__/
 *.pyc
 .DS_Store
