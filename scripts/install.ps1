@@ -363,8 +363,8 @@ if (-not $RimeDir) { $RimeDir = Get-DefaultRimeDir }
 $repoRoot  = if ($PSScriptRoot) { (Resolve-Path (Join-Path $PSScriptRoot "..")).Path } else { "" }
 $neuralDir = if ($DataDir) { $DataDir.Trim() } else { Join-Path $RimeDir "neural" }
 $luaDir    = Join-Path $RimeDir "lua"
-$baseHeaders = @{ "User-Agent" = "rime-neural-installer/1.2" }
-$authHeaders = @{ "User-Agent" = "rime-neural-installer/1.2" }
+$baseHeaders = @{ "User-Agent" = "rime-neural-installer/1.3" }
+$authHeaders = @{ "User-Agent" = "rime-neural-installer/1.3" }
 $ghToken   = if ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } elseif ($env:GH_TOKEN) { $env:GH_TOKEN } else { "" }
 if ($ghToken) { $authHeaders["Authorization"] = "Bearer $ghToken" }
 
@@ -413,6 +413,10 @@ $pruneOtherOnnx = $false
 $stagedOrtDll   = $null
 $builtDll       = ""
 $luaSrc         = if ($repoRoot) { Join-Path $repoRoot "lua\rime_neural.lua" } else { "" }
+$repairLuaSrc   = if ($repoRoot) {
+    $candRepair = Join-Path $repoRoot "lua\rime_neural_repair.lua"
+    if (Test-Path -LiteralPath $candRepair -PathType Leaf) { $candRepair } else { "" }
+} else { "" }
 $serverExe      = Resolve-WeaselServerExe
 $wasRunning     = [bool](Get-Process -Name WeaselServer -ErrorAction SilentlyContinue)
 $stoppedWeasel  = $false
@@ -624,13 +628,20 @@ try {
         }
 
         $relEx = Join-Path $relStage "ex"
-        $relMap = Expand-ZipAllowlisted -ArchivePath $relZip -DestDir $relEx -AllowNames @("rime_neural.dll", "rime_neural.lua")
+        $relMap = Expand-ZipAllowlisted -ArchivePath $relZip -DestDir $relEx -AllowNames @("rime_neural.dll", "rime_neural.lua", "rime_neural_repair.lua")
         $builtDll = $relMap["rime_neural.dll"]
         $relLua   = $relMap["rime_neural.lua"]
+        $relRepairLua = $relMap["rime_neural_repair.lua"]
         if (-not $builtDll -or -not $relLua) { throw "Release zip missing rime_neural.dll or rime_neural.lua." }
         Assert-Sha256InSums -SumsPath $extSums -EntryName "rime_neural.dll" -ActualPath $builtDll
         Assert-Sha256InSums -SumsPath $extSums -EntryName "rime_neural.lua" -ActualPath $relLua
         $luaSrc = $relLua
+        if ($relRepairLua) {
+            Assert-Sha256InSums -SumsPath $extSums -EntryName "rime_neural_repair.lua" -ActualPath $relRepairLua
+            $repairLuaSrc = $relRepairLua
+        } else {
+            $repairLuaSrc = ""
+        }
     } elseif ($PrebuiltDll) {
         if (-not (Test-Path -LiteralPath $PrebuiltDll -PathType Leaf)) {
             throw "Specified -PrebuiltDll not found: $PrebuiltDll"
@@ -686,6 +697,9 @@ try {
     if ($stagedOrtDll) { Backup-TargetForRollback -TargetPath $targetOrt }
     Backup-TargetForRollback -TargetPath (Join-Path $neuralDir "rime_neural.dll")
     Backup-TargetForRollback -TargetPath (Join-Path $luaDir "rime_neural.lua")
+    if ($repairLuaSrc) {
+        Backup-TargetForRollback -TargetPath (Join-Path $luaDir "rime_neural_repair.lua")
+    }
 
     # Install lock-prone DLLs first so any residual file lock fails before mutating model assets
     Copy-StagedTracked -Source $builtDll -Destination (Join-Path $neuralDir "rime_neural.dll")
@@ -716,6 +730,10 @@ try {
 
     Copy-StagedTracked -Source $luaSrc -Destination (Join-Path $luaDir "rime_neural.lua")
     Write-Output "Installed rime_neural.lua -> $luaDir"
+    if ($repairLuaSrc -and (Test-Path -LiteralPath $repairLuaSrc -PathType Leaf)) {
+        Copy-StagedTracked -Source $repairLuaSrc -Destination (Join-Path $luaDir "rime_neural_repair.lua")
+        Write-Output "Installed rime_neural_repair.lua (optional processor) -> $luaDir"
+    }
 
     if ($shouldRestart) {
         Start-WeaselServerDetached -ServerExe $serverExe

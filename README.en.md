@@ -21,12 +21,13 @@
 
 ### Features
 
-- **Complements `.gram` language models**: Works standalone or paired with a Chinese statistical grammar model (such as [`wanxiang-lts-zh-hans.gram`](https://github.com/amzxyz/rime-wanxiang-data/releases/tag/LTS)). Rime uses `.gram` to generate Top-8 sentence candidates; `rime-neural` shares a read-only mapping of the same `.gram` file across schemas and uses each schema’s penalties to fuse neural logits, `.gram` transition scores, and rank priors, with optional KV-cached Pass-2 P2C verification for high-confidence OOV sentences.
+- **Complements `.gram` language models with focus-bound context entity splice**: Works standalone or paired with a Chinese statistical grammar model (such as [`wanxiang-lts-zh-hans.gram`](https://github.com/amzxyz/rime-wanxiang-data/releases/tag/LTS)). Rime uses `.gram` to generate Top-8 sentence candidates; `rime-neural` shares a read-only mapping of the same `.gram` file across schemas and uses each schema’s penalties to fuse neural logits, `.gram` transition scores, and rank priors. A batched KV-cached Pass-2 cross-encoder check verifies both high-confidence OOV `char_logits` candidates and maximal 2+ character homophone entity spans (names, rare terms) present in the active focus-bound context.
+- **Optional pre-commit span repair & literal lock (`lua/rime_neural_repair.lua`)**: An opt-in standalone `lua_processor` mounted at the front of `engine/processors` (idle path costs at most two `KeyEvent:eq` comparisons). Supports word-aligned pre-commit homophone repair (`Alt+r`, `Left`/`Right`, `1..9`/`Space`, exact revert on `Escape`/`Alt+r`) without altering raw spelling or caret position, and verbatim ASCII literal locking (`Alt+l` for `GPUv2`, `OAuth2`, `v1.2.1`, `rime-neural`, `CI/CD`) as a native confirmed `raw` segment inside Chinese compositions.
 - **Sentence-only scope**: Reranks candidates with `cand:get_genuine().type == "sentence"` on configured segment tags (default `["abc"]`), preserving original order for exact dictionary words, `userdb` phrases, English words, dates, numbers, and punctuation.
 - **Full Pinyin and 7 Double Pinyin layouts**: Auto-detects Full Pinyin, Natural/ZRM, Flypy, MSPY (`; = ing`), Sogou (`; = ing`), Intelligent ABC, Ziguang (`; = ing`), and Pinyin Jiajia (PYJJ), supporting `rime-ice`, `rime-frost`, `rime-wanxiang`, and custom schemas.
 - **Local CPU inference and in-process reuse**: Runs quantized ONNX Runtime models with a 16-slot prefix KV-cache offline on CPU. Initializes asynchronously on a background thread and pins the DLL in-process via `GetModuleHandleExA(PIN)` so Rime redeploys reuse the loaded engine.
 - **Dynamic model introspection**: Reads ONNX graph geometry and `unified_vocab.json` at startup, supporting both 12-layer `ML-pumpkin-1103` (default, ~82 MB) and 8-layer `zhen-feather-preview-1121` (~38 MB) with the same DLL.
-- **Bounded UIA context and privacy controls**: A dedicated background MTA thread reads up to 64 characters before the caret via Windows UIA (`< 2 µs` hot path), bounded by `RangeFromChild(&focused)` (falling back to `DocumentRange`) and `U+FFFC` object separators. Focus changes immediately invalidate the frozen composition context. Classified non-`TextPattern` controls reuse Rime session history only within the same `(HWND, focus_epoch)`. Password fields, protected processes, password managers, remote-session clients, and local terminals fail closed, returning empty context and suspending feedback logging.
+- **Bounded UIA context and privacy controls**: A dedicated background MTA thread reads up to 64 characters before the caret via Windows UIA (`< 2 µs` hot path), bounded by `RangeFromChild(&focused)` (falling back to `DocumentRange`) and `U+FFFC` object separators. Focus changes immediately invalidate the frozen composition context. Classified non-`TextPattern` controls reuse only commits recorded within the current `(HWND, focus_epoch)`. Password fields, protected processes, password managers, remote-session clients, and local terminals fail closed, returning empty context and suspending feedback logging.
 
 ### Requirements & Limitations
 
@@ -107,6 +108,18 @@ patch:
 Save and run **Weasel Deploy (重新部署)**.
 
 > **`rime-wanxiang` Double Pinyin users**: Because `rime-wanxiang` retains `schema_id: wanxiang` when switching double pinyin via `speller/algebra`, set `pinyin_layout` explicitly (e.g. `flypy`, `zrm`, `mspy`).
+
+#### 3. Optional: Enable Pre-Commit Local Span Repair & Literal Lock
+
+To enable word-level pre-commit homophone repair (`Alt+r`) and verbatim ASCII literal locking (`Alt+l`), merge [`examples/rime_neural_repair.custom.yaml`](examples/rime_neural_repair.custom.yaml) into your schema's `*.custom.yaml`:
+
+```yaml
+patch:
+  "engine/processors/@before 0": lua_processor@*rime_neural_repair
+  rime_neural_repair:
+    repair_key: "Alt+r"   # Set "" to disable homophone repair
+    lock_key: "Alt+l"     # Set "" to disable literal lock
+```
 
 ---
 
@@ -193,9 +206,10 @@ Intel Core Ultra 7 255HX, isolated `rime.dll` benchmark:
 
 ```text
 Official Weasel (WeaselServer.exe / rime.dll, librime >= 1.17.0, Lua 5.4)
-  ├── lua/rime_neural.lua            # Lua filter: layout resolution, sentence/tag gating, per-composition UIA freeze, numeric feedback
+  ├── lua/rime_neural.lua            # Lua filter: layout resolution, sentence/tag gating, focus-scoped context freeze, numeric feedback
+  ├── lua/rime_neural_repair.lua     # Optional Lua processor: pre-commit homophone repair (Alt+r) & literal lock (Alt+l)
   └── neural/rime_neural.dll (Rust)  # Dynamic Lua 5.4 C API (C-unwind), in-process pin, embedded PE VERSIONINFO
-        ├── engine.rs                # ONNX introspection, selective outputs, 16-slot KV-cache, Pass-2 P2C, per-schema .gram cache
+        ├── engine.rs                # ONNX introspection, selective outputs, 16-slot KV-cache, Pass-2 P2C & context entity splice, per-schema .gram cache
         ├── gram.rs                  # Zero-extra-RAM Win32 file mapping for Rime::Grammar/1.0 (BMP & non-BMP UTF-8)
         ├── pinyin.rs                # 3-phase memoized Full Pinyin + DP splitter + 7 Double Pinyin layouts
         ├── uia.rs                   # Background MTA UIA (focus-change events + element-bounds clamp + 200ms timeout + denylist)

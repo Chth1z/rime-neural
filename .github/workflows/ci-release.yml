@@ -25,7 +25,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends lua5.4
-          luac5.4 -p lua/rime_neural.lua
+          luac5.4 -p lua/rime_neural.lua lua/rime_neural_repair.lua
 
   msrv-windows-x64:
     runs-on: windows-latest
@@ -147,14 +147,16 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target/release/rime_neural.dll dist/rime_neural.dll
           Copy-Item lua/rime_neural.lua dist/rime_neural.lua
+          Copy-Item lua/rime_neural_repair.lua dist/rime_neural_repair.lua
           Copy-Item LICENSE dist/LICENSE
           $hDll = (Get-FileHash dist/rime_neural.dll -Algorithm SHA256).Hash.ToLowerInvariant()
           $hLua = (Get-FileHash dist/rime_neural.lua -Algorithm SHA256).Hash.ToLowerInvariant()
+          $hRepair = (Get-FileHash dist/rime_neural_repair.lua -Algorithm SHA256).Hash.ToLowerInvariant()
           $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-          $innerSums = "$hDll  rime_neural.dll`n$hLua  rime_neural.lua`n"
+          $innerSums = "$hDll  rime_neural.dll`n$hLua  rime_neural.lua`n$hRepair  rime_neural_repair.lua`n"
           [System.IO.File]::WriteAllText((Join-Path (Resolve-Path dist).Path "SHA256SUMS.txt"), $innerSums, $utf8NoBom)
           $zipName = "rime-neural-$tag-win-x64.zip"
-          Compress-Archive -Path dist/rime_neural.dll, dist/rime_neural.lua, dist/LICENSE, dist/SHA256SUMS.txt -DestinationPath "dist/$zipName" -Force
+          Compress-Archive -Path dist/rime_neural.dll, dist/rime_neural.lua, dist/rime_neural_repair.lua, dist/LICENSE, dist/SHA256SUMS.txt -DestinationPath "dist/$zipName" -Force
           $hZip = (Get-FileHash "dist/$zipName" -Algorithm SHA256).Hash.ToLowerInvariant()
           $outerSums = "$innerSums$hZip  $zipName`n"
           [System.IO.File]::WriteAllText((Join-Path (Resolve-Path dist).Path "SHA256SUMS.txt"), $outerSums, $utf8NoBom)
@@ -167,7 +169,7 @@ jobs:
               throw "Malformed SHA256SUMS.txt line: $line"
             }
           }
-          foreach ($name in @("rime_neural.dll", "rime_neural.lua", $zipName)) {
+          foreach ($name in @("rime_neural.dll", "rime_neural.lua", "rime_neural_repair.lua", $zipName)) {
             if (-not $parsed.ContainsKey($name)) { throw "Missing entry '$name' in SHA256SUMS.txt" }
             $got = (Get-FileHash "dist/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
             if ($got -ne $parsed[$name]) { throw "SHA256SUMS.txt verification failed for $name" }

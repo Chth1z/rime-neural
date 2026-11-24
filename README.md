@@ -21,12 +21,13 @@
 
 ### 特性
 
-- **与 `.gram` 语言模型协同**：支持单独运行，也支持搭配中文统计语法模型（推荐 [`wanxiang-lts-zh-hans.gram`](https://github.com/amzxyz/rime-wanxiang-data/releases/tag/LTS)）。Rime 借助 `.gram` 生成 Top-8 整句候选，插件按路径共享只读 `.gram` 映射，按方案应用惩罚参数，联合融合神经模型分数、`.gram` 搭配分与候选位置先验，并对高置信度未登录整句执行 KV 缓存 Pass-2 校验合成。
+- **与 `.gram` 语言模型协同与聚焦上文实体拼接**：支持单独运行，也支持搭配中文统计语法模型（推荐 [`wanxiang-lts-zh-hans.gram`](https://github.com/amzxyz/rime-wanxiang-data/releases/tag/LTS)）。Rime 借助 `.gram` 生成 Top-8 整句候选，插件按路径共享只读 `.gram` 映射，按方案应用惩罚参数，联合融合神经模型分数、`.gram` 搭配分与候选位置先验；并对高置信度未登录整句及当前聚焦上文中出现过的 2 字及以上同音专名/术语（如人名、生僻词）执行单次 KV 缓存 Pass-2 交叉编码器与 `.gram` 联合校验合成。
+- **可选提交前词级修复与字面锁定（`lua/rime_neural_repair.lua`）**：作为独立的可选 `lua_processor` 挂载于 `engine/processors` 首位（常态按键仅执行至多 2 次 `KeyEvent:eq` 判断）。支持在不破坏原始拼音串与不移动物理光标的前提下，通过 `Alt+r` 按词边界步进（`Left`/`Right`）完成提交前同音词替换（`1..9`/`Space`）或无损取消（`Escape`/`Alt+r`）；并通过 `Alt+l` 将技术标识符（`GPUv2`、`OAuth2`、`v1.2.1`、`rime-neural`、`CI/CD` 等）以原生 `raw` 已确认分段嵌入中文句内。
 - **仅作用于整句候选**：仅重排配置分段标签（默认 `abc`）下 `cand:get_genuine().type == "sentence"` 的整句候选，词典精确词条、用户词典、英文混输、日期、数字与标点保持原序。
 - **全拼与 7 套双拼**：自动识别全拼以及自然码（ZRM）、小鹤（Flypy）、微软（MSPY，含 `; = ing`）、搜狗（Sogou，含 `; = ing`）、智能 ABC、紫光（含 `; = ing`）、拼音加加（PYJJ），适配雾凇、白霜、万象及自定义方案。
 - **本地 CPU 推理与进程内复用**：基于 ONNX Runtime 量化模型与 16 槽前缀 KV-cache 在 CPU 离线运行；启动阶段异步加载模型，模块通过 `GetModuleHandleExA(PIN)` 钉驻小狼毫进程，重新部署时直接复用已加载实例。
 - **多模型自动识别**：启动时读取 ONNX 图结构与 `unified_vocab.json`，同一份 `rime_neural.dll` 支持 12 层 `ML-pumpkin-1103`（默认，约 82 MB）与 8 层 `zhen-feather-preview-1121`（约 38 MB）。
-- **跨应用前文读取与隐私保护**：独立后台 MTA 线程通过 Windows UIA 读取光标前最多 64 字（按键热路径 `< 2 µs`），读取范围严格钳制在当前焦点控件边界（`RangeFromChild` / `DocumentRange`）与 `U+FFFC` 对象边界之内；每次编码会话冻结上文快照，焦点或窗口切换时立即失效。已确认安全的非 `TextPattern` 控件仅在相同焦点周期（`(HWND, focus_epoch)`）内沿用 Rime 会话历史与已确认前缀。遇到密码控件、受保护进程、密码管理器、远程会话客户端及本地终端时 fail-closed 返回空上文并停止记录日志。
+- **跨应用前文读取与隐私保护**：独立后台 MTA 线程通过 Windows UIA 读取光标前最多 64 字（按键热路径 `< 2 µs`），读取范围严格钳制在当前焦点控件边界（`RangeFromChild` / `DocumentRange`）与 `U+FFFC` 对象边界之内；每次编码会话冻结上文快照，焦点或窗口切换时立即失效。已确认安全的非 `TextPattern` 控件仅在相同焦点周期（`(HWND, focus_epoch)`）内沿用该焦点周期内产生的 Rime 提交历史与已确认前缀。遇到密码控件、受保护进程、密码管理器、远程会话客户端及本地终端时 fail-closed 返回空上文并停止记录日志。
 
 ### 运行要求与限制
 
@@ -107,6 +108,18 @@ patch:
 保存后执行小狼毫 **「重新部署」**。
 
 > **万象拼音（`rime-wanxiang`）双拼用户**：万象切换双拼时 `schema_id` 通常保持为 `wanxiang`，`auto` 会识别为全拼，需将 `pinyin_layout` 显式设为对应的双拼布局（如 `flypy`、`zrm`、`mspy`）。
+
+#### 3. 可选：启用提交前词级修复与字面锁定
+
+如需在提交前按词替换同音词（`Alt+r`）或嵌入原样 ASCII 标识符（`Alt+l`），可将 [`examples/rime_neural_repair.custom.yaml`](examples/rime_neural_repair.custom.yaml) 中的配置合并到方案的 `*.custom.yaml`：
+
+```yaml
+patch:
+  "engine/processors/@before 0": lua_processor@*rime_neural_repair
+  rime_neural_repair:
+    repair_key: "Alt+r"   # 置空 "" 可单独关闭词级同音修复
+    lock_key: "Alt+l"     # 置空 "" 可单独关闭字面锁定
+```
 
 ---
 
@@ -193,9 +206,10 @@ Intel Core Ultra 7 255HX，隔离 `rime.dll` 基准实测：
 
 ```text
 官方小狼毫 (WeaselServer.exe / rime.dll, librime >= 1.17.0, Lua 5.4)
-  ├── lua/rime_neural.lua            # Lua 滤镜：布局识别、整句/标签门控、会话上文冻结、纯数值反馈
+  ├── lua/rime_neural.lua            # Lua 滤镜：布局识别、整句/标签门控、聚焦上文冻结、纯数值反馈
+  ├── lua/rime_neural_repair.lua     # 可选 Lua 处理器：提交前词级同音修复 (Alt+r) 与原样字面锁定 (Alt+l)
   └── neural/rime_neural.dll (Rust)  # 动态解析 Lua 5.4 C API（C-unwind），进程内钉驻，内嵌 PE 版本信息
-        ├── engine.rs                # ONNX 结构自省、选择性输出裁剪、16 槽 KV-cache、Pass-2 P2C、按方案 .gram 缓存
+        ├── engine.rs                # ONNX 结构自省、选择性输出裁剪、16 槽 KV-cache、Pass-2 P2C 与上文实体拼接、按方案 .gram 缓存
         ├── gram.rs                  # Win32 共享内存只读映射 Rime::Grammar/1.0（兼容 BMP/非 BMP UTF-8）
         ├── pinyin.rs                # 3 阶段记忆化全拼对齐 + DP 切分 + 7 套双拼码表
         ├── uia.rs                   # 后台 MTA UIA（焦点变更事件 + 控件边界钳制 + 200ms 超时 + 密码/终端屏蔽）
