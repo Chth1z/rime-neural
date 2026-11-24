@@ -100,3 +100,24 @@ To point a schema at a specific model filename inside an existing paired directo
 ```yaml
   rime_neural/model_file: laya.one.w4.onnx
 ```
+
+---
+
+## Optional: Custom ASCII `data_dir` (Non-ASCII Windows Usernames)
+
+Lua 5.4's `package.loadlib` on Windows uses the system ANSI codepage (`LoadLibraryExA`). When `<RimeUserDir>` contains non-ASCII characters (such as Chinese usernames), install neural artifacts to an ASCII path via `-DataDir "C:\ProgramData\rime-neural"` and point the schema to it using **single quotes** or **forward slashes** (double-quoted YAML treats `\n` / `\t` as escape sequences):
+
+```yaml
+  rime_neural/data_dir: 'C:\ProgramData\rime-neural'
+  # or: rime_neural/data_dir: 'C:/ProgramData/rime-neural'
+```
+
+---
+
+## Optional: Custom Segment Tags
+
+By default `rime-neural` only reranks segments tagged `abc` (`rime_neural/tags: [abc]`). Schemas that assign a custom segment tag to Chinese pinyin segments can override the allowlist:
+
+```yaml
+  rime_neural/tags: [abc]
+```

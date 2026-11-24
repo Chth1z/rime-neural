@@ -21,12 +21,12 @@
 
 ### 特性
 
-- **与 `.gram` 语言模型协同**：支持单独运行，也支持搭配中文统计语法模型（推荐 [`wanxiang-lts-zh-hans.gram`](https://github.com/amzxyz/rime-wanxiang-data/releases/tag/LTS)）。Rime 借助 `.gram` 生成 Top-8 整句候选，插件通过 Win32 共享内存以只读方式映射同一份 `.gram` 文件（零额外物理内存），联合融合神经模型分数、`.gram` 搭配分与候选位置先验，并对高置信度未登录整句执行 KV 缓存 Pass-2 校验合成。
-- **仅作用于整句候选**：仅重排 `cand:get_genuine().type == "sentence"` 的整句候选，词典精确词条、用户词典、英文混输、日期、数字与标点保持原序。
+- **与 `.gram` 语言模型协同**：支持单独运行，也支持搭配中文统计语法模型（推荐 [`wanxiang-lts-zh-hans.gram`](https://github.com/amzxyz/rime-wanxiang-data/releases/tag/LTS)）。Rime 借助 `.gram` 生成 Top-8 整句候选，插件通过 Win32 共享内存以只读方式映射同一份 `.gram` 文件（零额外物理内存），按方案独立缓存对应的 `.gram` 与惩罚参数，联合融合神经模型分数、`.gram` 搭配分与候选位置先验，并对高置信度未登录整句执行 KV 缓存 Pass-2 校验合成。
+- **仅作用于整句候选**：仅重排配置分段标签（默认 `abc`）下 `cand:get_genuine().type == "sentence"` 的整句候选，词典精确词条、用户词典、英文混输、日期、数字与标点保持原序。
 - **全拼与 7 套双拼**：自动识别全拼以及自然码（ZRM）、小鹤（Flypy）、微软（MSPY，含 `; = ing`）、搜狗（Sogou，含 `; = ing`）、智能 ABC、紫光（含 `; = ing`）、拼音加加（PYJJ），适配雾凇、白霜、万象及自定义方案。
 - **本地 CPU 推理与进程内复用**：基于 ONNX Runtime 量化模型与 16 槽前缀 KV-cache 在 CPU 离线运行；启动阶段异步加载模型，模块通过 `GetModuleHandleExA(PIN)` 钉驻小狼毫进程，重新部署时直接复用已加载实例。
 - **多模型自动识别**：启动时读取 ONNX 图结构与 `unified_vocab.json`，同一份 `rime_neural.dll` 支持 12 层 `ML-pumpkin-1103`（默认，约 82 MB）与 8 层 `zhen-feather-preview-1121`（约 38 MB）。
-- **跨应用前文读取与隐私保护**：独立后台 MTA 线程通过 Windows UIA 读取光标前最多 64 字（按键热路径 `< 2 µs`），读取范围限制在当前焦点控件（`RangeFromChild`）与 `U+FFFC` 之内；切换前台窗口时隔离旧上文；遇到密码控件、受保护进程及常见密码管理器 / 远程会话客户端时 fail-closed 返回空上文并停止记录日志。
+- **跨应用前文读取与隐私保护**：独立后台 MTA 线程通过 Windows UIA 读取光标前最多 64 字（按键热路径 `< 2 µs`），读取范围严格钳制在当前焦点控件（`RangeFromChild`）与 `U+FFFC` 之内；每次编码会话冻结上文快照，焦点切换或窗口切换时立即隔离旧上文；遇到密码控件、受保护进程、密码管理器、远程会话客户端及本地终端时 fail-closed 返回空上文并停止记录日志。
 
 ### 运行要求与限制
 
@@ -65,8 +65,8 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Prebuilt -Model fe
 安装脚本会依次完成：
 1. 从 GitHub Releases 下载预编译 `rime-neural-*-win-x64.zip` 并校验独立资产 `SHA256SUMS.txt`；
 2. 从 `dd1000001000/zhiyi_models` 下载所选 Apache-2.0 ONNX 模型并全量校验 `.onnx`、`tokenizer.json` 与 `unified_vocab.json` 的 SHA-256；
-3. 从 Microsoft NuGet 下载锁定版本并校验 SHA-512 的官方 `onnxruntime.dll`（win-x64，也支持通过 `-OrtDllPath` 指定本机 DLL）；
-4. 停止小狼毫并备份待覆盖文件，将组件安装至 Rime 用户目录（自动读取注册表 `RimeUserDir`，默认 `%APPDATA%\Rime\neural\`；非 ASCII 用户名可通过 `-DataDir` 指定 ASCII 路径）与 `lua\rime_neural.lua`，随后重启小狼毫。
+3. 从 Microsoft NuGet 下载锁定版本并校验 SHA-512 / SHA-256 的官方 `onnxruntime.dll`（win-x64，也支持通过 `-OrtDllPath` 指定本机 DLL）；
+4. 停止小狼毫并备份待覆盖文件，将组件安装至 Rime 用户目录（自动读取注册表 `RimeUserDir`，默认 `%APPDATA%\Rime\neural\`；非 ASCII 用户名可通过 `-DataDir` 指定 ASCII 路径）与 `lua\rime_neural.lua`，失败时完整回滚，完成后重启小狼毫。
 
 从源码编译（需 Rust 1.92+）时，省略 `-Prebuilt` 直接执行 `scripts\install.ps1`。
 
@@ -85,7 +85,7 @@ patch:
   # 挂载于 filters 首位（位于简繁转换 / OpenCC 之前）
   engine/filters/@before 0: lua_filter@*rime_neural
 
-  # 可选：在 F4 菜单中添加「统计 / 神经」切换开关
+  # 可选：在 F4 菜单中添加「统计 / 神经」切换开关（省略时默认开启）
   switches/+:
     - name: neural_rerank
       states: [ 统计, 神经 ]
@@ -100,7 +100,7 @@ patch:
     p2c_verify_margin: 0.20      # <= 0 关闭 Pass-2 P2C 合成
     enable_uia_context: true
     threads: 0                   # 0 = 自动适配 CPU 核数（限幅 4..8）
-    log_feedback: true           # 零明文纯数值本地日志（上限 5 MiB）
+    log_feedback: true           # 零明文纯数值本地日志（单文件上限 5 MiB + 1 份 .1 轮转）
     sync_init: false             # 异步加载
 ```
 
@@ -114,7 +114,7 @@ patch:
 
 ### 测试环境
 
-- **运行环境**：官方小狼毫 `0.17.4`（`librime 1.17.0`），测试期间关闭用户词库（`enable_user_dict: false`）与 UIA 读屏；硬件为 Intel Core Ultra 7 255HX。
+- **运行环境与模型**：官方小狼毫 `0.17.4`（`librime 1.17.0`），默认 12 层量化模型 `ML-pumpkin-1103`（`threads: 0`，自动限幅 `4..8` 线程），测试期间关闭用户词库（`enable_user_dict: false`）与 UIA 读屏；硬件为 Intel Core Ultra 7 255HX。
 - **方案与词库基线**：端到端评测配置见 [`Chth1z/rime-chth1z`](https://github.com/Chth1z/rime-chth1z)（上游 `gaboolic/rime-frost` 词库 + `wanxiang-lts-zh-hans.gram`，注释 `41448` 与 `GB18030-2022` 生僻字表，`grammar/collocation_penalty: -15.5`）。下表同时列出同环境关闭 `rime-neural` 的统计基线及 `-14` 惩罚参数对照。
 
 ### 1. Rime 主流方案对比（`gaboolic/rime-schema-compare/report/latest.md`）
@@ -150,9 +150,9 @@ patch:
 | 手心输入法（原报告 Notepad 黑盒） | `71.14%` | `94.48%` | `86.11%` | `66.18%` | `65.79%` | `80.65%` | `80.0%` |
 | 原报告 `rime_frost_with_gram`（2026-04-25） | `71.54%` | `95.45%` | `88.89%` | `67.65%` | `55.26%` | `83.87%` | `100%` |
 | 本机 `rime-chth1z` 纯统计（白霜 + 万象，关 neural） | `76.02%` | `95.85%` | `97.22%` | `69.12%` | `71.05%` | `83.87%` | `100%` |
-| **白霜 + 万象 `.gram` + `rime-neural`（全拼·严格零上文）** | **`81.30%`** | **`97.29%`** | **`97.22%`** | `77.21%` | `68.42%` | **`93.55%`** | **`100%`** |
-| **白霜 + 万象 `.gram` + `rime-neural`（双拼·严格零上文）** | **`81.71%`** | `97.37%` | **`97.22%`** | **`77.94%`** | `68.42%` | **`93.55%`** | **`100%`** |
-| **白霜 + 万象 `.gram` + `rime-neural`（双拼·段落上文）** | **`81.71%`** | **`97.51%`** | **`97.22%`** | `76.47%` | **`76.32%`** | `90.32%` | **`100%`** |
+| **白霜 + 万象 `.gram` + `rime-neural v1.0.0`（全拼·严格零上文）** | **`81.30%`** | **`97.29%`** | **`97.22%`** | `77.21%` | `68.42%` | **`93.55%`** | **`100%`** |
+| **白霜 + 万象 `.gram` + `rime-neural v1.0.0`（双拼·严格零上文）** | **`81.71%`** | `97.37%` | **`97.22%`** | **`77.94%`** | `68.42%` | **`93.55%`** | **`100%`** |
+| **白霜 + 万象 `.gram` + `rime-neural v1.0.0`（双拼·段落上文）** | **`81.71%`** | **`97.51%`** | **`97.22%`** | `76.47%` | **`76.32%`** | `90.32%` | **`100%`** |
 
 > 商业输入法数据引自 `rime-schema-compare/report/other_latest.md`（Notepad 前台自动化黑盒采集，受系统环境、默认设置与联网状态影响）。
 
@@ -169,7 +169,7 @@ patch:
 | 青简 `含章·知微` | 56 MB | `91.2%` (1091) | `88.3%` (384) | `90.44%` | Apple GPU |
 | 知意 `1.4V2-Long-L12 int8` | 84 MB | `93.8%` (1122) | `87.8%` (382) | `92.21%` | CPU 4T |
 | 知意 `ML-pumpkin-1026 int8` | 92 MB | `94.6%` (1131) | `86.9%` (378) | `92.52%` | CPU 4T |
-| **`rime-neural`（纯 `ML-pumpkin-1103`，无先验）** | **82 MB** | **`95.15%`** (1138) | `87.13%` (379) | `93.01%` | CPU 4T（8 / 17 ms） |
+| **`rime-neural`（纯 `ML-pumpkin-1103`，无先验）** | **82 MB** | **`95.15%`** (1138) | `87.13%` (379) | `93.01%` | CPU 4T |
 | **`rime-neural`（`ML-pumpkin-1103` + 万象 `.gram`，无引擎先验）** | **82 MB** | **`95.15%`** (1138) | **`88.28%`** (384) | **`93.32%`** | CPU 4T |
 | **`rime-neural v1.0.0` 默认全融合** | **82 MB** | `94.98%` (1136) | **`88.51%`** (385) | `93.26%` | CPU 4T |
 | *参考：`Qwen2.5-0.5B-Instruct-4bit`* | *278 MB* | *`96.2%` (1150)* | *`85.5%` (372)* | *`93.32%`* | *Apple GPU (mlx)* |
@@ -193,31 +193,32 @@ Intel Core Ultra 7 255HX，隔离 `rime.dll` 基准实测：
 
 ```text
 官方小狼毫 (WeaselServer.exe / rime.dll, librime >= 1.17.0, Lua 5.4)
-  ├── lua/rime_neural.lua            # Lua 滤镜：方案布局识别、整句门控、UIA 预热、纯数值反馈记录
-  └── neural/rime_neural.dll (Rust)  # 动态解析 rime.dll Lua C API，进程内钉驻
-        ├── engine.rs                # ONNX 结构自省、选择性输出裁剪、16 槽 KV-cache、Pass-2 P2C
-        ├── gram.rs                  # Win32 共享内存只读映射 Rime::Grammar/1.0
-        ├── pinyin.rs                # 记忆化全拼对齐 + 7 套双拼码表
-        ├── uia.rs                   # 后台 MTA UIA 读取（RangeFromChild 钳制 + 200ms 超时 + 密码屏蔽）
-        └── feedback.rs              # 零明文纯数值本地日志（5 MiB 自动轮转）
+  ├── lua/rime_neural.lua            # Lua 滤镜：布局识别、整句/标签门控、会话上文冻结、纯数值反馈
+  └── neural/rime_neural.dll (Rust)  # 动态解析 Lua 5.4 C API（C-unwind），进程内钉驻，内嵌 PE 版本信息
+        ├── engine.rs                # ONNX 结构自省、选择性输出裁剪、16 槽 KV-cache、Pass-2 P2C、按方案 .gram 缓存
+        ├── gram.rs                  # Win32 共享内存只读映射 Rime::Grammar/1.0（兼容 BMP/非 BMP UTF-8）
+        ├── pinyin.rs                # 3 阶段记忆化全拼对齐 + DP 切分 + 7 套双拼码表
+        ├── uia.rs                   # 后台 MTA UIA（焦点变更事件 + 控件边界钳制 + 200ms 超时 + 密码/终端屏蔽）
+        └── feedback.rs              # 零明文纯数值本地日志（5 MiB 自动轮转 + 重解析点防护）
 ```
 
 实现细节见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
 | 配置键（`rime_neural/...`） | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| `option_name` | `neural_rerank` | 控制重排开关的 Rime 布尔选项名 |
+| `option_name` | `neural_rerank` | 控制重排开关的 Rime 布尔选项名；未在方案 `switches` 中声明时默认启用 |
 | `pinyin_layout` | `auto` | `auto` / `full` / `zrm` / `flypy` / `mspy` / `sogou` / `abc` / `ziguang` / `jiajia`（`pyjj`） |
-| `max_candidates` | `8` | 参与重排的头部 `sentence` 候选数量上限 |
-| `fusion_weights` | `[1.0, -1.4, 0.05, 0.15, 0.0]` | 5 维线性融合权重 `[logit_lp, ln(rank+1), gram_delta, char_lp, logit_lp*has_ctx]` |
+| `tags` | `["abc"]` | 允许参与重排的 Rime 分段标签白名单 |
+| `max_candidates` | `8` | 参与重排的头部 `sentence` 候选数量上限（限幅 `2..64`） |
+| `fusion_weights` | `[1.0, -1.4, 0.05, 0.15, 0.0]` | 5 维线性融合权重 `[logit_lp, ln(rank+1), gram_delta, char_lp_delta, logit_lp*has_ctx]`（`rank` 从 0 起始） |
 | `p2c_verify_margin` | `0.20` | 触发 KV 缓存 Pass-2 P2C 校验的裕度阈值（`<= 0` 关闭） |
 | `p2c_top1_logit_diff` | `2.0` | Pass-2 候选升至首选所需的最小 logit 领先值 |
-| `p2c_top1_min_gram_diff` | `-2.0` | Pass-2 升至首选时的 `.gram` 逐字分差底线 |
+| `p2c_top1_min_gram_diff` | `-2.0` | Pass-2 升至首选的 `.gram` 逐字分差底线（插入次选底线为该值减 `1.5`） |
 | `p2c_top2_logit_diff` | `0.5` | Pass-2 候选插入次选所需的最小 logit 领先值 |
 | `enable_uia_context` | `true` | 非阻塞后台 Windows UIA 前文读取（按方案独立生效） |
 | `threads` | `0` | ONNX Runtime CPU 线程数（`0` 自动适配并限幅 `4..8`） |
-| `min_input_len` | 双拼 `4` / 全拼 `6` | 触发神经重排的最小有效拼音按键数 |
-| `data_dir` | `""`（自动探测） | 可选：显式指定 `neural\` 数据目录（中文 Windows 用户名可指向纯 ASCII 路径） |
+| `min_input_len` | 双拼 `4` / 全拼 `6` | 触发神经重排的最小有效拼音按键数（下限 `1`） |
+| `data_dir` | `""`（自动探测） | 可选：显式指定 `neural\` 数据目录（非 ASCII Windows 用户名可指向纯 ASCII 路径，YAML 中建议用单引号或 `/`） |
 | `model_file` | `""`（自动探测） | 可选：显式指定 `neural\` 下的 `.onnx` 文件名 |
 | `t2s_config` | `""`（自动 `tw2sp` / `t2s`） | 可选：显式指定繁体上文转简体的 OpenCC 配置文件（如 `t2s.json`） |
 | `log_feedback` | `true` | 零明文纯数值本地日志开关（供可选的个人权重校准脚本使用） |
@@ -225,16 +226,21 @@ Intel Core Ultra 7 255HX，隔离 `rime.dll` 基准实测：
 
 ## 隐私与安全边界
 
-- **本地离线推理**：推理阶段无网络请求；下载行为仅发生在执行安装脚本时，且对二进制、ONNX Runtime 与模型均执行哈希校验。
-- **密码场景屏蔽**：控件报告 `IsPassword == true`，或前台窗口 / 焦点控件进程属于密码管理器与系统凭据界面（`KeePass`、`KeePassXC`、`1Password`、`Bitwarden`、`Enpass`、`LastPass`、`Dashlane`、`RoboForm`、`NordPass`、`ProtonPass`、`CredentialUIBroker`、`consent.exe`、`LockApp`、`mstsc.exe`）时，返回空上文并停止记录反馈。
-- **零明文本地日志**：`%APPDATA%\Rime\neural\feedback.jsonl` 仅记录模型数值特征（`logits`、`gram_deltas`、`char_lps`）与候选索引结果（`shown_top1_idx`、`chosen_idx`、`has_ctx`），不写入用户输入文本、按键串、候选词或屏幕上下文，文件总大小上限为 5 MiB 并自动轮转；设置 `log_feedback: false` 可关闭。
-- **可选个人权重校准**：积累 100 条以上本地选词记录后，可运行 `python scripts\tune-fusion.py`；仅在分块 5 折交叉验证与单侧 95% 置信检验（Hajek 稳健标准误）均通过且 Top-1 准确率不下降时输出新权重建议。
+完整的威胁模型与安全漏洞报告方式见 [`SECURITY.md`](SECURITY.md)。
+
+- **本地离线推理**：推理阶段无网络请求；下载行为仅发生在执行安装脚本时，且对二进制、ONNX Runtime 与模型均执行加密哈希校验。
+- **敏感场景 fail-closed 屏蔽**：以下情形均返回空上文并暂停反馈记录：
+  - 焦点控件报告 `IsPassword == true`，或访问 `IsPassword` 属性时返回访问拒绝，或内容呈掩码圆点 / 星号（`••••••` / `******`）；
+  - 前台或焦点进程为受保护进程（`OpenProcess` 返回 `ERROR_ACCESS_DENIED`）或 PID 无法解析；
+  - 命中敏感进程名单：密码管理器与验证器（`KeePass*`、`KeePassXC`、`1Password`、`Bitwarden`、`Enpass`、`LastPass`、`Dashlane`、`RoboForm`、`NordPass`、`ProtonPass`、`Keeper`、`PasswordSafe`、`Authy`、`WinAuth`）、系统凭据 / UAC 界面（`CredentialUIBroker`、`consent.exe`、`LockApp`）、远程桌面与 SSH 客户端（`mstsc.exe`、`msrdc.exe`、`PuTTY`、`Xshell`、`MobaXterm*`、`FinalShell`）以及本地终端（`WindowsTerminal`、`conhost`、`cmd`、`powershell`、`pwsh`、`mintty`、`alacritty`、`wezterm-gui`、`kitty`）。
+- **零明文本地日志**：`%APPDATA%\Rime\neural\feedback.jsonl` 仅记录模型数值特征（`logits`、`gram_deltas`、`char_lps`）与候选索引结果（`shown_top1_idx`、`chosen_idx`、`has_ctx`、`has_gram`），不写入用户输入文本、按键串、候选词或屏幕上下文；写入端拒绝符号链接与重解析点，单文件上限 `5 MiB` 并保留 1 份 `.1` 轮转备份（合计至多 `10 MiB`）；设置 `log_feedback: false` 可关闭。
+- **可选个人权重校准**：积累 100 条以上本地选词记录后，可使用 Python 3 + `numpy` 运行 `python scripts\tune-fusion.py`（支持 `--schema`、`--model`、`--has-gram` 筛选及 `--scrub-legacy-inplace` 清理历史格式）；仅在分块 5 折交叉验证、单侧 95% 置信检验（Hajek 稳健标准误）、Top-1 准确率不下降及权重域约束全部通过时输出新权重建议。
 
 ## 常见问题
 
-- **部署后未生效**：检查 `%TEMP%\rime.weasel\*WARNING*` 日志；确认 `%APPDATA%\Rime\neural\` 下包含 `rime_neural.dll`、`onnxruntime.dll`、`.onnx` 模型、`tokenizer.json`、`unified_vocab.json`，且 `%APPDATA%\Rime\lua\rime_neural.lua` 存在；确认 `F4` 菜单中 `neural_rerank` 处于开启状态。
+- **部署后未生效**：检查 `%TEMP%\rime.weasel\*WARNING*` 与近期 `.INFO.` 日志；确认 `%APPDATA%\Rime\neural\`（或自定义 `data_dir`）下包含 `rime_neural.dll`（可在文件属性中核对版本号）、`onnxruntime.dll`、单个 `.onnx` 模型、`tokenizer.json`、`unified_vocab.json`，且 `%APPDATA%\Rime\lua\rime_neural.lua` 存在；若方案配置了 `switches`，确认 `F4` 菜单中 `neural_rerank` 处于开启状态。
 - **小狼毫版本不兼容**：旧版小狼毫（如 `0.16.x`）的 `rime.dll` 未导出 Lua 5.4 C API 符号，滤镜会自动透传至统计模式，升级至小狼毫 `0.17.4+` 即可启用。
-- **卸载**：移除 `*.custom.yaml` 中的 `rime_neural` 相关配置，退出小狼毫后删除 `lua\rime_neural.lua` 与 `neural\` 目录，重新部署即可。
+- **卸载**：移除 `*.custom.yaml` 中的 `rime_neural` 相关配置，退出小狼毫后删除 `lua\rime_neural.lua` 与 `neural\` 目录（若使用了自定义 `-DataDir`，一并删除该目录），重新部署即可。
 
 ## 协议与致谢
 

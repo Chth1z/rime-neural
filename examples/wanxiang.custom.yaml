@@ -1,7 +1,13 @@
 # rime-neural integration patch for rime-wanxiang (万象拼音)
-# Copy to %APPDATA%\Rime\wanxiang.custom.yaml
-# NOTE: If you use Double Pinyin in rime-wanxiang (which keeps schema_id `wanxiang`),
-#       set `pinyin_layout` explicitly to zrm / flypy / mspy / sogou / abc / ziguang / jiajia.
+# Copy to %APPDATA%\Rime\wanxiang.custom.yaml (or wanxiang_pro.custom.yaml for Wanxiang Pro).
+# NOTES:
+# - If you use Double Pinyin in rime-wanxiang (which keeps schema_id `wanxiang`),
+#   set `pinyin_layout` explicitly to zrm / flypy / mspy / sogou / abc / ziguang / jiajia.
+# - `engine/filters/@before 0` mounts rime_neural before simplifier / OpenCC filters.
+#   If your wanxiang schema enables `wanxiang.context_reorder*F` and you prefer neural order
+#   to take precedence, place `lua_filter@*rime_neural` after context_reorder and before simplifier.
+# - Auxiliary-code inputs containing `;` pass through unchanged on Full Pinyin / ZRM / Flypy / ABC / PYJJ;
+#   on MSPY / Sogou / Ziguang, `;` maps to `ing`.
 patch:
   translator/max_sentences: 8
   translator/sentence_cutoff_threshold: 0.3

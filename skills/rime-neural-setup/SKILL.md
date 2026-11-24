@@ -31,7 +31,7 @@ powershell -ExecutionPolicy Bypass -File $s
 Verify the JSON output before proceeding:
 - **OS**: Must be Windows x64 (`is_64bit_os: true`). If on macOS/Linux, stop and inform the user that `rime-neural` currently supports Windows Weasel x64 only.
 - **Weasel & Lua 5.4 Exports**: `weasel_dir` must be non-null AND `rime_dll_lua54_exports` must be `true`. If `false`, stop and tell the user to upgrade to official **Weasel Nightly `0.17.4+`** (<https://github.com/rime/weasel/releases>) first — see [`references/troubleshooting.md`](./references/troubleshooting.md).
-- **Real User Directory & ASCII Path Check**: Always use `rime_user_dir` from the audit (respects custom `HKCU\Software\Rime\Weasel\RimeUserDir`, not just `%APPDATA%\Rime`). If `rime_user_dir_non_ascii` is `true`, pass `-DataDir "C:\ProgramData\rime-neural"` (or another writable ASCII path) to `install.ps1` and set `rime_neural/data_dir` in `<schema_id>.custom.yaml` so Lua 5.4 `package.loadlib` loads cleanly.
+- **Real User Directory & ASCII Path Check**: Always use `rime_user_dir` from the audit (respects custom `HKCU\Software\Rime\Weasel\RimeUserDir`, not just `%APPDATA%\Rime`). If `rime_user_dir_non_ascii` is `true`, pass `-DataDir "C:\ProgramData\rime-neural"` (or another writable ASCII path) to `install.ps1` and set `rime_neural/data_dir` in `<schema_id>.custom.yaml` using single quotes (`'C:\ProgramData\rime-neural'`) or forward slashes (`'C:/ProgramData/rime-neural'`) so YAML does not interpret `\n`/`\t` escapes and Lua 5.4 `package.loadlib` loads cleanly.
 - **Target Schema(s)**: Check `previously_selected`, `active_schema_list`, `installed_gram_models`, and `wanxiang_layout_hints`.
 
 ### Step 2: Confirm User Preferences (Brief, Single Prompt)
@@ -44,8 +44,8 @@ Unless the user already specified all choices (or asked for "recommended default
 3. **Optional Wanxiang `.gram` (`wanxiang-lts-zh-hans.gram`, ~373 MB)** — *only ask if `installed_gram_models` is empty*:
    - Explain clearly that `rime-neural` works standalone, **but pairing it with `wanxiang-lts-zh-hans.gram` improves both Top-8 candidate recall and reranking accuracy (`0 MB` extra RAM via shared memory mapping)**.
 4. **Optional Privacy Preferences** (mention defaults so there are no surprises):
-   - `enable_uia_context: true` (reads up to 64 chars before cursor locally; password fields & password managers are hard-blocked).
-   - `log_feedback: true` (zero-plaintext local numeric/index commit log capped at 5 MiB for optional personal weight tuning; stores only model scores and candidate indices, never user text or context).
+   - `enable_uia_context: true` (reads up to 64 chars before cursor locally; password fields, protected processes, password managers, remote-session clients, and local terminals fail closed).
+   - `log_feedback: true` (zero-plaintext local numeric/index commit log capped at 5 MiB per active file + 1 rotated `.1` backup for optional personal weight tuning; stores only model scores and candidate indices, never user text or context).
 
 ### Step 3: Install Binaries, ONNX Runtime & Verified Model
 
@@ -75,7 +75,7 @@ Unless the user already specified all choices (or asked for "recommended default
    $expectedSha = $Matches[1].ToLowerInvariant()
    $tmpGram = Join-Path $env:TEMP ("wanxiang-lts-" + [guid]::NewGuid().ToString("N").Substring(0,8) + ".gram")
    $prev = $ErrorActionPreference; $ErrorActionPreference = "Continue"
-   & curl.exe -fsSL --retry 3 -o $tmpGram $asset.browser_download_url
+   & curl.exe -fsSL --proto =https --proto-redir =https --retry 3 --max-time 300 -o $tmpGram -- $asset.browser_download_url
    $rc = $LASTEXITCODE; $ErrorActionPreference = $prev
    if ($rc -ne 0) { throw "wanxiang .gram download failed (ExitCode=$rc)" }
    $got = (Get-FileHash -LiteralPath $tmpGram -Algorithm SHA256).Hash.ToLowerInvariant()
