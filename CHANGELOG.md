@@ -4,6 +4,31 @@ All notable changes to `rime-neural` are documented in this file.
 
 ## [Unreleased]
 
+## [v1.2.1] - 2026-11-24
+
+### Engine, `.gram` & Performance
+- **Unified `char_logits` Scale & Partition Cancellation (`src/engine.rs`)**:
+  - Scored core and extended characters on one common scale in `CharVocab::decode_char_logits` without clamping positive extended-character deltas, cancelled the common log-partition term for in-vocabulary slots (evaluating `exp`/`ln` lazily only for missing-character fallbacks), and removed the duplicate `syl_to_p2c_cids` map (2.15× faster decoder microbenchmark).
+  - Propagated warmup inference failures in `init_engine_inner` instead of publishing a broken ready singleton.
+- **Path-Shared `.gram` Mappings & Zero Hot-Path Probes (`src/gram.rs`, `src/engine.rs`, `src/pinyin.rs`)**:
+  - Made `WanxiangGram` stateless so schemas with different penalties share a single read-only Win32 memory mapping per file path, selected resident mappings directly without per-rerank filesystem `stat` probes, preserved unrelated LRU entries when default `.gram` settings change, and isolated Rust unit tests from live `%APPDATA%` files.
+
+### FFI, UIA Privacy & Lua Lifecycle
+- **FFI & Feedback Simplification (`src/lua_api.rs`, `src/lib.rs`, `src/feedback.rs`)**:
+  - Replaced `API_LOCK` and two redundant `unsafe impl Send/Sync` blocks in `lua_api.rs` with direct `OnceLock::get_or_init`, checked P2C thresholds after narrowing Lua `f64` to `f32` (catching overflow to infinity), and simplified `feedback.rs` rotation and handle metadata verification onto `fs::rename` + `File::metadata` over `FILE_FLAG_OPEN_REPARSE_POINT`.
+- **UIA Focus-Epoch Race Fix & Same-Focus Fallback (`src/uia.rs`, `lua/rime_neural.lua`)**:
+  - Paired the UIA snapshot with a locked monotonic `focus_epoch` so in-flight probes cannot overwrite a newer same-window focus invalidation, moved process-image denylist checks off the keystroke hot path, clamped single `TextPattern` selections via `RangeFromChild(&focused)` with `DocumentRange` fallback, and avoided assuming caret position on non-empty `ValuePattern` values.
+  - Restored Rime `commit_history` fallback on classified non-`TextPattern` controls strictly while `(HWND, focus_epoch)` matches the last commit in the same control.
+- **Native `tags_match` & Final-Menu Feedback (`lua/rime_neural.lua`)**:
+  - Exported `M.tags_match(seg, env)` so Rime filters the exact segment being built, switched `commit_notifier` to read rank and genuine pre-OpenCC sources directly from the final Rime menu (skipping ambiguous merged candidates and eliminating per-rerank `emit_list`/`shown_texts` allocations), and connected `update_notifier` to clear stale state on Esc/cancel.
+
+### Tuner, Installer & Release CI
+- **MAP Tuner Statistical Rigor (`scripts/tune-fusion.py`, `tests/test_tune_fusion.py`)**:
+  - Computed `freeze_ctx_lp` per CV training fold (eliminating full-dataset leakage), evaluated 3-decimal deployed weights inside CV, applied a one-sided Bonferroni critical value across `LAMBDA_GRID` (`z >= 2.450`), and preserved authoritative numeric outcomes when scrubbing hybrid records with a stray `cands` field.
+- **Installer & Release Workflow Fixes (`scripts/install.ps1`, `.github/workflows/ci-release.yml`)**:
+  - Enforced `IMAGE_FILE_DLL` (`0x2000`) in `Test-Pe64Dll` and case-sensitive `-cne` comparison for Base64 SHA-512 verification in `install.ps1`.
+  - Set `GH_REPO: ${{ github.repository }}` in the checkout-less `publish-release` job so `gh release view/create/upload` resolves the repository cleanly.
+
 ## [v1.2.0] - 2026-11-24
 
 > **Upgrade Note**: Users upgrading from `v1.0.0` or `v1.1.0` who previously enabled `log_feedback: true` should run `python scripts\tune-fusion.py --scrub-legacy-inplace` to convert historical `v1` records in `feedback.jsonl` / `feedback.jsonl.1` to the zero-plaintext `v2` schema in place.
@@ -68,7 +93,8 @@ First standalone public release (Apache-2.0), audited across 1,600 in-domain/hol
 - **Privacy-Hardened Non-Blocking UIA Context**: Dedicated STA thread (`< 2 µs` hot path, keystroke-1 pre-warm), `RangeFromChild` + `U+FFFC` chrome clamping, synchronous `HWND` isolation, and hard password / password-manager blocking.
 - **Unbiased Local Feedback & Anti-Overfitting MAP Tuner**: Pre-OpenCC genuine Simplified capture, automatic secret redaction, 5 MiB rotation, and Newton-Raphson MAP + 5-fold NLL CV + paired 95% CI tuner (`scripts/tune-fusion.py`).
 
-[Unreleased]: https://github.com/Chth1z/rime-neural/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/Chth1z/rime-neural/compare/v1.2.1...HEAD
+[v1.2.1]: https://github.com/Chth1z/rime-neural/compare/v1.2.0...v1.2.1
 [v1.2.0]: https://github.com/Chth1z/rime-neural/compare/v1.1.0...v1.2.0
 [v1.1.0]: https://github.com/Chth1z/rime-neural/compare/v1.0.0...v1.1.0
 [v1.0.0]: https://github.com/Chth1z/rime-neural/releases/tag/v1.0.0
