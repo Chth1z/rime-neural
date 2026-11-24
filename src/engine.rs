@@ -7,18 +7,32 @@ use std::time::Instant;
 
 use ort::environment::Environment;
 use ort::session::{
-    builder::GraphOptimizationLevel, HasSelectedOutputs, OutputSelector, RunOptions, Session,
+    HasSelectedOutputs, OutputSelector, RunOptions, Session, builder::GraphOptimizationLevel,
 };
-use ort::value::{Tensor, TensorRef};
+use ort::value::TensorRef;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
+use tokenizers::pre_tokenizers::PreTokenizerWrapper;
+use tokenizers::pre_tokenizers::metaspace::PrependScheme;
 
 use crate::gram::WanxiangGram;
-use crate::pinyin::{input_to_units, PinyinLayout};
+use crate::pinyin::{PinyinLayout, input_to_units};
 
 const CONTEXT_CHARS: usize = 128;
 const LRU_CAPACITY: usize = 256;
 const KV_CACHE_CAPACITY: usize = 16;
+
+#[inline]
+fn canon_f64_bits(x: f64) -> u64 {
+    let v = if !x.is_finite() || x == 0.0 { 0.0 } else { x };
+    v.to_bits()
+}
+
+#[inline]
+fn canon_f32_bits(x: f32) -> u32 {
+    let v = if !x.is_finite() || x == 0.0 { 0.0 } else { x };
+    v.to_bits()
+}
 
 #[derive(Deserialize)]
 struct MlSubConfig {
@@ -139,6 +153,7 @@ struct CachedEval {
     p2c_margin: f32,
     p2c_verified: Option<(f32, f32)>,
     used_fused_kv: bool,
+    last_used: u64,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -190,6 +205,7 @@ impl CharVocab {
 
         let mut gen_chars: Vec<char> = Vec::with_capacity(n_slots);
         let mut slot_lse: Vec<f32> = Vec::with_capacity(n_slots);
+        let mut slot_allowed: Vec<Option<&[usize]>> = Vec::with_capacity(n_slots);
         let mut gen_sum = 0.0f32;
         let mut all_full = true;
 
@@ -203,61 +219,78 @@ impl CharVocab {
                 let mut best_cid = allowed[0];
                 for &cid in allowed {
                     let v = row[cid];
-                    if v > max_v {
+                    if v.is_finite() && v > max_v {
                         max_v = v;
                         best_cid = cid;
                     }
                 }
-                let sum_e: f32 = allowed.iter().map(|&cid| (row[cid] - max_v).exp()).sum();
+                if !max_v.is_finite() {
+                    all_full = false;
+                    slot_lse.push(0.0);
+                    slot_allowed.push(None);
+                    continue;
+                }
+                let sum_e: f32 = allowed
+                    .iter()
+                    .map(|&cid| {
+                        let v = row[cid];
+                        if v.is_finite() {
+                            (v - max_v).exp()
+                        } else {
+                            0.0
+                        }
+                    })
+                    .sum();
                 let lse = max_v + sum_e.ln();
                 gen_sum += max_v - lse;
                 if let Some(ch) = self.chars[best_cid].chars().next() {
                     gen_chars.push(ch);
                 }
                 slot_lse.push(lse);
+                slot_allowed.push(Some(allowed.as_slice()));
             } else {
                 all_full = false;
                 slot_lse.push(0.0);
+                slot_allowed.push(None);
             }
         }
 
-        if all_full && gen_chars.len() == n_slots {
-            let all_same_len = cands.iter().all(|c| c.chars().count() == n_slots);
+        // Gate both relative `char_lps` AND P2C synthesis strictly on `all_same_len`:
+        // if candidate lengths disagree with `n_slots` (e.g. fuzzy split mismatch), never emit
+        // a wrong-length P2C candidate or skewed missing-slot penalties.
+        let all_same_len = !cands.is_empty() && cands.iter().all(|c| c.chars().count() == n_slots);
+        if all_full && all_same_len && gen_chars.len() == n_slots {
             let mut raw_clp = Vec::with_capacity(cands.len());
             for c in cands {
                 let mut s = 0.0f32;
-                let mut cnt = 0usize;
-                for (j, ch) in c.chars().take(n_slots).enumerate() {
-                    cnt += 1;
+                for (j, ch) in c.chars().enumerate() {
                     let row = &c_slice[j * vocab_chars..(j + 1) * vocab_chars];
                     let lp = self
                         .char_to_id
                         .get(&ch)
                         .and_then(|&cid| {
-                            let allowed = self.syl_to_cids.get(&units[j].1)?;
-                            allowed
-                                .binary_search(&cid)
-                                .ok()
-                                .map(|_| row[cid] - slot_lse[j])
+                            let allowed = slot_allowed[j]?;
+                            allowed.binary_search(&cid).ok().and_then(|_| {
+                                let v = row[cid];
+                                v.is_finite().then_some(v - slot_lse[j])
+                            })
                         })
                         .unwrap_or(-15.0);
                     s += lp;
                 }
-                if cnt < n_slots {
-                    s += -15.0 * ((n_slots - cnt) as f32);
-                }
                 raw_clp.push(s / (n_slots as f32));
             }
-            if all_same_len {
-                let c0 = raw_clp[0];
-                for (i, &v) in raw_clp.iter().enumerate() {
-                    char_lps[i] = v - c0;
-                }
+            let c0 = raw_clp[0];
+            for (i, &v) in raw_clp.iter().enumerate() {
+                char_lps[i] = v - c0;
             }
             let max_cand_clp = raw_clp.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let gen_str: String = gen_chars.into_iter().collect();
             let gen_mean = gen_sum / (n_slots as f32);
-            if !cands.iter().any(|c| c == &gen_str) {
+            if gen_mean.is_finite()
+                && max_cand_clp.is_finite()
+                && !cands.iter().any(|c| c == &gen_str)
+            {
                 p2c_margin = gen_mean - max_cand_clp;
                 p2c_text = Some(gen_str);
             }
@@ -272,6 +305,7 @@ struct ScratchBufs {
     uids: Vec<i64>,
     slots: Vec<i64>,
     markers: Vec<i64>,
+    cand_str: String,
 }
 
 impl ScratchBufs {
@@ -281,6 +315,7 @@ impl ScratchBufs {
             uids: Vec::with_capacity(256),
             slots: Vec::with_capacity(max_slots.max(4)),
             markers: Vec::with_capacity(16),
+            cand_str: String::with_capacity(64),
         }
     }
 }
@@ -293,7 +328,6 @@ struct ContextKv {
     enc_v: Vec<f32>,
     choice_k: Vec<f32>,
     choice_v: Vec<f32>,
-    mask: Vec<bool>,
 }
 
 pub struct EngineStats {
@@ -321,12 +355,15 @@ pub struct NeuralEngine {
     present_names: [&'static str; 4],
     z_enc: Vec<f32>,
     z_ch: Vec<f32>,
+    true_mask: Vec<bool>,
     scratch: ScratchBufs,
     ctx_run_opts: Option<RunOptions<HasSelectedOutputs>>,
     key_run_opts: Option<RunOptions<HasSelectedOutputs>>,
     pass2_run_opts: Option<RunOptions<HasSelectedOutputs>>,
     tokenizer: Tokenizer,
     tokenizer_no_prepend: Option<Tokenizer>,
+    special_tokens: Vec<String>,
+    forbidden_special_ids: HashSet<i64>,
     choice_compact: bool,
     full_unit_ids: HashMap<String, i64>,
     partial_unit_ids: HashMap<String, i64>,
@@ -341,9 +378,10 @@ pub struct NeuralEngine {
     mask_id: i64,
     unk_id: i64,
     gram: Option<WanxiangGram>,
-    kv_cache: VecDeque<(String, ContextKv)>,
+    gram_penalties: (f64, f64),
+    kv_cache: VecDeque<(Vec<i64>, ContextKv)>,
     lru_map: HashMap<CacheKey, CachedEval>,
-    lru_order: VecDeque<CacheKey>,
+    lru_clock: u64,
     pub stats: EngineStats,
 }
 
@@ -416,7 +454,16 @@ fn resolve_model_path(model_dir: &Path, override_name: Option<&str>) -> Result<P
     ))
 }
 
-fn build_no_prepend_tokenizer(tok_path: &Path) -> Result<Tokenizer, String> {
+/// Build the no-prepend candidate tokenizer for `choice_compact` models by cloning the loaded
+/// tokenizer and updating `Metaspace.prepend_scheme` in memory (avoids re-parsing 32 MB JSON).
+fn build_no_prepend_tokenizer(base: &Tokenizer, tok_path: &Path) -> Result<Tokenizer, String> {
+    if let Some(PreTokenizerWrapper::Metaspace(mut ms)) = base.get_pre_tokenizer().cloned() {
+        ms.prepend_scheme = PrependScheme::Never;
+        let mut cloned = base.clone();
+        cloned.with_pre_tokenizer(Some(ms));
+        return Ok(cloned);
+    }
+    // Fallback for non-Metaspace pre-tokenizer layouts
     let raw = std::fs::read_to_string(tok_path)
         .map_err(|e| format!("read {}: {}", tok_path.display(), e))?;
     let mut val: serde_json::Value =
@@ -429,6 +476,47 @@ fn build_no_prepend_tokenizer(tok_path: &Path) -> Result<Tokenizer, String> {
     }
     let bytes = serde_json::to_vec(&val).map_err(|e| format!("serialize tokenizer.json: {}", e))?;
     Tokenizer::from_bytes(&bytes).map_err(|e| format!("build no-prepend tokenizer: {}", e))
+}
+
+/// Extract all special/control added tokens from the tokenizer so untrusted UIA context and
+/// candidate strings cannot inject raw control token IDs (`<pad>`, `<bos>`, `<eos>`, `<mask>`,
+/// `<start_of_turn>`, `<end_of_turn>`, `[@BOS@]`, etc.) into model `input_ids`.
+fn collect_special_tokens(tokenizer: &Tokenizer) -> (Vec<String>, HashSet<i64>) {
+    let mut strs: Vec<String> = Vec::new();
+    let mut seen_str: HashSet<String> = HashSet::new();
+    let mut ids: HashSet<i64> = HashSet::new();
+
+    for (id, added) in tokenizer.get_added_tokens_decoder() {
+        let is_control_like = added.special
+            || (added.content.starts_with('<') && added.content.ends_with('>'))
+            || added.content == "[@BOS@]";
+        if is_control_like && !added.content.is_empty() {
+            ids.insert(id as i64);
+            if seen_str.insert(added.content.clone()) {
+                strs.push(added.content);
+            }
+        }
+    }
+    for fallback in [
+        "<bos>",
+        "<eos>",
+        "<mask>",
+        "<pad>",
+        "<unk>",
+        "<start_of_turn>",
+        "<end_of_turn>",
+        "[@BOS@]",
+    ] {
+        if let Some(id) = tokenizer.token_to_id(fallback) {
+            ids.insert(id as i64);
+        }
+        if seen_str.insert(fallback.to_string()) {
+            strs.push(fallback.to_string());
+        }
+    }
+    // Longest tokens first so `<start_of_turn>` is stripped cleanly before any shorter substring
+    strs.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    (strs, ids)
 }
 
 fn introspect_kv_dims(session: &Session) -> (bool, usize, usize, usize, usize) {
@@ -444,26 +532,27 @@ fn introspect_kv_dims(session: &Session) -> (bool, usize, usize, usize, usize) {
         match inp.name() {
             "past_enc_k" => {
                 has_enc_k = true;
-                if let Some(shape) = inp.dtype().tensor_shape() {
-                    if shape.len() == 5 {
-                        if shape[0] > 0 {
-                            enc_layers = shape[0] as usize;
-                        }
-                        if shape[2] > 0 {
-                            num_heads = shape[2] as usize;
-                        }
-                        if shape[4] > 0 {
-                            head_dim = shape[4] as usize;
-                        }
+                if let Some(shape) = inp.dtype().tensor_shape()
+                    && shape.len() == 5
+                {
+                    if shape[0] > 0 {
+                        enc_layers = shape[0] as usize;
+                    }
+                    if shape[2] > 0 {
+                        num_heads = shape[2] as usize;
+                    }
+                    if shape[4] > 0 {
+                        head_dim = shape[4] as usize;
                     }
                 }
             }
             "past_choice_k" => {
                 has_ch_k = true;
-                if let Some(shape) = inp.dtype().tensor_shape() {
-                    if shape.len() == 5 && shape[0] > 0 {
-                        choice_layers = shape[0] as usize;
-                    }
+                if let Some(shape) = inp.dtype().tensor_shape()
+                    && shape.len() == 5
+                    && shape[0] > 0
+                {
+                    choice_layers = shape[0] as usize;
                 }
             }
             "past_mask" => {
@@ -492,7 +581,23 @@ fn maybe_attach_gram(cfg: &InitConfig) {
     let Ok(mut eng) = mutex.lock() else {
         return;
     };
-    if eng.gram.is_some() || !gpath.is_file() {
+    if eng.gram.is_some() {
+        let new_p = (
+            cfg.gram_collocation_penalty,
+            cfg.gram_non_collocation_penalty,
+        );
+        if canon_f64_bits(new_p.0) != canon_f64_bits(eng.gram_penalties.0)
+            || canon_f64_bits(new_p.1) != canon_f64_bits(eng.gram_penalties.1)
+        {
+            if let Some(ref mut g) = eng.gram {
+                g.update_penalties(new_p.0, new_p.1);
+            }
+            eng.gram_penalties = new_p;
+            eng.lru_map.clear();
+        }
+        return;
+    }
+    if !gpath.is_file() {
         return;
     }
     if let Ok(g) = WanxiangGram::open(
@@ -501,9 +606,12 @@ fn maybe_attach_gram(cfg: &InitConfig) {
         cfg.gram_non_collocation_penalty,
     ) {
         eng.gram = Some(g);
+        eng.gram_penalties = (
+            cfg.gram_collocation_penalty,
+            cfg.gram_non_collocation_penalty,
+        );
         eng.stats.has_gram = true;
         eng.lru_map.clear();
-        eng.lru_order.clear();
     }
 }
 
@@ -553,10 +661,10 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
 
     let mut char_to_id: HashMap<char, usize> = HashMap::with_capacity(uv.chars.len());
     for (idx, s) in uv.chars.iter().enumerate() {
-        if let Some(ch) = s.chars().next() {
-            if s.chars().count() == 1 {
-                char_to_id.insert(ch, idx);
-            }
+        if let Some(ch) = s.chars().next()
+            && s.chars().count() == 1
+        {
+            char_to_id.insert(ch, idx);
         }
     }
 
@@ -566,26 +674,35 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
         .map(|m| m.old_chars)
         .unwrap_or(uv.chars.len())
         .min(uv.chars.len());
+
+    // Build merged full-pinyin reading table: start with `uv.readings` and overlay `uv.ml.pinyin`
+    // (adds +2,737 Traditional/variant/extended Hanzi for full-pinyin alignment while `old_chars`
+    // strictly caps `syl_to_cids` for Simplified P2C generation).
+    let mut merged_readings = uv.readings;
+    if let Some(ref ml) = uv.ml {
+        for (ch, rlist) in &ml.pinyin {
+            merged_readings.insert(ch.clone(), rlist.clone());
+        }
+    }
+
     let pinyin_src = uv
         .ml
         .as_ref()
         .filter(|m| !m.pinyin.is_empty())
         .map(|m| &m.pinyin)
-        .unwrap_or(&uv.readings);
+        .unwrap_or(&merged_readings);
 
     let mut syl_to_cids: HashMap<String, Vec<usize>> = HashMap::with_capacity(450);
     for (ch_str, rlist) in pinyin_src {
-        if let Some(ch) = ch_str.chars().next() {
-            if let Some(&cid) = char_to_id.get(&ch) {
-                if cid < old_chars {
-                    for syl in rlist {
-                        syl_to_cids.entry(syl.clone()).or_default().push(cid);
-                    }
-                }
+        if let Some(ch) = ch_str.chars().next()
+            && let Some(&cid) = char_to_id.get(&ch)
+            && cid < old_chars
+        {
+            for syl in rlist {
+                syl_to_cids.entry(syl.clone()).or_default().push(cid);
             }
         }
     }
-    // Sort & deduplicate each syllable's char-id list once so hot-path lookup uses O(log N) binary_search with zero HashMap allocs
     for cids in syl_to_cids.values_mut() {
         cids.sort_unstable();
         cids.dedup();
@@ -593,8 +710,9 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
 
     let tokenizer = Tokenizer::from_file(&tok_path)
         .map_err(|e| format!("load {}: {}", tok_path.display(), e))?;
+    let (special_tokens, forbidden_special_ids) = collect_special_tokens(&tokenizer);
     let tokenizer_no_prepend = if uv.choice_compact {
-        Some(build_no_prepend_tokenizer(&tok_path)?)
+        Some(build_no_prepend_tokenizer(&tokenizer, &tok_path)?)
     } else {
         None
     };
@@ -615,10 +733,14 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
         .map_err(|e| format!("session builder: {}", e))?
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .map_err(|e| format!("opt level: {}", e))?
+        .with_parallel_execution(false)
+        .map_err(|e| format!("parallel exec: {}", e))?
         .with_intra_threads(threads)
         .map_err(|e| format!("intra threads: {}", e))?
         .with_inter_threads(1)
         .map_err(|e| format!("inter threads: {}", e))?
+        .with_inter_op_spinning(false)
+        .map_err(|e| format!("inter spinning: {}", e))?
         .commit_from_file(&onnx_path)
         .map_err(|e| format!("load {}: {}", onnx_path.display(), e))?;
 
@@ -685,6 +807,7 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
 
     let z_enc = vec![0.0f32; enc_layers * num_heads * head_dim];
     let z_ch = vec![0.0f32; choice_layers * num_heads * head_dim];
+    let true_mask = vec![true; uv.choice_context_tokens + 2];
 
     let mut engine = NeuralEngine {
         model_dir: cfg.model_dir.clone(),
@@ -698,12 +821,15 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
         present_names,
         z_enc,
         z_ch,
+        true_mask,
         scratch: ScratchBufs::new(uv.max_slots),
         ctx_run_opts,
         key_run_opts,
         pass2_run_opts,
         tokenizer,
         tokenizer_no_prepend,
+        special_tokens,
+        forbidden_special_ids,
         choice_compact: uv.choice_compact,
         full_unit_ids,
         partial_unit_ids,
@@ -714,7 +840,7 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
             old_chars,
             max_slots: uv.max_slots,
         },
-        readings: uv.readings,
+        readings: merged_readings,
         valid_syllables,
         max_slots: uv.max_slots,
         context_tokens: uv.choice_context_tokens,
@@ -724,9 +850,13 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
         mask_id,
         unk_id,
         gram,
+        gram_penalties: (
+            cfg.gram_collocation_penalty,
+            cfg.gram_non_collocation_penalty,
+        ),
         kv_cache: VecDeque::with_capacity(KV_CACHE_CAPACITY + 2),
         lru_map: HashMap::with_capacity(LRU_CAPACITY + 16),
-        lru_order: VecDeque::with_capacity(LRU_CAPACITY + 16),
+        lru_clock: 0,
         stats: EngineStats {
             calls: 0,
             cache_hits: 0,
@@ -752,7 +882,7 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
         0.0,
     );
     engine.lru_map.clear();
-    engine.lru_order.clear();
+    engine.lru_clock = 0;
     engine.stats.calls = 0;
     engine.stats.cache_hits = 0;
     engine.stats.kv_hits = 0;
@@ -763,31 +893,69 @@ fn init_engine_inner(cfg: &InitConfig) -> Result<(), String> {
     Ok(())
 }
 
+struct AsyncInitGuard {
+    succeeded: bool,
+}
+
+impl Drop for AsyncInitGuard {
+    fn drop(&mut self) {
+        if !self.succeeded {
+            ASYNC_STARTED.store(false, Ordering::Release);
+            if last_init_error().is_none() {
+                set_last_init_error(Some(
+                    "background init thread exited unexpectedly".to_string(),
+                ));
+            }
+        }
+    }
+}
+
 pub fn init_engine_async(cfg: InitConfig) {
     if ENGINE.get().is_some() {
-        maybe_attach_gram(&cfg);
+        // Offload lazy `.gram` attachment/penalty update so the calling UI thread never blocks on disk I/O
+        if cfg.gram_path.is_some() {
+            let _ = std::thread::Builder::new()
+                .name("rime-neural-gram".to_string())
+                .spawn(move || maybe_attach_gram(&cfg));
+        }
         return;
     }
     if ASYNC_STARTED.swap(true, Ordering::AcqRel) {
         return;
     }
-    let _ = std::thread::Builder::new()
+    set_last_init_error(None);
+    let spawned = std::thread::Builder::new()
         .name("rime-neural-init".to_string())
         .spawn(move || {
-            if init_engine(&cfg).is_err() {
-                ASYNC_STARTED.store(false, Ordering::Release);
+            let mut guard = AsyncInitGuard { succeeded: false };
+            if init_engine(&cfg).is_ok() {
+                guard.succeeded = true;
             }
         });
+    if let Err(e) = spawned {
+        set_last_init_error(Some(format!("spawn init thread failed: {}", e)));
+        ASYNC_STARTED.store(false, Ordering::Release);
+    }
 }
 
 pub fn is_ready() -> bool {
-    ENGINE.get().is_some()
+    ENGINE.get().is_some_and(|m| !m.is_poisoned())
 }
 
 pub fn model_dir_path() -> Option<PathBuf> {
     let mutex = ENGINE.get()?;
     let eng = mutex.lock().ok()?;
     Some(eng.model_dir.clone())
+}
+
+pub fn active_feedback_meta() -> (String, bool) {
+    let Some(mutex) = ENGINE.get() else {
+        return (String::new(), false);
+    };
+    let Ok(eng) = mutex.lock() else {
+        return (String::new(), false);
+    };
+    (eng.stats.model_name.clone(), eng.stats.has_gram)
 }
 
 fn utf8_tail(s: &str, max_chars: usize) -> &str {
@@ -827,11 +995,7 @@ fn common_prefix_chars(cands: &[String]) -> usize {
         min_len = min_len.min(c_len);
         lcp = lcp.min(matched);
     }
-    if lcp >= min_len {
-        0
-    } else {
-        lcp
-    }
+    if lcp >= min_len { 0 } else { lcp }
 }
 
 fn rank_order_from_features(
@@ -841,36 +1005,58 @@ fn rank_order_from_features(
     has_ctx: f64,
     weights: FusionWeights,
 ) -> Vec<usize> {
-    let max_l = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-    let sum_exp: f64 = logits.iter().map(|&x| ((x as f64) - max_l).exp()).sum();
-    let lse = max_l + sum_exp.ln();
+    let clean_l = |x: f32| if x.is_finite() { x as f64 } else { -1e6 };
+    let clean_f = |x: f32| if x.is_finite() { x as f64 } else { 0.0 };
+    let max_l = logits
+        .iter()
+        .map(|&x| clean_l(x))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let sum_exp: f64 = logits.iter().map(|&x| (clean_l(x) - max_l).exp()).sum();
+    let lse = if sum_exp > 0.0 && sum_exp.is_finite() {
+        max_l + sum_exp.ln()
+    } else {
+        max_l
+    };
 
     let mut scored: Vec<(usize, f64)> = logits
         .iter()
         .enumerate()
         .map(|(i, &x)| {
-            let lp = (x as f64) - lse;
+            let lp = clean_l(x) - lse;
+            let gd = gram_deltas.get(i).copied().map(clean_f).unwrap_or(0.0);
+            let clp = char_lps.get(i).copied().map(clean_f).unwrap_or(0.0);
             let score = weights.w_logit * lp
                 + weights.w_rank * ((i as f64) + 1.0).ln()
-                + weights.w_gram * (gram_deltas[i] as f64)
-                + weights.w_char_lp * (char_lps[i] as f64)
+                + weights.w_gram * gd
+                + weights.w_char_lp * clp
                 + weights.w_ctx_lp * lp * has_ctx;
-            (i, score)
+            let safe_score = if score.is_finite() {
+                score
+            } else {
+                f64::NEG_INFINITY
+            };
+            (i, safe_score)
         })
         .collect();
     scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     scored.into_iter().map(|(idx, _)| idx).collect()
 }
 
-fn sanitize_special_tokens(text: &str) -> Cow<'_, str> {
-    if text.contains("<mask>") || text.contains("<bos>") || text.contains("<eos>") {
-        Cow::Owned(
-            text.replace("<mask>", " ")
-                .replace("<bos>", " ")
-                .replace("<eos>", " "),
-        )
-    } else {
-        Cow::Borrowed(text)
+fn sanitize_special_tokens<'a>(text: &'a str, special_tokens: &[String]) -> Cow<'a, str> {
+    // Fast path: skip scanning all special tokens when neither `<` nor `[@BOS@]` appears
+    if !text.contains('<') && !text.contains("[@BOS@]") {
+        return Cow::Borrowed(text);
+    }
+    let mut owned: Option<String> = None;
+    for tok in special_tokens {
+        let cur = owned.as_deref().unwrap_or(text);
+        if cur.contains(tok.as_str()) {
+            owned = Some(cur.replace(tok.as_str(), " "));
+        }
+    }
+    match owned {
+        Some(s) => Cow::Owned(s),
+        None => Cow::Borrowed(text),
     }
 }
 
@@ -884,38 +1070,52 @@ impl NeuralEngine {
         }
     }
 
-    fn encode_ids(&self, text: &str) -> Vec<i64> {
-        let cleaned = sanitize_special_tokens(text);
-        match self.tokenizer.encode(cleaned.as_ref(), false) {
-            Ok(enc) => enc.get_ids().iter().map(|&x| x as i64).collect(),
+    fn encode_with_tok(&self, tok: &Tokenizer, text: &str) -> Vec<i64> {
+        let cleaned = sanitize_special_tokens(text, &self.special_tokens);
+        match tok.encode_fast(cleaned.as_ref(), false) {
+            Ok(enc) => enc
+                .get_ids()
+                .iter()
+                .map(|&x| x as i64)
+                .filter(|id| !self.forbidden_special_ids.contains(id))
+                .collect(),
             Err(_) => Vec::new(),
         }
     }
 
-    fn encode_candidate_ids(&self, text: &str) -> Vec<i64> {
+    fn encode_ids(&self, text: &str) -> Vec<i64> {
+        self.encode_with_tok(&self.tokenizer, text)
+    }
+
+    fn encode_candidate_ids(&mut self, text: &str) -> Vec<i64> {
         if self.choice_compact {
-            let cleaned = sanitize_special_tokens(text);
             let tok = self
                 .tokenizer_no_prepend
                 .as_ref()
                 .unwrap_or(&self.tokenizer);
-            let mut ids: Vec<i64> = match tok.encode(cleaned.as_ref(), false) {
-                Ok(enc) => enc.get_ids().iter().map(|&x| x as i64).collect(),
-                Err(_) => Vec::new(),
-            };
+            let mut ids = self.encode_with_tok(tok, text);
             if ids.is_empty() {
                 ids.push(self.unk_id);
             }
             ids
         } else {
-            let mut s = String::with_capacity(text.len() + 1);
-            s.push(' ');
-            s.push_str(text);
-            self.encode_ids(&s)
+            self.scratch.cand_str.clear();
+            self.scratch.cand_str.push(' ');
+            self.scratch.cand_str.push_str(text);
+            let cleaned = sanitize_special_tokens(&self.scratch.cand_str, &self.special_tokens);
+            match self.tokenizer.encode_fast(cleaned.as_ref(), false) {
+                Ok(enc) => enc
+                    .get_ids()
+                    .iter()
+                    .map(|&x| x as i64)
+                    .filter(|id| !self.forbidden_special_ids.contains(id))
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
         }
     }
 
-    fn compute_context_kv(&mut self, ctx_final: &str) -> Result<ContextKv, String> {
+    fn build_context_token_ids(&self, ctx_final: &str) -> Vec<i64> {
         let mut ids: Vec<i64> = Vec::with_capacity(self.context_tokens + 2);
         ids.push(self.cls_id);
         if !ctx_final.is_empty() {
@@ -924,13 +1124,20 @@ impl NeuralEngine {
             ids.extend_from_slice(&cids[start..]);
         }
         ids.push(self.sep_id);
-        let p = ids.len();
-        let uids = vec![0i64; p];
+        ids
+    }
 
-        let t_ids =
-            Tensor::from_array(([1usize, p], ids)).map_err(|e| format!("ctx ids: {}", e))?;
-        let t_uid =
-            Tensor::from_array(([1usize, p], uids)).map_err(|e| format!("ctx uid: {}", e))?;
+    fn compute_context_kv(&mut self, ctx_ids: &[i64]) -> Result<ContextKv, String> {
+        let p = ctx_ids.len();
+        self.scratch.uids.clear();
+        self.scratch.uids.resize(p, 0);
+        let dummy_false = [false];
+        let dummy_zero = [0i64];
+
+        let t_ids = TensorRef::from_array_view(([1usize, p], ctx_ids))
+            .map_err(|e| format!("ctx ids: {}", e))?;
+        let t_uid = TensorRef::from_array_view(([1usize, p], self.scratch.uids.as_slice()))
+            .map_err(|e| format!("ctx uid: {}", e))?;
         let t_ek = TensorRef::from_array_view((
             [self.enc_layers, 1, self.num_heads, 1, self.head_dim],
             self.z_enc.as_slice(),
@@ -951,12 +1158,12 @@ impl NeuralEngine {
             self.z_ch.as_slice(),
         ))
         .map_err(|e| format!("cv: {}", e))?;
-        let t_pm =
-            Tensor::from_array(([1usize, 1], vec![false])).map_err(|e| format!("pm: {}", e))?;
-        let t_mp =
-            Tensor::from_array(([1usize, 1], vec![0i64])).map_err(|e| format!("mp: {}", e))?;
-        let t_sp =
-            Tensor::from_array(([1usize, 1], vec![0i64])).map_err(|e| format!("sp: {}", e))?;
+        let t_pm = TensorRef::from_array_view(([1usize, 1], dummy_false.as_slice()))
+            .map_err(|e| format!("pm: {}", e))?;
+        let t_mp = TensorRef::from_array_view(([1usize, 1], dummy_zero.as_slice()))
+            .map_err(|e| format!("mp: {}", e))?;
+        let t_sp = TensorRef::from_array_view(([1usize, 1], dummy_zero.as_slice()))
+            .map_err(|e| format!("sp: {}", e))?;
 
         let inputs = ort::inputs![
             "input_ids" => t_ids,
@@ -1001,32 +1208,31 @@ impl NeuralEngine {
             enc_v: ev.to_vec(),
             choice_k: ck.to_vec(),
             choice_v: cv.to_vec(),
-            mask: vec![true; p],
         })
     }
 
     fn get_or_compute_kv_index(&mut self, ctx_final: &str) -> Result<usize, String> {
-        if let Some(pos) = self.kv_cache.iter().position(|(k, _)| k == ctx_final) {
+        let ctx_ids = self.build_context_token_ids(ctx_final);
+        if let Some(pos) = self.kv_cache.iter().position(|(k, _)| k == &ctx_ids) {
             self.stats.kv_hits += 1;
-            // Promote to MRU back (unless already at back)
             let last = self.kv_cache.len() - 1;
-            if pos != last {
-                if let Some(entry) = self.kv_cache.remove(pos) {
-                    self.kv_cache.push_back(entry);
-                }
+            if pos != last
+                && let Some(entry) = self.kv_cache.remove(pos)
+            {
+                self.kv_cache.push_back(entry);
             }
             return Ok(self.kv_cache.len() - 1);
         }
-        let kv = self.compute_context_kv(ctx_final)?;
+        let kv = self.compute_context_kv(&ctx_ids)?;
         if self.kv_cache.len() >= KV_CACHE_CAPACITY {
-            // Keep empty context pinned; evict LRU non-empty entry
-            if let Some(evict) = self.kv_cache.iter().position(|(k, _)| !k.is_empty()) {
+            // Keep empty context (`[cls, sep]`, len == 2) pinned; evict LRU non-empty entry
+            if let Some(evict) = self.kv_cache.iter().position(|(k, _)| k.len() > 2) {
                 self.kv_cache.remove(evict);
             } else {
                 self.kv_cache.pop_front();
             }
         }
-        self.kv_cache.push_back((ctx_final.to_string(), kv));
+        self.kv_cache.push_back((ctx_ids, kv));
         Ok(self.kv_cache.len() - 1)
     }
 
@@ -1046,26 +1252,20 @@ impl NeuralEngine {
             raw_input: raw_input.to_string(),
             layout,
             weights_bits: [
-                weights.w_logit.to_bits(),
-                weights.w_rank.to_bits(),
-                weights.w_gram.to_bits(),
-                weights.w_char_lp.to_bits(),
-                weights.w_ctx_lp.to_bits(),
+                canon_f64_bits(weights.w_logit),
+                canon_f64_bits(weights.w_rank),
+                canon_f64_bits(weights.w_gram),
+                canon_f64_bits(weights.w_char_lp),
+                canon_f64_bits(weights.w_ctx_lp),
             ],
-            p2c_verify_margin_bits: p2c_verify_margin.to_bits(),
+            p2c_verify_margin_bits: canon_f32_bits(p2c_verify_margin),
             cands: cands.to_vec(),
         };
-        if let Some(cached) = self.lru_map.get(&key).cloned() {
+        if let Some(entry) = self.lru_map.get_mut(&key) {
             self.stats.cache_hits += 1;
-            // True LRU promotion
-            if let Some(pos) = self.lru_order.iter().position(|k| k == &key) {
-                if pos + 1 != self.lru_order.len() {
-                    if let Some(k) = self.lru_order.remove(pos) {
-                        self.lru_order.push_back(k);
-                    }
-                }
-            }
-            return Ok(cached);
+            self.lru_clock = self.lru_clock.wrapping_add(1);
+            entry.last_used = self.lru_clock;
+            return Ok(entry.clone());
         }
 
         let mut units = input_to_units(
@@ -1077,25 +1277,26 @@ impl NeuralEngine {
         );
         let orig_units_len = units.len();
 
-        let mut cand_toks: Vec<Vec<i64>> =
-            cands.iter().map(|c| self.encode_candidate_ids(c)).collect();
+        let mut cand_toks: Vec<Vec<i64>> = Vec::with_capacity(cands.len());
+        for c in cands {
+            cand_toks.push(self.encode_candidate_ids(c));
+        }
 
         let mut eff_ctx = ctx_tail.to_string();
         let mut shifted_lcp = false;
         if cand_toks.iter().any(|t| t.len() > self.candidate_tokens) || units.len() > self.max_slots
         {
             let lcp = common_prefix_chars(cands);
-            if lcp > 0 && lcp < units.len() {
+            // Only shift `units` by `lcp` when 1:1 char-to-unit alignment holds
+            if lcp > 0 && lcp < units.len() && units.len() == cands[0].chars().count() {
                 shifted_lcp = true;
                 let prefix_str: String = cands[0].chars().take(lcp).collect();
                 eff_ctx.push_str(&prefix_str);
-                cand_toks = cands
-                    .iter()
-                    .map(|c| {
-                        let tail: String = c.chars().skip(lcp).collect();
-                        self.encode_candidate_ids(&tail)
-                    })
-                    .collect();
+                cand_toks.clear();
+                for c in cands {
+                    let tail: String = c.chars().skip(lcp).collect();
+                    cand_toks.push(self.encode_candidate_ids(&tail));
+                }
                 units = units.split_off(lcp);
             }
         }
@@ -1119,52 +1320,56 @@ impl NeuralEngine {
             )?
         };
 
-        // Compute exact Wanxiang .gram deltas (~0.01 ms, 0 MB extra RAM)
-        let gram_deltas: Vec<f32> = if let Some(ref g) = self.gram {
-            let raw_g: Vec<f64> = cands.iter().map(|c| g.score_sentence_per_char(c)).collect();
-            let g0 = raw_g.first().copied().unwrap_or(0.0);
-            raw_g.into_iter().map(|x| (x - g0) as f32).collect()
+        // Compute exact Wanxiang .gram deltas (~0.004 ms/cand) and retain `raw_g` for Pass-2 reuse
+        let (raw_g, gram_deltas): (Vec<f64>, Vec<f32>) = if let Some(ref g) = self.gram {
+            let rg: Vec<f64> = cands.iter().map(|c| g.score_sentence_per_char(c)).collect();
+            let g0 = rg.first().copied().unwrap_or(0.0);
+            let gd = rg.iter().map(|&x| (x - g0) as f32).collect();
+            (rg, gd)
         } else {
-            vec![0.0f32; cands.len()]
+            (Vec::new(), vec![0.0f32; cands.len()])
         };
 
         // Optional KV-cached Pass-2 Cross-Encoder + .gram verification of promising novel P2C candidates
-        // Triggers on only ~7% of sentences; reuses warm prefix KV-cache + Pass-1 candidate tokens and fetches ONLY `logits`.
         let mut p2c_verified: Option<(f32, f32)> = None;
-        if self.use_fused_kv && p2c_verify_margin > 0.0 && p2c_margin > p2c_verify_margin {
-            if let Some(ref p2c_str) = p2c_text {
-                let has_ctx_f = if context.trim().chars().count() >= 2 {
-                    1.0
+        if self.use_fused_kv
+            && p2c_verify_margin > 0.0
+            && p2c_margin > p2c_verify_margin
+            && let Some(ref p2c_str) = p2c_text
+        {
+            let has_ctx_f = if ctx_tail.trim().chars().count() >= 2 {
+                1.0
+            } else {
+                0.0
+            };
+            let rank0 =
+                rank_order_from_features(&logits, &gram_deltas, &char_lps, has_ctx_f, weights);
+            let best_idx = rank0[0];
+            let mut probe_toks: Vec<Vec<i64>> = Vec::with_capacity(3);
+            probe_toks.push(cand_toks[best_idx].clone());
+            if rank0.len() >= 2 {
+                probe_toks.push(cand_toks[rank0[1]].clone());
+            }
+            probe_toks.push(self.encode_candidate_ids(p2c_str));
+
+            if let Ok((l2, _, _, _)) = self.run_fused_kv(&ctx_final, &units, &probe_toks, None)
+                && let (Some(&l_best), Some(&l_p2c)) = (l2.first(), l2.last())
+            {
+                self.stats.p2c_pass2_calls += 1;
+                let gdiff = if let Some(ref g) = self.gram {
+                    let best_g = raw_g
+                        .get(best_idx)
+                        .copied()
+                        .unwrap_or_else(|| g.score_sentence_per_char(&cands[best_idx]));
+                    (g.score_sentence_per_char(p2c_str) - best_g) as f32
                 } else {
                     0.0
                 };
-                let rank0 =
-                    rank_order_from_features(&logits, &gram_deltas, &char_lps, has_ctx_f, weights);
-                let best_idx = rank0[0];
-                let mut probe_toks: Vec<Vec<i64>> = Vec::with_capacity(3);
-                probe_toks.push(cand_toks[best_idx].clone());
-                if rank0.len() >= 2 {
-                    probe_toks.push(cand_toks[rank0[1]].clone());
-                }
-                probe_toks.push(self.encode_candidate_ids(p2c_str));
-
-                if let Ok((l2, _, _, _)) = self.run_fused_kv(&ctx_final, &units, &probe_toks, None)
-                {
-                    if let (Some(&l_best), Some(&l_p2c)) = (l2.first(), l2.last()) {
-                        self.stats.p2c_pass2_calls += 1;
-                        let gdiff = if let Some(ref g) = self.gram {
-                            (g.score_sentence_per_char(p2c_str)
-                                - g.score_sentence_per_char(&cands[best_idx]))
-                                as f32
-                        } else {
-                            0.0
-                        };
-                        p2c_verified = Some((l_p2c - l_best, gdiff));
-                    }
-                }
+                p2c_verified = Some((l_p2c - l_best, gdiff));
             }
         }
 
+        self.lru_clock = self.lru_clock.wrapping_add(1);
         let res = CachedEval {
             logits,
             gram_deltas,
@@ -1173,14 +1378,18 @@ impl NeuralEngine {
             p2c_margin,
             p2c_verified,
             used_fused_kv: self.use_fused_kv,
+            last_used: self.lru_clock,
         };
 
-        if self.lru_map.len() >= LRU_CAPACITY {
-            if let Some(old) = self.lru_order.pop_front() {
-                self.lru_map.remove(&old);
-            }
+        if self.lru_map.len() >= LRU_CAPACITY
+            && let Some(evict_key) = self
+                .lru_map
+                .iter()
+                .min_by_key(|(_, v)| v.last_used)
+                .map(|(k, _)| k.clone())
+        {
+            self.lru_map.remove(&evict_key);
         }
-        self.lru_order.push_back(key.clone());
         self.lru_map.insert(key, res.clone());
         Ok(res)
     }
@@ -1238,6 +1447,9 @@ impl NeuralEngine {
         let n_slots_in = self.scratch.slots.len();
 
         let kv = &self.kv_cache[kv_idx].1;
+        if self.true_mask.len() < kv.p {
+            self.true_mask.resize(kv.p, true);
+        }
         let t_ids = TensorRef::from_array_view(([1usize, seq_len], self.scratch.ids.as_slice()))
             .map_err(|e| format!("ids: {}", e))?;
         let t_uid = TensorRef::from_array_view(([1usize, seq_len], self.scratch.uids.as_slice()))
@@ -1262,7 +1474,7 @@ impl NeuralEngine {
             kv.choice_v.as_slice(),
         ))
         .map_err(|e| format!("cv: {}", e))?;
-        let t_pm = TensorRef::from_array_view(([1usize, kv.p], kv.mask.as_slice()))
+        let t_pm = TensorRef::from_array_view(([1usize, kv.p], &self.true_mask[..kv.p]))
             .map_err(|e| format!("pm: {}", e))?;
         let t_mp =
             TensorRef::from_array_view(([1usize, n_markers], self.scratch.markers.as_slice()))
@@ -1344,15 +1556,7 @@ impl NeuralEngine {
         orig_units_len: usize,
         shifted_lcp: bool,
     ) -> Result<ForwardResult, String> {
-        let mut ids: Vec<i64> = Vec::with_capacity(256);
-        ids.push(self.cls_id);
-        if !ctx_final.is_empty() {
-            let cids = self.encode_ids(ctx_final);
-            let start = cids.len().saturating_sub(self.context_tokens);
-            ids.extend_from_slice(&cids[start..]);
-        }
-        ids.push(self.sep_id);
-
+        let mut ids = self.build_context_token_ids(ctx_final);
         let mut uids: Vec<i64> = vec![0; ids.len()];
         let mut slots: Vec<i64> = Vec::with_capacity(self.max_slots);
         for (kind, text) in units.iter().take(self.max_slots) {
@@ -1383,18 +1587,20 @@ impl NeuralEngine {
         }
         let n_slots_in = slots.len();
 
-        let t_ids =
-            Tensor::from_array(([1usize, seq_len], ids)).map_err(|e| format!("ids: {}", e))?;
-        let t_att = Tensor::from_array(([1usize, seq_len], vec![1i64; seq_len]))
+        let att = vec![1i64; seq_len];
+        let mm = vec![true; n_markers];
+        let t_ids = TensorRef::from_array_view(([1usize, seq_len], ids.as_slice()))
+            .map_err(|e| format!("ids: {}", e))?;
+        let t_att = TensorRef::from_array_view(([1usize, seq_len], att.as_slice()))
             .map_err(|e| format!("att: {}", e))?;
-        let t_uid =
-            Tensor::from_array(([1usize, seq_len], uids)).map_err(|e| format!("uid: {}", e))?;
-        let t_mp =
-            Tensor::from_array(([1usize, n_markers], markers)).map_err(|e| format!("mp: {}", e))?;
-        let t_mm = Tensor::from_array(([1usize, n_markers], vec![true; n_markers]))
+        let t_uid = TensorRef::from_array_view(([1usize, seq_len], uids.as_slice()))
+            .map_err(|e| format!("uid: {}", e))?;
+        let t_mp = TensorRef::from_array_view(([1usize, n_markers], markers.as_slice()))
+            .map_err(|e| format!("mp: {}", e))?;
+        let t_mm = TensorRef::from_array_view(([1usize, n_markers], mm.as_slice()))
             .map_err(|e| format!("mm: {}", e))?;
-        let t_sp =
-            Tensor::from_array(([1usize, n_slots_in], slots)).map_err(|e| format!("sp: {}", e))?;
+        let t_sp = TensorRef::from_array_view(([1usize, n_slots_in], slots.as_slice()))
+            .map_err(|e| format!("sp: {}", e))?;
 
         let t0 = Instant::now();
         let outputs = self
@@ -1473,7 +1679,8 @@ pub fn rerank(
         p2c_cfg.verify_margin,
     )?;
 
-    let has_ctx = if context.trim().chars().count() >= 2 {
+    let ctx_tail = utf8_tail(context, CONTEXT_CHARS);
+    let has_ctx = if ctx_tail.trim().chars().count() >= 2 {
         1.0
     } else {
         0.0
@@ -1606,6 +1813,25 @@ pub fn get_stats() -> StatsSnapshot {
 mod tests {
     use super::*;
 
+    fn test_char_vocab() -> CharVocab {
+        let chars = vec!["你".into(), "拟".into(), "好".into(), "号".into()];
+        let mut char_to_id = HashMap::new();
+        char_to_id.insert('你', 0);
+        char_to_id.insert('拟', 1);
+        char_to_id.insert('好', 2);
+        char_to_id.insert('号', 3);
+        let mut syl_to_cids = HashMap::new();
+        syl_to_cids.insert("ni".to_string(), vec![0, 1]);
+        syl_to_cids.insert("hao".to_string(), vec![2, 3]);
+        CharVocab {
+            chars,
+            char_to_id,
+            syl_to_cids,
+            old_chars: 4,
+            max_slots: 24,
+        }
+    }
+
     #[test]
     fn test_common_prefix_and_utf8_tail() {
         let cands = vec!["我们今天去公园".to_string(), "我们今天去广场".to_string()];
@@ -1617,25 +1843,78 @@ mod tests {
     }
 
     #[test]
-    fn test_rank_order_respects_fusion_weights() {
+    fn test_rank_order_respects_fusion_weights_and_sanitizes_nan() {
         let logits = [0.0f32, 3.0, -1.0];
         let grams = [0.0f32, 0.0, 0.0];
         let clps = [0.0f32, 0.0, 0.0];
         let order = rank_order_from_features(&logits, &grams, &clps, 0.0, FusionWeights::default());
         assert_eq!(order, vec![1, 0, 2]);
+
+        // NaN logit must NOT sort above finite logits
+        let nan_logits = [0.0f32, f32::NAN, 2.0];
+        let order_nan =
+            rank_order_from_features(&nan_logits, &grams, &clps, 0.0, FusionWeights::default());
+        assert_eq!(order_nan[0], 2);
+        assert_eq!(order_nan[2], 1);
     }
 
     #[test]
-    fn test_sanitize_special_tokens_strips_bos_eos_mask() {
-        assert_eq!(sanitize_special_tokens("普通文本").as_ref(), "普通文本");
+    fn test_decode_char_logits_suppresses_p2c_on_length_mismatch() {
+        let cv = test_char_vocab();
+        let units = vec![("f", "ni".to_string()), ("f", "hao".to_string())];
+        // Strongly prefers "拟号" (cid 1, cid 3)
+        let c_slice = [0.0f32, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0];
+
+        // Same-length candidates -> emits P2C "拟号" with positive margin
+        let cands_ok = vec!["你好".to_string(), "你号".to_string()];
+        let (clps, p2c, margin) =
+            cv.decode_char_logits(&c_slice, (2, 4), &units, &cands_ok, 2, false);
+        assert_eq!(p2c.as_deref(), Some("拟号"));
+        assert!(margin > 0.0);
+        assert!(clps[1] > clps[0]);
+
+        // Mismatched candidate length (3 chars vs 2 slots) -> must suppress P2C completely
+        let cands_mismatch = vec!["你好啊".to_string(), "你好".to_string()];
+        let (clps2, p2c2, margin2) =
+            cv.decode_char_logits(&c_slice, (2, 4), &units, &cands_mismatch, 2, false);
+        assert_eq!(p2c2, None);
+        assert_eq!(margin2, -100.0);
+        assert_eq!(clps2, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_sanitize_special_tokens_strips_all_control_tokens() {
+        let specials: Vec<String> = [
+            "<start_of_turn>",
+            "<end_of_turn>",
+            "[@BOS@]",
+            "<mask>",
+            "<bos>",
+            "<eos>",
+            "<pad>",
+            "<unk>",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
         assert_eq!(
-            sanitize_special_tokens("a<bos>b<eos>c<mask>d").as_ref(),
-            "a b c d"
+            sanitize_special_tokens("普通文本", &specials).as_ref(),
+            "普通文本"
+        );
+        assert_eq!(
+            sanitize_special_tokens(
+                "a<bos>b<eos>c<mask>d<pad>e<start_of_turn>f<end_of_turn>g[@BOS@]h",
+                &specials
+            )
+            .as_ref(),
+            "a b c d e f g h"
         );
     }
 
     #[test]
-    fn test_cache_key_distinguishes_fusion_weights() {
+    fn test_cache_key_distinguishes_fusion_weights_and_canonicalizes_neg_zero() {
+        assert_eq!(canon_f64_bits(-0.0), canon_f64_bits(0.0));
+        assert_eq!(canon_f32_bits(-0.0), canon_f32_bits(0.0));
         let w1 = FusionWeights::default();
         let w2 = FusionWeights { w_rank: -0.5, ..w1 };
         let k1 = CacheKey {
@@ -1643,22 +1922,22 @@ mod tests {
             raw_input: "nihk".to_string(),
             layout: PinyinLayout::Zrm,
             weights_bits: [
-                w1.w_logit.to_bits(),
-                w1.w_rank.to_bits(),
-                w1.w_gram.to_bits(),
-                w1.w_char_lp.to_bits(),
-                w1.w_ctx_lp.to_bits(),
+                canon_f64_bits(w1.w_logit),
+                canon_f64_bits(w1.w_rank),
+                canon_f64_bits(w1.w_gram),
+                canon_f64_bits(w1.w_char_lp),
+                canon_f64_bits(w1.w_ctx_lp),
             ],
-            p2c_verify_margin_bits: 0.2f32.to_bits(),
+            p2c_verify_margin_bits: canon_f32_bits(0.2),
             cands: vec!["你好".to_string()],
         };
         let k2 = CacheKey {
             weights_bits: [
-                w2.w_logit.to_bits(),
-                w2.w_rank.to_bits(),
-                w2.w_gram.to_bits(),
-                w2.w_char_lp.to_bits(),
-                w2.w_ctx_lp.to_bits(),
+                canon_f64_bits(w2.w_logit),
+                canon_f64_bits(w2.w_rank),
+                canon_f64_bits(w2.w_gram),
+                canon_f64_bits(w2.w_char_lp),
+                canon_f64_bits(w2.w_ctx_lp),
             ],
             ..k1.clone()
         };
