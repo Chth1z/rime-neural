@@ -29,19 +29,23 @@ impl PinyinLayout {
         }
 
         let s = schema_id.to_ascii_lowercase();
+        let has_token = |tok: &str| {
+            s.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|part| part == tok)
+        };
         if s.contains("flypy") || s.contains("xiaohe") || s.contains("xhup") {
             Self::Flypy
         } else if s.contains("mspy") || s.contains("microsoft") {
             Self::Mspy
         } else if s.contains("sogou") {
             Self::Sogou
-        } else if s.contains("abc") {
+        } else if has_token("abc") || s.contains("znabc") {
             Self::Abc
-        } else if s.contains("ziguang") {
+        } else if s.contains("ziguang") || has_token("zg") {
             Self::Ziguang
         } else if s.contains("jiajia") || s.contains("pyjj") {
             Self::Jiajia
-        } else if s.contains("double_pinyin") || s.contains("zrm") {
+        } else if s.contains("double_pinyin") || has_token("zrm") {
             Self::Zrm
         } else {
             Self::Full
@@ -584,7 +588,9 @@ pub fn dp_pair_to_syllable(
     fallback
 }
 
-/// Parse Double Pinyin input (ignoring delimiters `'`) into model unit tags for any supported layout.
+/// Parse Double Pinyin input into model unit tags for any supported layout.
+/// Respects explicit syllable separators (`'`, space) by pairing keys independently per chunk
+/// so abbreviated single-key segments (e.g. `w'm'jntm`) do not scramble subsequent syllables.
 pub fn double_pinyin_to_units(
     layout: PinyinLayout,
     raw_input: &str,
@@ -594,25 +600,36 @@ pub fn double_pinyin_to_units(
         return Vec::new();
     };
     let allow_semi = layout.uses_semicolon();
-    let keys: Vec<u8> = raw_input
-        .bytes()
-        .filter(|&b| b.is_ascii_alphabetic() || (allow_semi && b == b';'))
-        .map(|b| b.to_ascii_lowercase())
-        .collect();
+    let mut units = Vec::with_capacity(raw_input.len().div_ceil(2));
 
-    let mut units = Vec::with_capacity(keys.len().div_ceil(2));
-    let mut i = 0;
-    while i + 1 < keys.len() {
-        if let Some(syl) = dp_pair_to_syllable(layout, keys[i], keys[i + 1], valid_syllables) {
-            units.push(("f", syl));
+    for chunk in raw_input.split([' ', '\'']) {
+        let keys: Vec<u8> = chunk
+            .bytes()
+            .filter(|&b| b.is_ascii_alphabetic() || (allow_semi && b == b';'))
+            .map(|b| b.to_ascii_lowercase())
+            .collect();
+        if keys.is_empty() {
+            continue;
         }
-        i += 2;
-    }
-    if i < keys.len() {
-        let p = map_initial(&spec, keys[i])
-            .map(str::to_string)
-            .unwrap_or_else(|| (keys[i] as char).to_string());
-        units.push(("p", p));
+        let mut i = 0;
+        while i + 1 < keys.len() {
+            if let Some(syl) = dp_pair_to_syllable(layout, keys[i], keys[i + 1], valid_syllables) {
+                units.push(("f", syl));
+            } else {
+                // Keep 1:1 slot alignment by emitting a partial initial unit instead of dropping.
+                let p = map_initial(&spec, keys[i])
+                    .map(str::to_string)
+                    .unwrap_or_else(|| (keys[i] as char).to_string());
+                units.push(("p", p));
+            }
+            i += 2;
+        }
+        if i < keys.len() {
+            let p = map_initial(&spec, keys[i])
+                .map(str::to_string)
+                .unwrap_or_else(|| (keys[i] as char).to_string());
+            units.push(("p", p));
+        }
     }
     units
 }
@@ -669,6 +686,24 @@ fn user_input_alias(canonical: &str) -> Option<&'static str> {
     }
 }
 
+/// Returns `true` if `a` and `b` have the same length (>= 3) and differ by exactly one
+/// adjacent-letter transposition (e.g. `yuo` vs `you`, `xaing` vs `xiang`, `hoa` vs `hao`).
+#[inline]
+fn is_adjacent_transposition(a: &[u8], b: &[u8]) -> bool {
+    let n = a.len();
+    if n != b.len() || n < 3 {
+        return false;
+    }
+    let mut i = 0;
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    if i + 1 >= n {
+        return false;
+    }
+    a[i] == b[i + 1] && a[i + 1] == b[i] && a[(i + 2)..] == b[(i + 2)..]
+}
+
 fn greedy_split_chunk(
     chunk: &str,
     valid_syllables: &HashSet<String>,
@@ -679,19 +714,24 @@ fn greedy_split_chunk(
         let mut matched = false;
         for len in (1..=6.min(chunk.len() - pos)).rev() {
             let sub = &chunk[pos..pos + len];
+            // Avoid classifying isolated non-standard syllabic nasals / stray vowels (`m`, `n`,
+            // `ng`, `o`, `hm`, `hng`) as full syllables when splitting unrecognized fragments.
+            if matches!(sub, "m" | "n" | "ng" | "hm" | "hng" | "o") && chunk.len() > len {
+                continue;
+            }
             if valid_syllables.contains(sub) {
                 out.push(("f", sub.to_string()));
                 pos += len;
                 matched = true;
                 break;
             }
-            if let Some(canon) = canonical_alias(sub) {
-                if valid_syllables.contains(canon) {
-                    out.push(("f", canon.to_string()));
-                    pos += len;
-                    matched = true;
-                    break;
-                }
+            if let Some(canon) = canonical_alias(sub)
+                && valid_syllables.contains(canon)
+            {
+                out.push(("f", canon.to_string()));
+                pos += len;
+                matched = true;
+                break;
             }
         }
         if !matched {
@@ -709,8 +749,8 @@ fn greedy_split_chunk(
 
 /// Full-pinyin syllable recovery aligned to the leading candidate's characters via `readings`.
 /// Respects explicit syllable separators (`'`, space), normalizes `lue`/`nue`/`[jqxy]v*` aliases
-/// to canonical vocabulary spellings, and uses O(N*L) memoization to eliminate worst-case
-/// exponential backtracking on fuzzy/unmatched long inputs.
+/// to canonical vocabulary spellings, supports bounded adjacent-transposition fuzzy recovery
+/// (matching common `fuzz/` typo-correction algebra), and uses O(N*L) memoization.
 pub fn full_pinyin_to_units(
     raw_input: &str,
     lead_text: &str,
@@ -743,6 +783,7 @@ pub fn full_pinyin_to_units(
     fn walk(
         i: usize,
         pos: usize,
+        allow_fuzzy: bool,
         chars: &[char],
         code: &str,
         must_break: &[bool],
@@ -766,16 +807,17 @@ pub fn full_pinyin_to_units(
         };
         let last = i + 1 == chars.len();
         for reading in rlist {
-            let rlen = reading.len();
             let forms = [Some(reading.as_str()), user_input_alias(reading.as_str())];
             for form in forms.into_iter().flatten() {
-                if pos + rlen <= code.len() && code[pos..].starts_with(form) {
-                    let crosses_sep = ((pos + 1)..(pos + rlen)).any(|p| must_break[p]);
+                let flen = form.len();
+                if pos + flen <= code.len() && code[pos..].starts_with(form) {
+                    let crosses_sep = ((pos + 1)..(pos + flen)).any(|p| must_break[p]);
                     if !crosses_sep {
                         out.push(("f", reading.clone()));
                         if walk(
                             i + 1,
-                            pos + rlen,
+                            pos + flen,
+                            allow_fuzzy,
                             chars,
                             code,
                             must_break,
@@ -790,6 +832,34 @@ pub fn full_pinyin_to_units(
                     }
                 }
             }
+            if allow_fuzzy {
+                let rlen = reading.len();
+                if rlen >= 3 && pos + rlen <= code.len() {
+                    let seg = &code.as_bytes()[pos..pos + rlen];
+                    if is_adjacent_transposition(seg, reading.as_bytes()) {
+                        let crosses_sep = ((pos + 1)..(pos + rlen)).any(|p| must_break[p]);
+                        if !crosses_sep {
+                            out.push(("f", reading.clone()));
+                            if walk(
+                                i + 1,
+                                pos + rlen,
+                                allow_fuzzy,
+                                chars,
+                                code,
+                                must_break,
+                                readings,
+                                failed,
+                                stride,
+                                out,
+                            ) {
+                                return true;
+                            }
+                            out.pop();
+                        }
+                    }
+                }
+            }
+            let rlen = reading.len();
             for k in (1..rlen).rev() {
                 let b = reading.as_bytes();
                 let is_initial =
@@ -798,13 +868,17 @@ pub fn full_pinyin_to_units(
                     continue;
                 }
                 for form in forms.into_iter().flatten() {
-                    if pos + k <= code.len() && code[pos..].starts_with(&form[..k]) {
+                    if k <= form.len()
+                        && pos + k <= code.len()
+                        && code[pos..].starts_with(&form[..k])
+                    {
                         let crosses_sep = ((pos + 1)..(pos + k)).any(|p| must_break[p]);
                         if !crosses_sep {
                             out.push(("p", reading[..k].to_string()));
                             if walk(
                                 i + 1,
                                 pos + k,
+                                allow_fuzzy,
                                 chars,
                                 code,
                                 must_break,
@@ -828,6 +902,25 @@ pub fn full_pinyin_to_units(
     if walk(
         0,
         0,
+        false,
+        &chars,
+        &code,
+        &must_break,
+        readings,
+        &mut failed,
+        stride,
+        &mut out,
+    ) {
+        return out;
+    }
+
+    // Second pass: allow single adjacent-letter transposition per syllable (e.g. `yuo->you`, `xaing->xiang`)
+    failed.fill(false);
+    out.clear();
+    if walk(
+        0,
+        0,
+        true,
         &chars,
         &code,
         &must_break,
@@ -897,12 +990,12 @@ mod tests {
                     .join(sub)
                     .join("unified_vocab.json");
                 if let Ok(raw) = std::fs::read_to_string(&p) {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                        if let Some(arr) = v.get("units").and_then(|u| u.as_array()) {
-                            for item in arr {
-                                if let Some(s) = item.as_str().and_then(|u| u.strip_prefix("f:")) {
-                                    set.insert(s.to_string());
-                                }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+                        && let Some(arr) = v.get("units").and_then(|u| u.as_array())
+                    {
+                        for item in arr {
+                            if let Some(s) = item.as_str().and_then(|u| u.strip_prefix("f:")) {
+                                set.insert(s.to_string());
                             }
                         }
                     }
@@ -1279,7 +1372,6 @@ mod tests {
         let valid = sample_valid_syllables();
         let skip = [
             "hm", "hng", "m", "n", "ng", "lo", "nou", "den", "kei", "dia", "tei", "fiao", "chua",
-            "neng",
         ];
         for layout in [
             PinyinLayout::Zrm,
@@ -1352,10 +1444,76 @@ mod tests {
     fn test_greedy_split_preserves_zh_ch_sh_initials() {
         let mut valid = sample_valid_syllables();
         valid.insert("wen".to_string());
+        valid.insert("n".to_string());
+        valid.insert("o".to_string());
         let readings: HashMap<String, Vec<String>> = HashMap::new();
         // `zhonwen` (fuzzy `zhong` -> `zhon`) falls back to greedy split; must keep `zh` intact
+        // and must NOT emit bogus full syllables `f:o`/`f:n`
         let u = full_pinyin_to_units("zhonwen", "中文", &readings, &valid);
         assert_eq!(u[0], ("p", "zh".to_string()));
         assert_eq!(u.last().unwrap(), &("f", "wen".to_string()));
+        assert!(!u.iter().any(|(k, s)| *k == "f" && (s == "o" || s == "n")));
+    }
+
+    #[test]
+    fn test_full_pinyin_fuzzy_transposition_alignment() {
+        let valid = sample_valid_syllables();
+        let mut readings: HashMap<String, Vec<String>> = HashMap::new();
+        readings.insert("我".to_string(), vec!["wo".to_string()]);
+        readings.insert("们".to_string(), vec!["men".to_string()]);
+        readings.insert("有".to_string(), vec!["you".to_string()]);
+        readings.insert("钱".to_string(), vec!["qian".to_string()]);
+        readings.insert("今".to_string(), vec!["jin".to_string()]);
+        readings.insert("天".to_string(), vec!["tian".to_string()]);
+        readings.insert("想".to_string(), vec!["xiang".to_string()]);
+        readings.insert("去".to_string(), vec!["qu".to_string()]);
+
+        let u1 = full_pinyin_to_units("womenyuoqian", "我们有钱", &readings, &valid);
+        assert_eq!(
+            u1,
+            vec![
+                ("f", "wo".to_string()),
+                ("f", "men".to_string()),
+                ("f", "you".to_string()),
+                ("f", "qian".to_string()),
+            ]
+        );
+        let u2 = full_pinyin_to_units("jintianxaingqu", "今天想去", &readings, &valid);
+        assert_eq!(
+            u2,
+            vec![
+                ("f", "jin".to_string()),
+                ("f", "tian".to_string()),
+                ("f", "xiang".to_string()),
+                ("f", "qu".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_double_pinyin_respects_apostrophe_chunks_and_layout_tokens() {
+        let valid = sample_valid_syllables();
+        let u = double_pinyin_to_units(PinyinLayout::Zrm, "w'm'jntm", &valid);
+        assert_eq!(
+            u,
+            vec![
+                ("p", "w".to_string()),
+                ("p", "m".to_string()),
+                ("f", "jin".to_string()),
+                ("f", "tian".to_string()),
+            ]
+        );
+        assert_eq!(
+            PinyinLayout::from_name_or_schema("auto", "my_abacus_pinyin"),
+            PinyinLayout::Full
+        );
+        assert_eq!(
+            PinyinLayout::from_name_or_schema("auto", "double_pinyin_abc"),
+            PinyinLayout::Abc
+        );
+        assert_eq!(
+            PinyinLayout::from_name_or_schema("auto", "double_pinyin_zg"),
+            PinyinLayout::Ziguang
+        );
     }
 }
