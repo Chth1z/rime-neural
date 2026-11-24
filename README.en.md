@@ -26,7 +26,7 @@
 - **Full Pinyin and 7 Double Pinyin layouts**: Auto-detects Full Pinyin, Natural/ZRM, Flypy, MSPY (`; = ing`), Sogou (`; = ing`), Intelligent ABC, Ziguang (`; = ing`), and Pinyin Jiajia (PYJJ), supporting `rime-ice`, `rime-frost`, `rime-wanxiang`, and custom schemas.
 - **Local CPU inference and in-process reuse**: Runs quantized ONNX Runtime models with a 16-slot prefix KV-cache offline on CPU. Initializes asynchronously on a background thread and pins the DLL in-process via `GetModuleHandleExA(PIN)` so Rime redeploys reuse the loaded engine.
 - **Dynamic model introspection**: Reads ONNX graph geometry and `unified_vocab.json` at startup, supporting both 12-layer `ML-pumpkin-1103` (default, ~82 MB) and 8-layer `zhen-feather-preview-1121` (~38 MB) with the same DLL.
-- **Bounded UIA context and privacy controls**: A dedicated background STA thread reads up to 64 characters before the caret via Windows UIA (`< 2 µs` hot path), clamped within `RangeFromChild(&focused)` and `U+FFFC` boundaries. Switching foreground windows isolates prior context; password fields and password managers return empty context and suspend feedback logging.
+- **Bounded UIA context and privacy controls**: A dedicated background MTA thread reads up to 64 characters before the caret via Windows UIA (`< 2 µs` hot path), clamped within `RangeFromChild(&focused)` and `U+FFFC` boundaries. Switching foreground windows isolates prior context; password fields, protected processes, password managers, and remote-session clients fail closed, returning empty context and suspending feedback logging.
 
 ### Requirements & Limitations
 
@@ -63,12 +63,12 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Prebuilt -Model fe
 ```
 
 The installer:
-1. Downloads `rime-neural-*-win-x64.zip` from GitHub Releases and verifies `SHA256SUMS.txt`.
-2. Downloads and SHA-256 verifies the selected Apache-2.0 ONNX model from `dd1000001000/zhiyi_models`.
-3. Reuses a local copy or fetches official `onnxruntime.dll` (win-x64) from Microsoft NuGet.
-4. Stops Weasel, installs files into `%APPDATA%\Rime\neural\` and `%APPDATA%\Rime\lua\rime_neural.lua`, and restarts Weasel.
+1. Downloads `rime-neural-*-win-x64.zip` from GitHub Releases and verifies it against the standalone `SHA256SUMS.txt` asset.
+2. Downloads the selected Apache-2.0 ONNX model from `dd1000001000/zhiyi_models` and verifies SHA-256 on `.onnx`, `tokenizer.json`, and `unified_vocab.json`.
+3. Downloads the pinned, SHA-512-verified official `onnxruntime.dll` (win-x64) from Microsoft NuGet (or uses an explicit `-OrtDllPath`).
+4. Stops Weasel, backs up existing files for rollback on error, installs files into the Rime user directory (honoring registry `RimeUserDir`, defaulting to `%APPDATA%\Rime\neural\`; non-ASCII user profiles can pass `-DataDir` to an ASCII path) and `lua\rime_neural.lua`, then restarts Weasel.
 
-Omit `-Prebuilt` to compile from source (requires Rust 1.80+).
+Omit `-Prebuilt` to compile from source (requires Rust 1.92+).
 
 > **Recommended companion model**: Download [`wanxiang-lts-zh-hans.gram`](https://github.com/amzxyz/rime-wanxiang-data/releases/tag/LTS) into your Rime user directory and enable `grammar/language: wanxiang-lts-zh-hans`.
 
@@ -100,7 +100,7 @@ patch:
     p2c_verify_margin: 0.20      # <= 0 disables Pass-2 P2C synthesis
     enable_uia_context: true
     threads: 0                   # 0 = auto (clamped 4..8)
-    log_feedback: true           # local redacted log (5 MiB cap)
+    log_feedback: true           # zero-plaintext numeric local log (5 MiB cap)
     sync_init: false             # async background load
 ```
 

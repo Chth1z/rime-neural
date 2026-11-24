@@ -14,12 +14,13 @@ If the user asks you to install, configure, upgrade, or troubleshoot `rime-neura
 
 ## Developing / Building This Repository
 
-- Language: Rust (`edition = "2021"`, `cdylib` target `rime_neural.dll`) + Lua 5.4 (`lua/rime_neural.lua`).
+- Language: Rust (`edition = "2024"`, `rust-version = "1.92"`, `cdylib` target `rime_neural.dll`) + Lua 5.4 (`lua/rime_neural.lua`).
 - Validation commands (must all pass before committing code changes):
   ```powershell
-  cargo fmt --check
+  cargo fmt --all -- --check
   cargo clippy --all-targets -- -D warnings
   cargo test --locked
   cargo build --release --locked
+  python -m py_compile scripts/tune-fusion.py
   ```
 - Architecture notes: see [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).

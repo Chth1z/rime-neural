@@ -2,6 +2,29 @@
 
 All notable changes to `rime-neural` are documented in this file.
 
+## [Unreleased]
+
+### Security, Privacy & Soundness
+- **Zero-Plaintext Feedback & Legacy Scrubbing (`src/feedback.rs`, `src/lib.rs`, `lua/rime_neural.lua`, `scripts/tune-fusion.py`)**:
+  - Switched `feedback.jsonl` to schema `v: 2` numeric-only records (`model`, `has_gram`, `has_ctx`, `logits`, `gram_deltas`, `char_lps`, candidate indices; never persists user text, keystrokes, or UIA context), with symlink rejection, input length caps, and atomic `MoveFileExW` 5 MiB rotation.
+  - Added `--scrub-legacy-inplace`, `--schema`, `--model`, Kish `N_eff` gating, strict type/bound parsing, and domain sanity guards (`w_logit >= 0.1`, `w_rank <= 0.0`, `w_logit + w_ctx_lp >= 0.1`) to `scripts/tune-fusion.py`.
+- **Fail-Closed UIA Hardening (`src/uia.rs`)**:
+  - Upgraded background worker to MTA (`COINIT_MULTITHREADED`) with 200 ms `IUIAutomation6` timeouts, `(hwnd, pid)` denylist cache, post-read foreground `HWND` & `GetAncestor(GA_ROOT)` verification, deferred trailing probes when throttled by `MIN_REFRESH_INTERVAL`, fail-closed `ERROR_ACCESS_DENIED` / `CurrentIsPassword` / `MoveEndpointByUnit` / `end_inside < 0` checks, bullet-masked password detection, and expanded password-manager / remote-session denylist.
+- **Lua 5.4 FFI & Rust 2024 Hardening (`Cargo.toml`, `src/lua_api.rs`, `src/lib.rs`)**:
+  - Upgraded to Rust `edition = "2024"` (`rust-version = "1.92"`) with `#![warn(clippy::undocumented_unsafe_blocks)]` (0 warnings).
+  - Verified `lua_version(L) >= 504.0`, checked `pin_self_module()` return value, switched to strict `LUA_TSTRING` checks before `lua_tolstring` and metamethod-free `lua_rawget`/`lua_rawset`, checked `tointegerx` validity (`isnum`) in `lua_log_feedback`, and wrapped all `extern "C"` exports in `catch_unwind`.
+- **CI & Supply-Chain Hardening (`.github/workflows/ci-release.yml`, `scripts/install.ps1`)**:
+  - Eliminated PowerShell `${{ github.ref_name }}` injection in `publish-release`, scoped `contents: write` strictly to `publish-release`, added non-Rust CI gates (PowerShell AST, Python tuner self-test, YAML examples, tag-version parity, `SHA256SUMS.txt` LF & self-verification).
+  - Fixed `feather` model download URL (`laya-zhen-feather-preview-1121-slim.zip`) and pinned SHA-256 hashes for both `pumpkin` and `feather` `.onnx`/`tokenizer.json`/`unified_vocab.json`, pinned SHA-512 Microsoft NuGet `onnxruntime.dll` (1.31.0), added fail-closed external `SHA256SUMS.txt` checks, PS 5.1 stderr-safe `curl`/`cargo` execution, `-DataDir` support, and backup-and-rollback on install failure.
+
+### Performance & NLP Correctness
+- **Engine Hot-Path & Cold-Start Optimizations (`src/engine.rs`, `src/gram.rs`, `src/pinyin.rs`)**:
+  - Implemented 3–4× faster single-pass forward double-array trie walk in `gram.rs` (bit-identical to `octagram.cc`) with `FILE_FLAG_RANDOM_ACCESS` and checked `Rime::Grammar/1.0` bounds; reused Pass-1 `.gram` scores in Pass-2.
+  - Replaced 3× JSON re-parse of 32 MB `tokenizer.json` for `choice_compact` models with in-memory `tokenizer.clone()` + `Metaspace(PrependScheme::Never)`; switched to `encode_fast`, dynamic special-token filtering, monotonic-clock LRU, token-ID prefix KV-cache with shared `true_mask`, precomputed `slot_allowed`, and sequential inter-op execution (`with_parallel_execution(false)`, `with_inter_op_spinning(false)`).
+  - Merged `uv.ml.pinyin` into `engine.readings` (+2,737 Traditional/variant/extended Hanzi), gated P2C synthesis strictly on `all_same_len`, guarded `shifted_lcp` 1:1 alignment, supported `'`-separated chunks in Double Pinyin and adjacent-transposition fuzzy recovery in Full Pinyin.
+- **Lua Filter Lifecycle & Feedback Accuracy (`lua/rime_neural.lua`)**:
+  - Preserved rerank snapshots across trailing punctuation auto-commits (`,`, `.`, `?`, `!`, `:`, `;`) with exact segment-range commit extraction while clearing stale snapshots on partial-segment selection; prevented Traditional UIA double-stripping via atomic `preedit_stripped` flag; fixed non-ASCII feedback path (always under writable `user_dir\neural\`); added per-path DLL failure tracking, lazy `.gram` attachment, and module-level OpenCC caching.
+
 ## [v1.1.0] - 2026-11-23
 
 ### Improvements & Fixes

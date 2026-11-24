@@ -26,7 +26,7 @@
 - **全拼与 7 套双拼**：自动识别全拼以及自然码（ZRM）、小鹤（Flypy）、微软（MSPY，含 `; = ing`）、搜狗（Sogou，含 `; = ing`）、智能 ABC、紫光（含 `; = ing`）、拼音加加（PYJJ），适配雾凇、白霜、万象及自定义方案。
 - **本地 CPU 推理与进程内复用**：基于 ONNX Runtime 量化模型与 16 槽前缀 KV-cache 在 CPU 离线运行；启动阶段异步加载模型，模块通过 `GetModuleHandleExA(PIN)` 钉驻小狼毫进程，重新部署时直接复用已加载实例。
 - **多模型自动识别**：启动时读取 ONNX 图结构与 `unified_vocab.json`，同一份 `rime_neural.dll` 支持 12 层 `ML-pumpkin-1103`（默认，约 82 MB）与 8 层 `zhen-feather-preview-1121`（约 38 MB）。
-- **跨应用前文读取与隐私保护**：独立后台 STA 线程通过 Windows UIA 读取光标前最多 64 字（按键热路径 `< 2 µs`），读取范围限制在当前焦点控件（`RangeFromChild`）与 `U+FFFC` 之内；切换前台窗口时隔离旧上文；遇到密码控件及常见密码管理器时返回空上文并停止记录日志。
+- **跨应用前文读取与隐私保护**：独立后台 MTA 线程通过 Windows UIA 读取光标前最多 64 字（按键热路径 `< 2 µs`），读取范围限制在当前焦点控件（`RangeFromChild`）与 `U+FFFC` 之内；切换前台窗口时隔离旧上文；遇到密码控件、受保护进程及常见密码管理器 / 远程会话客户端时 fail-closed 返回空上文并停止记录日志。
 
 ### 运行要求与限制
 
@@ -63,12 +63,12 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Prebuilt -Model fe
 ```
 
 安装脚本会依次完成：
-1. 从 GitHub Releases 下载预编译 `rime-neural-*-win-x64.zip` 并核对 `SHA256SUMS.txt`；
-2. 从 `dd1000001000/zhiyi_models` 下载所选 Apache-2.0 ONNX 模型并校验 SHA-256；
-3. 复用本机或从 Microsoft NuGet 获取官方 `onnxruntime.dll`（win-x64）；
-4. 停止小狼毫，将文件安装至 `%APPDATA%\Rime\neural\` 与 `%APPDATA%\Rime\lua\rime_neural.lua`，随后重启小狼毫。
+1. 从 GitHub Releases 下载预编译 `rime-neural-*-win-x64.zip` 并校验独立资产 `SHA256SUMS.txt`；
+2. 从 `dd1000001000/zhiyi_models` 下载所选 Apache-2.0 ONNX 模型并全量校验 `.onnx`、`tokenizer.json` 与 `unified_vocab.json` 的 SHA-256；
+3. 从 Microsoft NuGet 下载锁定版本并校验 SHA-512 的官方 `onnxruntime.dll`（win-x64，也支持通过 `-OrtDllPath` 指定本机 DLL）；
+4. 停止小狼毫并备份待覆盖文件，将组件安装至 Rime 用户目录（自动读取注册表 `RimeUserDir`，默认 `%APPDATA%\Rime\neural\`；非 ASCII 用户名可通过 `-DataDir` 指定 ASCII 路径）与 `lua\rime_neural.lua`，随后重启小狼毫。
 
-从源码编译（需 Rust 1.80+）时，省略 `-Prebuilt` 直接执行 `scripts\install.ps1`。
+从源码编译（需 Rust 1.92+）时，省略 `-Prebuilt` 直接执行 `scripts\install.ps1`。
 
 > **推荐配套语言模型**：从 [amzxyz/rime-wanxiang-data (LTS)](https://github.com/amzxyz/rime-wanxiang-data/releases/tag/LTS) 下载 `wanxiang-lts-zh-hans.gram` 放入 Rime 用户目录，并在方案中启用 `grammar/language: wanxiang-lts-zh-hans`。
 
@@ -100,7 +100,7 @@ patch:
     p2c_verify_margin: 0.20      # <= 0 关闭 Pass-2 P2C 合成
     enable_uia_context: true
     threads: 0                   # 0 = 自动适配 CPU 核数（限幅 4..8）
-    log_feedback: true           # 本地脱敏选词日志（上限 5 MiB）
+    log_feedback: true           # 零明文纯数值本地日志（上限 5 MiB）
     sync_init: false             # 异步加载
 ```
 

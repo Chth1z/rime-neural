@@ -31,7 +31,7 @@ powershell -ExecutionPolicy Bypass -File $s
 Verify the JSON output before proceeding:
 - **OS**: Must be Windows x64 (`is_64bit_os: true`). If on macOS/Linux, stop and inform the user that `rime-neural` currently supports Windows Weasel x64 only.
 - **Weasel & Lua 5.4 Exports**: `weasel_dir` must be non-null AND `rime_dll_lua54_exports` must be `true`. If `false`, stop and tell the user to upgrade to official **Weasel Nightly `0.17.4+`** (<https://github.com/rime/weasel/releases>) first — see [`references/troubleshooting.md`](./references/troubleshooting.md).
-- **Real User Directory**: Always use `rime_user_dir` from the audit (respects custom `HKCU\Software\Rime\Weasel\RimeUserDir`, not just `%APPDATA%\Rime`).
+- **Real User Directory & ASCII Path Check**: Always use `rime_user_dir` from the audit (respects custom `HKCU\Software\Rime\Weasel\RimeUserDir`, not just `%APPDATA%\Rime`). If `rime_user_dir_non_ascii` is `true`, pass `-DataDir "C:\ProgramData\rime-neural"` (or another writable ASCII path) to `install.ps1` and set `rime_neural/data_dir` in `<schema_id>.custom.yaml` so Lua 5.4 `package.loadlib` loads cleanly.
 - **Target Schema(s)**: Check `previously_selected`, `active_schema_list`, `installed_gram_models`, and `wanxiang_layout_hints`.
 
 ### Step 2: Confirm User Preferences (Brief, Single Prompt)
@@ -65,18 +65,28 @@ Unless the user already specified all choices (or asked for "recommended default
    Stage the latest LTS `.gram` asset from `amzxyz/rime-wanxiang-data` (`releases/tags/LTS`) into `%TEMP%`, verify its SHA-256 digest, stop `WeaselServer.exe`, and move it into `<rime_user_dir>\wanxiang-lts-zh-hans.gram`:
 
    ```powershell
+   $ErrorActionPreference = "Stop"
    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
    $rel = Invoke-RestMethod "https://api.github.com/repos/amzxyz/rime-wanxiang-data/releases/tags/LTS" -Headers @{ "User-Agent" = "rime-neural-setup" }
    $asset = $rel.assets | Where-Object { $_.name -eq "wanxiang-lts-zh-hans.gram" } | Select-Object -First 1
-   $tmpGram = Join-Path $env:TEMP "wanxiang-lts-zh-hans.gram"
-   & curl.exe -fSL --retry 3 -o $tmpGram $asset.browser_download_url
-   if ($asset.digest -match '^sha256:([0-9a-fA-F]{64})$') {
-       $got = (Get-FileHash $tmpGram -Algorithm SHA256).Hash.ToLowerInvariant()
-       if ($got -ne $Matches[1].ToLowerInvariant()) { throw "wanxiang .gram SHA-256 mismatch!" }
+   if (-not $asset -or -not ($asset.digest -match '^sha256:([0-9a-fA-F]{64})$')) {
+       throw "Unable to resolve wanxiang-lts-zh-hans.gram asset or SHA-256 digest."
    }
-   & "<weasel_dir>\WeaselServer.exe" /q 2>$null; Start-Sleep -Milliseconds 600
+   $expectedSha = $Matches[1].ToLowerInvariant()
+   $tmpGram = Join-Path $env:TEMP ("wanxiang-lts-" + [guid]::NewGuid().ToString("N").Substring(0,8) + ".gram")
+   $prev = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+   & curl.exe -fsSL --retry 3 -o $tmpGram $asset.browser_download_url
+   $rc = $LASTEXITCODE; $ErrorActionPreference = $prev
+   if ($rc -ne 0) { throw "wanxiang .gram download failed (ExitCode=$rc)" }
+   $got = (Get-FileHash -LiteralPath $tmpGram -Algorithm SHA256).Hash.ToLowerInvariant()
+   if ($got -ne $expectedSha) { Remove-Item -LiteralPath $tmpGram -Force -ErrorAction SilentlyContinue; throw "wanxiang .gram SHA-256 mismatch!" }
+   $prev = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+   & "<weasel_dir>\WeaselServer.exe" /q 2>$null
+   $ErrorActionPreference = $prev
+   for ($i = 0; $i -lt 15 -and (Get-Process -Name WeaselServer -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 250 }
    Get-Process -Name WeaselServer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-   Move-Item -Path $tmpGram -Destination "<rime_user_dir>\wanxiang-lts-zh-hans.gram" -Force
+   for ($i = 0; $i -lt 15 -and (Get-Process -Name WeaselServer -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 200 }
+   Move-Item -LiteralPath $tmpGram -Destination "<rime_user_dir>\wanxiang-lts-zh-hans.gram" -Force
    ```
 
 ### Step 4: Patch `<schema_id>.custom.yaml` Safely
