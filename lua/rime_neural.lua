@@ -8,19 +8,43 @@
 --   * Dynamic KV-cache ONNX architecture introspection (supports 12L ML-pumpkin-1103, 8L zhen-feather, etc.)
 --     + selective ORT output fetching + direct mmap `.gram` score fusion + KV-cached Pass-2 verified P2C.
 --   * Non-blocking background Windows UIA preceding-text context (clamped to focused control,
---     keystroke-1 pre-warm, settled post-commit refresh, window isolation, hard password blocking).
+--     keystroke-1 pre-warm, settled post-commit refresh, window isolation, fail-closed password blocking).
 --   * Strict dictionary protection: only reranks `sentence` candidates, never overrides exact
 --     dictionary/userdb hits (`phrase`, `user_phrase`, `table`, `completion`, etc.).
 --   * Traditional-to-Simplified context normalization (`tw2sp.json` / `t2s.json`) + pre-OpenCC commit capture.
---   * Optional privacy-first unbiased local feedback logger (`neural/feedback.jsonl`) for MAP tuning.
+--   * Zero-plaintext numeric local feedback logger (`neural/feedback.jsonl`) for unbiased MAP tuning.
 --   * Graceful zero-cost pass-through if DLL/model is absent or `neural_rerank` option is off.
 
 local M = {}
 
 local native_mod = nil
 local native_loaded = false
-local native_attempted = false
+local failed_dll_paths = {}
 local logged_init_error = false
+
+-- Module-level OpenCC converter cache (shared across schemas; `tw2sp` loaded lazily on demand)
+local shared_t2s = nil
+local shared_t2s_tried = false
+local shared_tw2sp = nil
+local shared_tw2sp_tried = false
+
+local function get_shared_t2s()
+    if not shared_t2s_tried then
+        shared_t2s_tried = true
+        local ok, occ = pcall(Opencc, "t2s.json")
+        shared_t2s = (ok and occ) or nil
+    end
+    return shared_t2s
+end
+
+local function get_shared_tw2sp()
+    if not shared_tw2sp_tried then
+        shared_tw2sp_tried = true
+        local ok, occ = pcall(Opencc, "tw2sp.json")
+        shared_tw2sp = (ok and occ) or nil
+    end
+    return shared_tw2sp
+end
 
 local function join_path(a, b)
     if a:sub(-1) == "\\" or a:sub(-1) == "/" then
@@ -57,6 +81,15 @@ local function is_pure_ascii(s)
 end
 
 local function utf8_char_count(s)
+    if type(s) ~= "string" or #s == 0 then
+        return 0
+    end
+    if utf8 and type(utf8.len) == "function" then
+        local n = utf8.len(s)
+        if n then
+            return n
+        end
+    end
     local count = 0
     for i = 1, #s do
         local b = string.byte(s, i)
@@ -67,8 +100,22 @@ local function utf8_char_count(s)
     return count
 end
 
+-- Trim ASCII whitespace plus CJK ideographic space U+3000 (`\227\128\128`) so `has_ctx` agrees with Rust `str::trim()`.
 local function trim_ws(s)
-    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+    local cur = s
+    while true do
+        local next_s = cur:gsub("^[%s]+", ""):gsub("[%s]+$", "")
+        if next_s:sub(1, 3) == "\227\128\128" then
+            next_s = next_s:sub(4)
+        end
+        if #next_s >= 3 and next_s:sub(-3) == "\227\128\128" then
+            next_s = next_s:sub(1, -4)
+        end
+        if next_s == cur then
+            return cur
+        end
+        cur = next_s
+    end
 end
 
 local function resolve_data_dir(user_dir, model_file, custom_data_dir)
@@ -107,27 +154,38 @@ local function ensure_native(user_dir, data_dir, threads, gram_file, col_pen, no
         gram_path = join_path(user_dir, gram_file)
     end
 
-    if native_attempted then
-        if native_loaded and native_mod then
-            if sync_init and not native_mod.is_ready() then
-                native_mod.init(data_dir, ort_path, threads, gram_path, col_pen, non_col_pen, model_file or "")
-            elseif not native_mod.is_ready() and type(native_mod.stats) == "function" then
-                local st = native_mod.stats()
-                if type(st) == "table" and type(st.last_error) == "string" and #st.last_error > 0 then
-                    logged_init_error = false
-                    native_mod.init_async(data_dir, ort_path, threads, gram_path, col_pen, non_col_pen, model_file or "")
-                end
-            elseif native_mod.is_ready() and #gram_path > 0 then
-                -- Allow lazy .gram attachment if an earlier schema initialized without grammar/language
-                native_mod.init_async(data_dir, ort_path, threads, gram_path, col_pen, non_col_pen, model_file or "")
+    if native_loaded and native_mod then
+        if sync_init and not native_mod.is_ready() then
+            local ok_init, init_err = native_mod.init(
+                data_dir, ort_path, threads, gram_path, col_pen, non_col_pen, model_file or ""
+            )
+            if not ok_init and log and log.warning then
+                log.warning("rime_neural: init failed: " .. tostring(init_err))
             end
+            return ok_init == true
+        elseif not native_mod.is_ready() and type(native_mod.stats) == "function" then
+            local st = native_mod.stats()
+            if type(st) == "table" and type(st.last_error) == "string" and #st.last_error > 0 then
+                logged_init_error = false
+                native_mod.init_async(
+                    data_dir, ort_path, threads, gram_path, col_pen, non_col_pen, model_file or ""
+                )
+            end
+        elseif native_mod.is_ready() and #gram_path > 0 then
+            native_mod.init_async(
+                data_dir, ort_path, threads, gram_path, col_pen, non_col_pen, model_file or ""
+            )
         end
-        return native_loaded
+        return true
     end
-    native_attempted = true
 
     local dll_path = join_path(data_dir, "rime_neural.dll")
+    if failed_dll_paths[dll_path] then
+        return false
+    end
+
     if not file_exists(dll_path) then
+        failed_dll_paths[dll_path] = true
         if has_non_ascii(dll_path) and log and log.warning then
             log.warning(
                 "rime_neural: cannot access non-ASCII path via Lua ANSI io.open/loadlib ("
@@ -140,6 +198,7 @@ local function ensure_native(user_dir, data_dir, threads, gram_file, col_pen, no
 
     local loader, err = package.loadlib(dll_path, "luaopen_rime_neural")
     if not loader then
+        failed_dll_paths[dll_path] = true
         if log and log.warning then
             log.warning("rime_neural: loadlib failed: " .. tostring(err))
         end
@@ -148,14 +207,22 @@ local function ensure_native(user_dir, data_dir, threads, gram_file, col_pen, no
 
     local ok_mod, mod = pcall(loader)
     if not ok_mod or type(mod) ~= "table" or type(mod.rerank) ~= "function" then
+        failed_dll_paths[dll_path] = true
         if log and log.warning then
             log.warning("rime_neural: luaopen_rime_neural failed: " .. tostring(mod))
         end
         return false
     end
 
+    -- Retain loaded native module even if initial `sync_init` fails, so another schema with valid
+    -- config (e.g. valid `model_file`) can retry without re-calling `loadlib`.
+    native_mod = mod
+    native_loaded = true
+
     if sync_init then
-        local ok_init, init_err = mod.init(data_dir, ort_path, threads, gram_path, col_pen, non_col_pen, model_file or "")
+        local ok_init, init_err = mod.init(
+            data_dir, ort_path, threads, gram_path, col_pen, non_col_pen, model_file or ""
+        )
         if not ok_init then
             if log and log.warning then
                 log.warning("rime_neural: init failed: " .. tostring(init_err))
@@ -166,8 +233,6 @@ local function ensure_native(user_dir, data_dir, threads, gram_file, col_pen, no
         mod.init_async(data_dir, ort_path, threads, gram_path, col_pen, non_col_pen, model_file or "")
     end
 
-    native_mod = mod
-    native_loaded = true
     return true
 end
 
@@ -245,27 +310,31 @@ local function is_traditional_mode(ctx)
 end
 
 --- Normalize preceding text or fallback commit text to Mainland Simplified for the neural model.
---- Applies Taiwan phrase + variant reversal (`tw2sp.json`) only when Traditional mode is active
---- or Traditional characters are present, preserving Mainland Simplified phrasing (`程序`, `文件`).
+--- Skips OpenCC FFI entirely on pure-ASCII text; lazily loads `tw2sp.json` only when Traditional
+--- mode is active or Traditional characters are present.
 local function normalize_to_simplified(text, prefer_tw2sp, env)
-    if not text or #text == 0 then
-        return ""
+    if not text or #text == 0 or is_pure_ascii(text) then
+        return text or ""
     end
     if env.t2s_override then
         local ok, conv = pcall(env.t2s_override.convert, env.t2s_override, text)
         return (ok and conv) or text
     end
     local t2s_out = text
-    if env.t2s then
-        local ok, conv = pcall(env.t2s.convert, env.t2s, text)
+    local t2s = get_shared_t2s()
+    if t2s then
+        local ok, conv = pcall(t2s.convert, t2s, text)
         if ok and conv then
             t2s_out = conv
         end
     end
-    if env.tw2sp and (prefer_tw2sp or t2s_out ~= text) then
-        local ok, conv = pcall(env.tw2sp.convert, env.tw2sp, text)
-        if ok and conv then
-            return conv
+    if prefer_tw2sp or t2s_out ~= text then
+        local tw2sp = get_shared_tw2sp()
+        if tw2sp then
+            local ok, conv = pcall(tw2sp.convert, tw2sp, text)
+            if ok and conv then
+                return conv
+            end
         end
     end
     return t2s_out
@@ -284,15 +353,22 @@ local function get_preceding_context(context, segment_start, first_preedit, raw_
         if ok_p and pre and pre.text and #pre.text > #full_preedit then
             full_preedit = pre.text
         end
-        local status, uia_text = native_mod.query_uia_context(full_preedit, raw_seg or "", first_cand_text or "")
+        local status, uia_text, _hwnd, preedit_stripped = native_mod.query_uia_context(
+            full_preedit, raw_seg or "", first_cand_text or ""
+        )
         if status == "blocked" then
             return "", true, comp_prefix
         elseif status == "text" then
             if uia_text and #uia_text > 0 then
                 base_ctx = normalize_to_simplified(utf8_tail_bytes(uia_text, 384), is_trad, env)
                 -- Under Traditional mode + `preedit_type: preview`, Weasel echoes the Traditional
-                -- candidate inline; strip its Simplified equivalent after tw2sp normalization.
-                if is_trad and first_cand_text and #first_cand_text > 0 and #base_ctx >= #first_cand_text
+                -- candidate inline; only strip its Simplified equivalent when Rust did NOT already
+                -- strip a pinyin/preview suffix and the candidate is >= 2 chars.
+                if not preedit_stripped
+                    and is_trad
+                    and first_cand_text
+                    and utf8_char_count(first_cand_text) >= 2
+                    and #base_ctx >= #first_cand_text
                     and base_ctx:sub(-#first_cand_text) == first_cand_text
                 then
                     base_ctx = trim_ws(base_ctx:sub(1, #base_ctx - #first_cand_text))
@@ -326,41 +402,53 @@ local function get_preceding_context(context, segment_start, first_preedit, raw_
     return utf8_tail_bytes(base_ctx, 384), false, comp_prefix
 end
 
---- Extract the pre-OpenCC genuine Simplified committed text when available so `s2twp` phrasing
---- differences (e.g. `程序优化` -> `程式最佳化`) still match `snap.shown` accurately.
-local function extract_genuine_commit(ctx, env)
+--- Extract the pre-OpenCC genuine Simplified committed text strictly for the reranked segment
+--- range `[seg_start, seg_end)` when available. Preserves accurate matching even when the user
+--- commits a sentence by pressing trailing punctuation (`,`, `.`, `?`, `!`, `:`, `;`).
+local function extract_genuine_commit(ctx, env, seg_start, seg_end)
     if ctx.composition and type(ctx.composition.toSegmentation) == "function" then
         local ok_s, segs = pcall(ctx.composition.toSegmentation, ctx.composition)
         if ok_s and segs and segs.size and segs.size > 0 then
             local parts = {}
             local all_ok = true
+            local matched_range = false
             for i = 0, segs.size - 1 do
                 local seg = segs:get_at(i)
-                local cand = seg and seg:get_selected_candidate()
-                local g = cand and cand:get_genuine()
-                local txt = (g and g.text and #g.text > 0) and g.text or (cand and cand.text)
-                if txt and #txt > 0 then
-                    parts[#parts + 1] = txt
-                else
-                    all_ok = false
-                    break
+                if seg then
+                    local in_range = (seg_start == nil or seg_end == nil)
+                        or (seg.start >= seg_start and seg._end <= seg_end)
+                    if in_range then
+                        matched_range = true
+                        local cand = seg:get_selected_candidate()
+                        local g = cand and cand:get_genuine()
+                        local txt = (g and g.text and #g.text > 0) and g.text or (cand and cand.text)
+                        if txt and #txt > 0 then
+                            parts[#parts + 1] = txt
+                        else
+                            all_ok = false
+                            break
+                        end
+                    end
                 end
             end
-            if all_ok and #parts > 0 then
-                return table.concat(parts)
+            if matched_range and all_ok and #parts > 0 then
+                return table.concat(parts), true
             end
         end
     end
 
     local committed = ctx:get_commit_text() or ""
     if #committed > 0 then
-        return normalize_to_simplified(committed, is_traditional_mode(ctx), env)
+        return normalize_to_simplified(committed, is_traditional_mode(ctx), env), false
     end
-    return committed
+    return committed, false
 end
 
 local function detect_namespace(cfg)
     for _, ns in ipairs({ "rime_neural", "neural_rerank", "zhiyi_rerank" }) do
+        if type(cfg.get_item) == "function" and cfg:get_item(ns) ~= nil then
+            return ns
+        end
         if cfg:get_string(ns .. "/option_name")
             or cfg:get_string(ns .. "/pinyin_layout")
             or cfg:get_string(ns .. "/data_dir")
@@ -421,13 +509,18 @@ function M.init(env)
 
     local custom_data_dir = cfg:get_string(ns .. "/data_dir") or ""
     local data_dir = resolve_data_dir(user_dir, env.model_file, custom_data_dir)
+    env.data_dir = data_dir
+    env.user_dir = user_dir
+
     local allow_temp_log = (cfg:get_bool(ns .. "/log_feedback_in_temp") == true)
     local fb_opt = cfg:get_bool(ns .. "/log_feedback")
     if fb_opt == nil then
         fb_opt = true
     end
     env.log_feedback = fb_opt and (not in_temp or allow_temp_log)
-    env.feedback_path = join_path(data_dir, "feedback.jsonl")
+    -- Always store feedback under writable `user_dir\neural\feedback.jsonl` (Rust uses UTF-16
+    -- `CreateFileW`, so non-ASCII user profiles work without writing into read-only Program Files).
+    env.feedback_path = join_path(join_path(user_dir, "neural"), "feedback.jsonl")
 
     local uia_opt = cfg:get_bool(ns .. "/enable_uia_context")
     if uia_opt == nil then
@@ -442,6 +535,10 @@ function M.init(env)
     local gram_file = (gram_lang and #gram_lang > 0) and (gram_lang .. ".gram") or ""
     local col_pen = cfg:get_double("grammar/collocation_penalty") or -15.5
     local non_col_pen = cfg:get_double("grammar/non_collocation_penalty") or -4.0
+    env.gram_file = gram_file
+    env.col_pen = col_pen
+    env.non_col_pen = non_col_pen
+    env.gram_attached = (#gram_file == 0)
 
     env.ready = ensure_native(
         user_dir,
@@ -453,6 +550,9 @@ function M.init(env)
         env.model_file,
         env.sync_init
     )
+    if env.ready and native_mod and native_mod.is_ready() then
+        env.gram_attached = true
+    end
 
     -- Resolve pinyin layout universally (auto-detects Full + 7 Double Pinyin schemes)
     local layout_opt = cfg:get_string(ns .. "/pinyin_layout") or "auto"
@@ -482,17 +582,13 @@ function M.init(env)
     if #t2s_override > 0 then
         local ok_ov, occ_ov = pcall(Opencc, t2s_override)
         env.t2s_override = (ok_ov and occ_ov) or nil
-        env.t2s = nil
-        env.tw2sp = nil
     else
         env.t2s_override = nil
-        local ok_occ, occ = pcall(Opencc, "t2s.json")
-        env.t2s = (ok_occ and occ) or nil
-        local ok_tw, occ_tw = pcall(Opencc, "tw2sp.json")
-        env.tw2sp = (ok_tw and occ_tw) or nil
     end
 
-    if (env.log_feedback or env.enable_uia) and env.engine.context and env.engine.context.commit_notifier then
+    if env.ready and (env.log_feedback or env.enable_uia)
+        and env.engine.context and env.engine.context.commit_notifier
+    then
         env.commit_conn = env.engine.context.commit_notifier:connect(function(ctx)
             if env.enable_uia and native_mod then
                 if type(native_mod.kick_uia_after_commit) == "function" then
@@ -514,8 +610,9 @@ function M.init(env)
                 return
             end
 
-            local norm_commit = extract_genuine_commit(ctx, env)
-            if snap.comp_prefix and #snap.comp_prefix > 0
+            local norm_commit, from_range = extract_genuine_commit(ctx, env, snap.seg_start, snap.seg_end)
+            if not from_range
+                and snap.comp_prefix and #snap.comp_prefix > 0
                 and norm_commit:sub(1, #snap.comp_prefix) == snap.comp_prefix
             then
                 norm_commit = norm_commit:sub(#snap.comp_prefix + 1)
@@ -607,6 +704,16 @@ function M.func(input, env)
         return
     end
 
+    -- One-shot lazy `.gram` attachment once async init finishes (covers multi-schema startup races)
+    if not env.gram_attached and env.gram_file and #env.gram_file > 0 then
+        env.gram_attached = true
+        local ort_path = join_path(env.data_dir, "onnxruntime.dll")
+        local gram_path = join_path(env.user_dir, env.gram_file)
+        native_mod.init_async(
+            env.data_dir, ort_path, env.threads, gram_path, env.col_pen, env.non_col_pen, env.model_file or ""
+        )
+    end
+
     local cur_input = ctx.input or ""
     -- Pre-warm UIA snapshot asynchronously on early keystrokes (< 1 µs) so context is already
     -- fresh when keystroke 4+ triggers neural reranking (even after window switch or idle pause).
@@ -614,10 +721,21 @@ function M.func(input, env)
         native_mod.kick_uia_refresh()
     end
 
-    local function clear_stale_snapshot()
-        if env.last_rerank and cur_input ~= env.last_rerank.full_input then
-            env.last_rerank = nil
+    -- Clear snapshot on every non-rerank transition EXCEPT when a trailing punctuation segment
+    -- (`,`, `.`, `?`, `!`, `:`, `;`) immediately follows the reranked sentence right before auto-commit.
+    local function maybe_clear_snapshot(is_trailing_punct, cand_start)
+        local snap = env.last_rerank
+        if not snap then
+            return
         end
+        if is_trailing_punct
+            and cand_start == snap.seg_end
+            and #cur_input > #snap.full_input
+            and cur_input:sub(1, #snap.full_input) == snap.full_input
+        then
+            return
+        end
+        env.last_rerank = nil
     end
 
     local max_k = env.max_candidates
@@ -672,7 +790,7 @@ function M.func(input, env)
                     local c = sent_cands[idx]
                     if c then
                         emit_list[#emit_list + 1] = c
-                        shown_texts[#shown_texts + 1] = c.text
+                        shown_texts[#shown_texts + 1] = sent_texts[idx]
                         if #emit_list == 1 and p2c_cand and res.p2c_pos == 2 then
                             emit_list[#emit_list + 1] = p2c_cand
                             shown_texts[#shown_texts + 1] = res.p2c_text
@@ -684,6 +802,8 @@ function M.func(input, env)
                 if env.log_feedback then
                     env.last_rerank = {
                         full_input = cur_input,
+                        seg_start = seg_start,
+                        seg_end = seg_end,
                         comp_prefix = comp_prefix,
                         has_ctx = (utf8_char_count(trim_ws(pre_ctx)) >= 2),
                         cands = sent_texts,
@@ -701,10 +821,10 @@ function M.func(input, env)
                 end
                 return
             else
-                clear_stale_snapshot()
+                env.last_rerank = nil
             end
         else
-            clear_stale_snapshot()
+            env.last_rerank = nil
         end
         for i = 1, #sent_cands do
             yield(sent_cands[i])
@@ -718,7 +838,7 @@ function M.func(input, env)
             is_first = false
             local g0 = cand:get_genuine()
             if not g0 or g0.type ~= "sentence" then
-                clear_stale_snapshot()
+                maybe_clear_snapshot(g0 ~= nil and g0.type == "punct", cand.start)
                 passthrough = true
                 yield(cand)
             else
@@ -731,10 +851,12 @@ function M.func(input, env)
                 local allow_semi = env.uses_semicolon
                 for i = 1, #raw_seg do
                     local b = string.byte(raw_seg, i)
-                    if b >= 97 and b <= 122 or (allow_semi and b == 59) then
+                    if (b >= 97 and b <= 122) or (allow_semi and b == 59) then
                         key_cnt = key_cnt + 1
-                    elseif (b >= 65 and b <= 90) or (b >= 48 and b <= 57) then
-                        -- Uppercase ASCII or digits (e.g. mixed `用AI` / `5G网络` bridge) would shift DP 2-key pairs
+                    elseif b == 39 or b == 32 then
+                        -- Explicit syllable delimiter (`'` or space)
+                    else
+                        -- Uppercase ASCII, digits, or auxiliary-code delimiters (`/`, `;`, `-`)
                         has_non_pinyin = true
                         key_cnt = key_cnt + 1
                     end
@@ -743,13 +865,14 @@ function M.func(input, env)
                     or key_cnt < env.min_input_len
                     or (env.is_double_pinyin and (key_cnt % 2) == 1)
                 then
-                    clear_stale_snapshot()
+                    env.last_rerank = nil
                     passthrough = true
                     yield(cand)
                 else
+                    local gtxt = (g0.text and #g0.text > 0) and g0.text or cand.text
                     sent_cands = { cand }
-                    sent_texts = { cand.text }
-                    seen_texts = { [cand.text] = true }
+                    sent_texts = { gtxt }
+                    seen_texts = { [gtxt] = true }
                 end
             end
         else
@@ -758,10 +881,11 @@ function M.func(input, env)
                 and g and g.type == "sentence"
                 and cand.start == seg_start and cand._end == seg_end
             then
-                if not seen_texts[cand.text] then
-                    seen_texts[cand.text] = true
+                local gtxt = (g.text and #g.text > 0) and g.text or cand.text
+                if not seen_texts[gtxt] then
+                    seen_texts[gtxt] = true
                     sent_cands[#sent_cands + 1] = cand
-                    sent_texts[#sent_texts + 1] = cand.text
+                    sent_texts[#sent_texts + 1] = gtxt
                 end
             else
                 flush_sentences()
@@ -771,7 +895,7 @@ function M.func(input, env)
     end
 
     if is_first then
-        clear_stale_snapshot()
+        env.last_rerank = nil
     elseif not passthrough and not flushed and sent_cands then
         flush_sentences()
     end
@@ -783,8 +907,6 @@ function M.fini(env)
         env.commit_conn = nil
     end
     env.last_rerank = nil
-    env.t2s = nil
-    env.tw2sp = nil
     env.t2s_override = nil
 end
 
