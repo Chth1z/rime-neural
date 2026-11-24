@@ -14,8 +14,9 @@ use lua_api::{get_api, pop, push_str, read_str, LuaInteger, LuaState};
 use pinyin::PinyinLayout;
 use uia::UiaContext;
 
-const LUA_TTABLE: c_int = 5;
+const LUA_TBOOLEAN: c_int = 1;
 const LUA_TSTRING: c_int = 4;
+const LUA_TTABLE: c_int = 5;
 
 unsafe fn read_str_array(api: &lua_api::LuaApi, l: LuaState, idx: c_int) -> Vec<String> {
     if (api.lua_type)(l, idx) != LUA_TTABLE {
@@ -377,20 +378,58 @@ unsafe extern "C" fn lua_rerank(l: LuaState) -> c_int {
     }
 }
 
-/// log_feedback(schema, raw_input, context, cands_tbl, logits_tbl, gram_tbl, char_tbl, p2c_cand_or_nil, shown_top1, chosen_text, chosen_rank, reverted, [log_path])
+/// Zero-plaintext feedback logger.
+/// Supports both:
+/// - Numeric v2 signature (11 args):
+///   `log_feedback(schema, has_ctx_bool, logits_tbl, gram_tbl, char_tbl, shown_top1_idx, chosen_idx, p2c_shown, p2c_chosen, chosen_rank, [log_path])`
+/// - Legacy 13-arg signature (for older Lua scripts): converts to zero-plaintext v2 in memory before writing.
 unsafe extern "C" fn lua_log_feedback(l: LuaState) -> c_int {
     let Ok(api) = get_api() else {
         return 0;
     };
     let res = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
+        let schema = read_str(api, l, 1).unwrap_or_default();
+        if (api.lua_type)(l, 2) == LUA_TBOOLEAN {
+            let has_ctx = (api.toboolean)(l, 2) != 0;
+            let logits = read_f32_array(api, l, 3);
+            let gram_deltas = read_f32_array(api, l, 4);
+            let char_lps = read_f32_array(api, l, 5);
+            let mut isnum: c_int = 0;
+            let shown_top1_idx = (api.tointegerx)(l, 6, &mut isnum) as i32;
+            let chosen_idx = (api.tointegerx)(l, 7, &mut isnum) as i32;
+            let p2c_shown = (api.toboolean)(l, 8) != 0;
+            let p2c_chosen = (api.toboolean)(l, 9) != 0;
+            let chosen_rank = (api.tointegerx)(l, 10, &mut isnum) as i32;
+            let log_path = match read_str(api, l, 11).filter(|s| !s.is_empty()) {
+                Some(p) => PathBuf::from(p),
+                None => engine::model_dir_path()
+                    .ok_or("engine not ready")?
+                    .join("feedback.jsonl"),
+            };
+            let reverted = shown_top1_idx != 0 && chosen_idx == 0;
+            let rec = feedback::FeedbackRecord::new_numeric(
+                &schema,
+                has_ctx,
+                &logits,
+                &gram_deltas,
+                &char_lps,
+                shown_top1_idx,
+                chosen_idx,
+                p2c_shown,
+                p2c_chosen,
+                chosen_rank,
+                reverted,
+            );
+            return feedback::append_feedback(&log_path, &rec);
+        }
+
+        // Legacy 13-arg compatibility: derive purely numeric indices in memory; never persist raw text
         let log_path = match read_str(api, l, 13).filter(|s| !s.is_empty()) {
             Some(p) => PathBuf::from(p),
             None => engine::model_dir_path()
                 .ok_or("engine not ready")?
                 .join("feedback.jsonl"),
         };
-        let schema = read_str(api, l, 1).unwrap_or_default();
-        let raw_input = read_str(api, l, 2).unwrap_or_default();
         let ctx = read_str(api, l, 3).unwrap_or_default();
         let cands = read_str_array(api, l, 4);
         let logits = read_f32_array(api, l, 5);
@@ -401,24 +440,43 @@ unsafe extern "C" fn lua_log_feedback(l: LuaState) -> c_int {
         let chosen_text = read_str(api, l, 10).unwrap_or_default();
         let mut isnum: c_int = 0;
         let chosen_rank = (api.tointegerx)(l, 11, &mut isnum) as i32;
-        let reverted = (api.toboolean)(l, 12) != 0;
 
-        let rec = feedback::FeedbackRecord {
-            ts: feedback::now_unix_secs(),
-            sample_weight: 1.0,
-            schema: &schema,
-            raw_input: &raw_input,
-            context: feedback::sanitize_for_log(&ctx),
-            cands: &cands,
-            logits: &logits,
-            gram_deltas: &gram_deltas,
-            char_lps: &char_lps,
-            p2c_cand: p2c_cand.as_deref(),
-            shown_top1: &shown_top1,
-            chosen_text: &chosen_text,
+        let has_ctx = ctx.trim().chars().count() >= 2;
+        let p2c_shown = p2c_cand.is_some();
+        let chosen_idx = cands
+            .iter()
+            .position(|c| c == &chosen_text)
+            .map(|i| i as i32)
+            .unwrap_or(-1);
+        let p2c_chosen = p2c_cand
+            .as_deref()
+            .is_some_and(|p| p == chosen_text && chosen_idx < 0);
+        let shown_top1_idx = if p2c_cand.as_deref().is_some_and(|p| p == shown_top1)
+            && !cands.iter().any(|c| c == &shown_top1)
+        {
+            -2
+        } else {
+            cands
+                .iter()
+                .position(|c| c == &shown_top1)
+                .map(|i| i as i32)
+                .unwrap_or(-1)
+        };
+        let reverted = shown_top1_idx != 0 && chosen_idx == 0;
+
+        let rec = feedback::FeedbackRecord::new_numeric(
+            &schema,
+            has_ctx,
+            &logits,
+            &gram_deltas,
+            &char_lps,
+            shown_top1_idx,
+            chosen_idx,
+            p2c_shown,
+            p2c_chosen,
             chosen_rank,
             reverted,
-        };
+        );
         feedback::append_feedback(&log_path, &rec)
     }));
     (api.pushboolean)(l, if matches!(res, Ok(Ok(()))) { 1 } else { 0 });

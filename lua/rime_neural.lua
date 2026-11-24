@@ -48,10 +48,48 @@ local function has_any_model(dir, model_file)
         or file_exists(join_path(dir, "laya.int8g.onnx"))
 end
 
-local function resolve_data_dir(user_dir, model_file)
+local function has_non_ascii(s)
+    return type(s) == "string" and s:find("[\128-\255]") ~= nil
+end
+
+local function is_pure_ascii(s)
+    return type(s) == "string" and #s > 0 and s:find("[\128-\255]") == nil
+end
+
+local function utf8_char_count(s)
+    local count = 0
+    for i = 1, #s do
+        local b = string.byte(s, i)
+        if b < 0x80 or b >= 0xC0 then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+local function trim_ws(s)
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function resolve_data_dir(user_dir, model_file, custom_data_dir)
+    if custom_data_dir and #custom_data_dir > 0 then
+        return custom_data_dir
+    end
     local primary = join_path(user_dir, "neural")
     if file_exists(join_path(primary, "rime_neural.dll")) and has_any_model(primary, model_file) then
         return primary
+    end
+    -- Fallback to shared_data_dir/neural (typically ASCII Program Files path for non-ASCII Windows usernames)
+    if rime_api and type(rime_api.get_shared_data_dir) == "function" then
+        local ok_s, shared_dir = pcall(rime_api.get_shared_data_dir)
+        if ok_s and type(shared_dir) == "string" and #shared_dir > 0 then
+            local shared_neural = join_path(shared_dir, "neural")
+            if file_exists(join_path(shared_neural, "rime_neural.dll"))
+                and has_any_model(shared_neural, model_file)
+            then
+                return shared_neural
+            end
+        end
     end
     -- Graceful fallback for users migrating from earlier `zhiyi/` folder layout
     local legacy = join_path(user_dir, "zhiyi")
@@ -63,24 +101,40 @@ end
 
 local function ensure_native(user_dir, data_dir, threads, gram_file, col_pen, non_col_pen, model_file, sync_init)
     local ort_path = join_path(data_dir, "onnxruntime.dll")
+    -- Do not gate gram_path on Lua `io.open` (ANSI codepage on Windows); Rust checks via UTF-16 Wide APIs.
     local gram_path = ""
     if gram_file and #gram_file > 0 then
-        local gp = join_path(user_dir, gram_file)
-        if file_exists(gp) then
-            gram_path = gp
-        end
+        gram_path = join_path(user_dir, gram_file)
     end
 
     if native_attempted then
-        if native_loaded and sync_init and native_mod and not native_mod.is_ready() then
-            native_mod.init(data_dir, ort_path, threads, gram_path, col_pen, non_col_pen, model_file or "")
+        if native_loaded and native_mod then
+            if sync_init and not native_mod.is_ready() then
+                native_mod.init(data_dir, ort_path, threads, gram_path, col_pen, non_col_pen, model_file or "")
+            elseif not native_mod.is_ready() and type(native_mod.stats) == "function" then
+                local st = native_mod.stats()
+                if type(st) == "table" and type(st.last_error) == "string" and #st.last_error > 0 then
+                    logged_init_error = false
+                    native_mod.init_async(data_dir, ort_path, threads, gram_path, col_pen, non_col_pen, model_file or "")
+                end
+            elseif native_mod.is_ready() and #gram_path > 0 then
+                -- Allow lazy .gram attachment if an earlier schema initialized without grammar/language
+                native_mod.init_async(data_dir, ort_path, threads, gram_path, col_pen, non_col_pen, model_file or "")
+            end
         end
         return native_loaded
     end
     native_attempted = true
 
     local dll_path = join_path(data_dir, "rime_neural.dll")
-    if not (file_exists(dll_path) and file_exists(ort_path) and has_any_model(data_dir, model_file)) then
+    if not file_exists(dll_path) then
+        if has_non_ascii(dll_path) and log and log.warning then
+            log.warning(
+                "rime_neural: cannot access non-ASCII path via Lua ANSI io.open/loadlib ("
+                    .. dll_path
+                    .. "); configure rime_neural/data_dir to an ASCII path or place neural/ under Weasel shared data_dir"
+            )
+        end
         return false
     end
 
@@ -236,6 +290,13 @@ local function get_preceding_context(context, segment_start, first_preedit, raw_
         elseif status == "text" then
             if uia_text and #uia_text > 0 then
                 base_ctx = normalize_to_simplified(utf8_tail_bytes(uia_text, 384), is_trad, env)
+                -- Under Traditional mode + `preedit_type: preview`, Weasel echoes the Traditional
+                -- candidate inline; strip its Simplified equivalent after tw2sp normalization.
+                if is_trad and first_cand_text and #first_cand_text > 0 and #base_ctx >= #first_cand_text
+                    and base_ctx:sub(-#first_cand_text) == first_cand_text
+                then
+                    base_ctx = trim_ws(base_ctx:sub(1, #base_ctx - #first_cand_text))
+                end
             end
         elseif status == "window_changed" then
             base_ctx = ""
@@ -302,10 +363,13 @@ local function detect_namespace(cfg)
     for _, ns in ipairs({ "rime_neural", "neural_rerank", "zhiyi_rerank" }) do
         if cfg:get_string(ns .. "/option_name")
             or cfg:get_string(ns .. "/pinyin_layout")
+            or cfg:get_string(ns .. "/data_dir")
+            or cfg:get_string(ns .. "/model_file")
             or cfg:get_list(ns .. "/fusion_weights")
             or cfg:get_int(ns .. "/max_candidates")
             or cfg:get_bool(ns .. "/sync_init") ~= nil
             or cfg:get_bool(ns .. "/enable_uia_context") ~= nil
+            or cfg:get_bool(ns .. "/log_feedback") ~= nil
         then
             return ns
         end
@@ -355,9 +419,14 @@ function M.init(env)
     local ud_low = user_dir:lower()
     local in_temp = (ud_low:find("\\temp\\", 1, true) ~= nil) or (ud_low:find("/temp/", 1, true) ~= nil)
 
-    local data_dir = resolve_data_dir(user_dir, env.model_file)
+    local custom_data_dir = cfg:get_string(ns .. "/data_dir") or ""
+    local data_dir = resolve_data_dir(user_dir, env.model_file, custom_data_dir)
     local allow_temp_log = (cfg:get_bool(ns .. "/log_feedback_in_temp") == true)
-    env.log_feedback = (cfg:get_bool(ns .. "/log_feedback") == true) and (not in_temp or allow_temp_log)
+    local fb_opt = cfg:get_bool(ns .. "/log_feedback")
+    if fb_opt == nil then
+        fb_opt = true
+    end
+    env.log_feedback = fb_opt and (not in_temp or allow_temp_log)
     env.feedback_path = join_path(data_dir, "feedback.jsonl")
 
     local uia_opt = cfg:get_bool(ns .. "/enable_uia_context")
@@ -391,6 +460,8 @@ function M.init(env)
         local dp_legacy = cfg:get_bool(ns .. "/double_pinyin")
         if dp_legacy == false then
             layout_opt = "full"
+        elseif dp_legacy == true then
+            layout_opt = "zrm"
         end
     end
     if env.ready and native_mod and type(native_mod.resolve_layout) == "function" then
@@ -449,7 +520,7 @@ function M.init(env)
             then
                 norm_commit = norm_commit:sub(#snap.comp_prefix + 1)
             end
-            if #norm_commit < 6 then
+            if #norm_commit < 6 or is_pure_ascii(norm_commit) then
                 return
             end
 
@@ -467,21 +538,48 @@ function M.init(env)
                 end
             end
 
-            -- Log 100% of multi-candidate commits (unbiased stream -> zero selection bias for MAP tuning;
-            -- disk usage is strictly bounded by feedback.rs 5 MiB auto-rotation ~15,000 sentences).
+            -- Derive purely numeric indices in memory; never persist user text, keystrokes, or UIA context.
+            local chosen_idx = -1
+            for i = 1, #snap.cands do
+                if snap.cands[i] == norm_commit then
+                    chosen_idx = i - 1
+                    break
+                end
+            end
+            local p2c_shown = (type(snap.p2c_text) == "string" and #snap.p2c_text > 0)
+            local p2c_chosen = p2c_shown and (chosen_idx < 0) and (norm_commit == snap.p2c_text)
+            local shown_top1_idx = -1
+            local top1_text = snap.shown[1] or ""
+            if p2c_shown and top1_text == snap.p2c_text then
+                shown_top1_idx = -2
+                for i = 1, #snap.cands do
+                    if snap.cands[i] == top1_text then
+                        shown_top1_idx = i - 1
+                        break
+                    end
+                end
+            else
+                for i = 1, #snap.cands do
+                    if snap.cands[i] == top1_text then
+                        shown_top1_idx = i - 1
+                        break
+                    end
+                end
+            end
+
+            -- Log 100% of multi-candidate commits as zero-plaintext numeric features
+            -- (bounded by feedback.rs 5 MiB auto-rotation).
             native_mod.log_feedback(
                 env.schema_id,
-                snap.raw_seg,
-                snap.pre_ctx,
-                snap.cands,
+                snap.has_ctx,
                 snap.logits,
                 snap.gram_deltas,
                 snap.char_lps,
-                snap.p2c_text or "",
-                snap.shown[1] or "",
-                norm_commit,
+                shown_top1_idx,
+                chosen_idx,
+                p2c_shown,
+                p2c_chosen,
                 chosen_rank,
-                false,
                 env.feedback_path
             )
         end)
@@ -491,6 +589,7 @@ end
 function M.func(input, env)
     local ctx = env.engine.context
     if not env.ready or not native_mod or not ctx:get_option(env.option_name) or not native_mod.is_ready() then
+        env.last_rerank = nil
         if native_mod and not logged_init_error and type(native_mod.is_ready) == "function"
             and not native_mod.is_ready() and type(native_mod.stats) == "function"
         then
@@ -585,14 +684,13 @@ function M.func(input, env)
                 if env.log_feedback then
                     env.last_rerank = {
                         full_input = cur_input,
-                        raw_seg = raw_seg,
                         comp_prefix = comp_prefix,
-                        pre_ctx = pre_ctx,
+                        has_ctx = (utf8_char_count(trim_ws(pre_ctx)) >= 2),
                         cands = sent_texts,
                         logits = res.logits or {},
                         gram_deltas = res.gram_deltas or {},
                         char_lps = res.char_lps or {},
-                        p2c_text = res.p2c_text,
+                        p2c_text = (p2c_cand and res.p2c_text) or nil,
                         shown = shown_texts,
                         blocked = is_blocked,
                     }
@@ -602,6 +700,8 @@ function M.func(input, env)
                     yield(emit_list[i])
                 end
                 return
+            else
+                clear_stale_snapshot()
             end
         else
             clear_stale_snapshot()
@@ -670,7 +770,9 @@ function M.func(input, env)
         end
     end
 
-    if not passthrough and not flushed and sent_cands then
+    if is_first then
+        clear_stale_snapshot()
+    elseif not passthrough and not flushed and sent_cands then
         flush_sentences()
     end
 end
