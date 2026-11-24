@@ -179,6 +179,14 @@ pub struct RerankResult {
     pub has_gram: bool,
 }
 
+#[derive(Clone, Debug)]
+struct VerifiedProposal {
+    text: String,
+    ldiff: f32,
+    gdiff: f32,
+    from_ctx: bool,
+}
+
 #[derive(Clone)]
 struct CachedEval {
     logits: Vec<f32>,
@@ -186,7 +194,7 @@ struct CachedEval {
     char_lps: Vec<f32>,
     p2c_text: Option<String>,
     p2c_margin: f32,
-    p2c_verified: Option<(f32, f32)>,
+    p2c_verified: Vec<VerifiedProposal>,
     used_fused_kv: bool,
     has_gram: bool,
     last_used: u64,
@@ -1173,6 +1181,136 @@ fn rank_order_from_features(
     scored.into_iter().map(|(idx, _)| idx).collect()
 }
 
+/// Synthesize up to 3 candidate proposals by splicing maximal 2+ character reading-matched Han
+/// spans from the already-authorized `ctx_tail` into `base_cand`. Returns an empty list on empty
+/// context, partial syllables, or length/reading misalignment so zero-context keystrokes pay zero
+/// overhead and never change behavior.
+fn build_context_entity_proposals(
+    ctx_tail: &str,
+    units: &[(&'static str, String)],
+    base_cand: &str,
+    existing_cands: &[String],
+    readings: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    if ctx_tail.is_empty() || units.len() < 2 || units.iter().any(|(k, _)| *k != "f") {
+        return Vec::new();
+    }
+    let base_chars: Vec<char> = base_cand.chars().collect();
+    if base_chars.len() != units.len() {
+        return Vec::new();
+    }
+    let mut ch_buf = [0u8; 4];
+    for (j, &ch) in base_chars.iter().enumerate() {
+        let key: &str = ch.encode_utf8(&mut ch_buf);
+        if readings
+            .get(key)
+            .is_none_or(|rlist| !rlist.contains(&units[j].1))
+        {
+            return Vec::new();
+        }
+    }
+
+    let ctx_chars: Vec<char> = ctx_tail.chars().collect();
+    if ctx_chars.len() < 2 {
+        return Vec::new();
+    }
+    let ctx_rlists: Vec<Option<&[String]>> = ctx_chars
+        .iter()
+        .map(|&ch| {
+            if !matches!(ch, '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}') {
+                return None;
+            }
+            let key: &str = ch.encode_utf8(&mut ch_buf);
+            readings.get(key).map(|v| v.as_slice())
+        })
+        .collect();
+
+    let matches_slot = |a: usize, s: usize| -> bool {
+        ctx_rlists[a].is_some_and(|rlist| rlist.iter().any(|r| r == &units[s].1))
+    };
+
+    // Collect left- and right-maximal contiguous matching diagonals of length >= 2 that differ
+    // from `base_chars` in at least one slot.
+    let mut spans: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for a in 0..ctx_chars.len() {
+        if ctx_rlists[a].is_none() {
+            continue;
+        }
+        for s in 0..units.len() {
+            if !matches_slot(a, s) {
+                continue;
+            }
+            if a > 0 && s > 0 && matches_slot(a - 1, s - 1) {
+                continue;
+            }
+            let mut len = 1usize;
+            while a + len < ctx_chars.len()
+                && s + len < units.len()
+                && matches_slot(a + len, s + len)
+            {
+                len += 1;
+            }
+            if len < 2 {
+                continue;
+            }
+            let diffs = (0..len)
+                .filter(|&k| ctx_chars[a + k] != base_chars[s + k])
+                .count();
+            if diffs > 0 {
+                spans.push((a, s, len, diffs));
+            }
+        }
+    }
+    if spans.is_empty() {
+        return Vec::new();
+    }
+
+    // Prefer longer matches, then more recent occurrences in context, then more changed chars.
+    spans.sort_by(|x, y| {
+        y.2.cmp(&x.2)
+            .then_with(|| y.0.cmp(&x.0))
+            .then_with(|| y.3.cmp(&x.3))
+            .then_with(|| x.1.cmp(&y.1))
+    });
+
+    let mut proposals: Vec<String> = Vec::with_capacity(3);
+    let push_unique = |proposals: &mut Vec<String>, cand: String| {
+        if proposals.len() < 3
+            && !existing_cands.iter().any(|c| c == &cand)
+            && !proposals.iter().any(|p| p == &cand)
+        {
+            proposals.push(cand);
+        }
+    };
+
+    // If two or more non-overlapping maximal spans apply to the same sentence (e.g. two names),
+    // also propose their combined splice.
+    let mut combined = base_chars.clone();
+    let mut covered = vec![false; units.len()];
+    let mut applied_spans = 0usize;
+    for &(a, s, len, _) in &spans {
+        if covered[s..s + len].iter().all(|&c| !c) {
+            combined[s..s + len].copy_from_slice(&ctx_chars[a..a + len]);
+            covered[s..s + len].fill(true);
+            applied_spans += 1;
+        }
+    }
+    if applied_spans >= 2 {
+        push_unique(&mut proposals, combined.into_iter().collect());
+    }
+
+    for &(a, s, len, _) in &spans {
+        if proposals.len() >= 3 {
+            break;
+        }
+        let mut spliced = base_chars.clone();
+        spliced[s..s + len].copy_from_slice(&ctx_chars[a..a + len]);
+        push_unique(&mut proposals, spliced.into_iter().collect());
+    }
+
+    proposals
+}
+
 fn sanitize_special_tokens<'a>(
     text: &'a str,
     special_tokens: &[String],
@@ -1550,13 +1688,16 @@ impl NeuralEngine {
                 (Vec::new(), vec![0.0f32; cands.len()])
             };
 
-        // Optional KV-cached Pass-2 Cross-Encoder + .gram verification of promising novel P2C candidates
-        let mut p2c_verified: Option<(f32, f32)> = None;
-        if let Some(kv_idx) = kv_idx_opt
-            && p2c_verify_margin > 0.0
+        // Optional KV-cached Pass-2 Cross-Encoder + .gram verification of novel P2C candidates
+        // and maximal focus-bound context-entity splices (batched into a single Pass-2 call).
+        let mut p2c_verified: Vec<VerifiedProposal> = Vec::new();
+        let has_greedy_p2c = p2c_verify_margin > 0.0
             && p2c_margin.is_finite()
             && p2c_margin > p2c_verify_margin
-            && let Some(ref p2c_str) = p2c_text
+            && p2c_text.is_some();
+        if let Some(kv_idx) = kv_idx_opt
+            && p2c_verify_margin > 0.0
+            && (has_greedy_p2c || !ctx_tail.is_empty())
         {
             let has_ctx_f = if ctx_tail.trim().chars().count() >= 2 {
                 1.0
@@ -1566,34 +1707,86 @@ impl NeuralEngine {
             let rank0 =
                 rank_order_from_features(&logits, &gram_deltas, &char_lps, has_ctx_f, weights);
             let best_idx = rank0[0];
-            let mut probe_toks: Vec<Vec<i64>> = Vec::with_capacity(3);
-            probe_toks.push(cand_toks[best_idx].clone());
-            if rank0.len() >= 2 {
-                probe_toks.push(cand_toks[rank0[1]].clone());
-            }
-            probe_toks.push(self.encode_candidate_ids(p2c_str));
 
-            if let Ok((l2, _, _, _)) = self.run_fused_kv_at(kv_idx, &units, &probe_toks, None)
-                && let (Some(&l_best), Some(&l_p2c)) = (l2.first(), l2.last())
-                && l_best.is_finite()
-                && l_p2c.is_finite()
+            let mut proposals: Vec<(String, Vec<i64>, bool)> = Vec::with_capacity(4);
+            if has_greedy_p2c && let Some(ref p2c_str) = p2c_text {
+                let toks = self.encode_candidate_ids(p2c_str);
+                proposals.push((p2c_str.clone(), toks, false));
+            }
+            if !ctx_tail.is_empty()
+                && !shifted_lcp
+                && units.len() == orig_units_len
+                && units.len() <= self.max_slots
+                && cand_toks[best_idx].len() <= self.candidate_tokens
             {
-                let ldiff = l_p2c - l_best;
-                self.stats.p2c_pass2_calls += 1;
-                let gdiff = if let Some((g, (col, non_col, max_len))) = key
-                    .gram_key
-                    .path
-                    .as_ref()
-                    .and_then(|p| self.gram_cache.get(p))
-                    .zip(gram_params)
+                let ctx_props = build_context_entity_proposals(
+                    ctx_tail,
+                    &units,
+                    &cands[best_idx],
+                    cands,
+                    &self.readings,
+                );
+                for prop in ctx_props {
+                    if proposals.iter().any(|(p, _, _)| p == &prop) {
+                        continue;
+                    }
+                    let toks = self.encode_candidate_ids(&prop);
+                    if toks.len() <= self.candidate_tokens {
+                        proposals.push((prop, toks, true));
+                    }
+                }
+            }
+
+            if !proposals.is_empty() {
+                let mut probe_toks: Vec<Vec<i64>> = Vec::with_capacity(2 + proposals.len());
+                probe_toks.push(cand_toks[best_idx].clone());
+                if rank0.len() >= 2 {
+                    probe_toks.push(cand_toks[rank0[1]].clone());
+                }
+                let prop_start = probe_toks.len();
+                for (_, toks, _) in &proposals {
+                    probe_toks.push(toks.clone());
+                }
+
+                if let Ok((l2, _, _, _)) = self.run_fused_kv_at(kv_idx, &units, &probe_toks, None)
+                    && l2.len() >= prop_start + proposals.len()
+                    && l2[0].is_finite()
                 {
-                    (g.score_sentence_per_char(p2c_str, col, non_col, max_len) - raw_g[best_idx])
-                        as f32
-                } else {
-                    0.0
-                };
-                if ldiff.is_finite() && gdiff.is_finite() {
-                    p2c_verified = Some((ldiff, gdiff));
+                    let l_best = l2[0];
+                    self.stats.p2c_pass2_calls += 1;
+                    let gram_scorer = key
+                        .gram_key
+                        .path
+                        .as_ref()
+                        .and_then(|p| self.gram_cache.get(p))
+                        .zip(gram_params);
+                    for (k, &l_prop) in l2[prop_start..prop_start + proposals.len()]
+                        .iter()
+                        .enumerate()
+                    {
+                        if !l_prop.is_finite() {
+                            continue;
+                        }
+                        let ldiff = l_prop - l_best;
+                        if !ldiff.is_finite() {
+                            continue;
+                        }
+                        let (ref prop_text, _, from_ctx) = proposals[k];
+                        let gdiff = if let Some((g, (col, non_col, max_len))) = gram_scorer {
+                            (g.score_sentence_per_char(prop_text, col, non_col, max_len)
+                                - raw_g[best_idx]) as f32
+                        } else {
+                            0.0
+                        };
+                        if gdiff.is_finite() {
+                            p2c_verified.push(VerifiedProposal {
+                                text: prop_text.clone(),
+                                ldiff,
+                                gdiff,
+                                from_ctx,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -1898,36 +2091,67 @@ impl NeuralEngine {
 }
 
 /// Pure P2C placement decision with strict finiteness guards on Pass-2 logit/gram deltas and
-/// legacy Pass-1 margins.
+/// legacy Pass-1 margins. Each Pass-2 verified proposal is evaluated against the caller's
+/// thresholds independently (proposals injected solely from context add a prefix-copy bias guard),
+/// selecting the strongest qualifying placement (`#1` over `#2`, ties broken by higher `ldiff`).
 fn select_p2c_placement(
     p2c_text: Option<&str>,
     p2c_margin: f32,
-    p2c_verified: Option<(f32, f32)>,
+    p2c_verified: &[VerifiedProposal],
     used_fused_kv: bool,
     has_ctx: bool,
     p2c_cfg: P2cConfig,
 ) -> (Option<String>, u8) {
+    if !p2c_verified.is_empty() {
+        let mut best: Option<(&str, u8, f32)> = None;
+        for vp in p2c_verified {
+            if !vp.ldiff.is_finite() || !vp.gdiff.is_finite() {
+                continue;
+            }
+            let top1_req = if vp.from_ctx {
+                p2c_cfg.top1_logit_diff + 2.0
+            } else {
+                p2c_cfg.top1_logit_diff
+            };
+            let top2_req = if vp.from_ctx {
+                p2c_cfg.top2_logit_diff + 1.5
+            } else {
+                p2c_cfg.top2_logit_diff
+            };
+            let pos = if p2c_cfg.top1_logit_diff > 0.0
+                && vp.ldiff > top1_req
+                && vp.gdiff > p2c_cfg.top1_min_gram_diff
+            {
+                1u8
+            } else if p2c_cfg.top2_logit_diff > 0.0
+                && vp.ldiff > top2_req
+                && vp.gdiff > (p2c_cfg.top1_min_gram_diff - 1.5)
+            {
+                2u8
+            } else {
+                0u8
+            };
+            if pos == 0 {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some((_, bpos, bldiff)) => pos < bpos || (pos == bpos && vp.ldiff > bldiff),
+            };
+            if better {
+                best = Some((vp.text.as_str(), pos, vp.ldiff));
+            }
+        }
+        return match best {
+            Some((txt, pos, _)) => (Some(txt.to_string()), pos),
+            None => (None, 0),
+        };
+    }
+
     let Some(txt) = p2c_text else {
         return (None, 0);
     };
-    if let Some((ldiff, gdiff)) = p2c_verified {
-        if !ldiff.is_finite() || !gdiff.is_finite() {
-            return (None, 0);
-        }
-        if p2c_cfg.top1_logit_diff > 0.0
-            && ldiff > p2c_cfg.top1_logit_diff
-            && gdiff > p2c_cfg.top1_min_gram_diff
-        {
-            (Some(txt.to_string()), 1)
-        } else if p2c_cfg.top2_logit_diff > 0.0
-            && ldiff > p2c_cfg.top2_logit_diff
-            && gdiff > (p2c_cfg.top1_min_gram_diff - 1.5)
-        {
-            (Some(txt.to_string()), 2)
-        } else {
-            (None, 0)
-        }
-    } else if !used_fused_kv && has_ctx && p2c_margin.is_finite() {
+    if !used_fused_kv && has_ctx && p2c_margin.is_finite() {
         if p2c_cfg.legacy_top1_margin > 0.0 && p2c_margin > p2c_cfg.legacy_top1_margin {
             (Some(txt.to_string()), 1)
         } else if p2c_cfg.legacy_top2_margin > 0.0 && p2c_margin > p2c_cfg.legacy_top2_margin {
@@ -1989,7 +2213,7 @@ pub fn rerank(
     let (p2c_text, p2c_pos) = select_p2c_placement(
         eval.p2c_text.as_deref(),
         eval.p2c_margin,
-        eval.p2c_verified,
+        &eval.p2c_verified,
         eval.used_fused_kv,
         has_ctx_bool,
         p2c_cfg,
@@ -2270,12 +2494,18 @@ mod tests {
     #[test]
     fn test_select_p2c_placement_guards_non_finite_and_thresholds() {
         let cfg = P2cConfig::default();
+        let vp = |text: &str, ldiff: f32, gdiff: f32, from_ctx: bool| VerifiedProposal {
+            text: text.to_string(),
+            ldiff,
+            gdiff,
+            from_ctx,
+        };
         // +Inf / NaN Pass-2 deltas must never promote P2C
         assert_eq!(
             select_p2c_placement(
                 Some("拟号"),
                 1.0,
-                Some((f32::INFINITY, 0.0)),
+                &[vp("拟号", f32::INFINITY, 0.0, false)],
                 true,
                 true,
                 cfg
@@ -2283,28 +2513,195 @@ mod tests {
             (None, 0)
         );
         assert_eq!(
-            select_p2c_placement(Some("拟号"), 1.0, Some((3.0, f32::NAN)), true, true, cfg),
+            select_p2c_placement(
+                Some("拟号"),
+                1.0,
+                &[vp("拟号", 3.0, f32::NAN, false)],
+                true,
+                true,
+                cfg
+            ),
             (None, 0)
         );
         // Valid Pass-2 #1 promotion
         assert_eq!(
-            select_p2c_placement(Some("拟号"), 1.0, Some((2.5, -1.0)), true, true, cfg),
+            select_p2c_placement(
+                Some("拟号"),
+                1.0,
+                &[vp("拟号", 2.5, -1.0, false)],
+                true,
+                true,
+                cfg
+            ),
             (Some("拟号".to_string()), 1)
         );
         // Fails #1 gram floor (-2.5 < -2.0), passes #2 gram floor (-2.5 > -3.5)
         assert_eq!(
-            select_p2c_placement(Some("拟号"), 1.0, Some((2.5, -2.5)), true, true, cfg),
+            select_p2c_placement(
+                Some("拟号"),
+                1.0,
+                &[vp("拟号", 2.5, -2.5, false)],
+                true,
+                true,
+                cfg
+            ),
             (Some("拟号".to_string()), 2)
         );
-        // Fails #2 gram floor (-4.0 < -3.5)
+        // Context-only spliced proposals add a +2.0 copy-bias guard on top1_logit_diff (4.0)
+        // and +1.5 on top2_logit_diff (2.0) while keeping the standard `.gram` floor.
         assert_eq!(
-            select_p2c_placement(Some("拟号"), 1.0, Some((2.5, -4.0)), true, true, cfg),
+            select_p2c_placement(
+                None,
+                -100.0,
+                &[vp("沈珂理解", 2.8, -1.0, true)],
+                true,
+                true,
+                cfg
+            ),
+            (Some("沈珂理解".to_string()), 2)
+        );
+        assert_eq!(
+            select_p2c_placement(
+                None,
+                -100.0,
+                &[vp("陆屿多年", 1.5, -0.5, true)],
+                true,
+                true,
+                cfg
+            ),
+            (None, 0)
+        );
+        assert_eq!(
+            select_p2c_placement(
+                None,
+                -100.0,
+                &[vp("沈珂明天过来", 5.0, -0.8, true)],
+                true,
+                true,
+                cfg
+            ),
+            (Some("沈珂明天过来".to_string()), 1)
+        );
+        // An ineligible context splice (ldiff=1.6 < 2.0) must NOT suppress an eligible greedy P2C
+        // (ldiff=1.0 > 0.5) evaluated in the same Pass-2 batch.
+        assert_eq!(
+            select_p2c_placement(
+                Some("拟号"),
+                0.5,
+                &[vp("拟号", 1.0, 0.0, false), vp("陆屿多年", 1.6, 0.0, true)],
+                true,
+                true,
+                cfg
+            ),
+            (Some("拟号".to_string()), 2)
+        );
+        // Fails #2 gram floor (-4.0 < -3.5) for non-context P2C
+        assert_eq!(
+            select_p2c_placement(
+                Some("拟号"),
+                1.0,
+                &[vp("拟号", 2.5, -4.0, false)],
+                true,
+                true,
+                cfg
+            ),
             (None, 0)
         );
         // Fused KV without Pass-2 verification never falls back to legacy margin
         assert_eq!(
-            select_p2c_placement(Some("拟号"), 5.0, None, true, true, cfg),
+            select_p2c_placement(Some("拟号"), 5.0, &[], true, true, cfg),
             (None, 0)
+        );
+    }
+
+    #[test]
+    fn test_build_context_entity_proposals_maximal_and_multi_span() {
+        let mut r = HashMap::new();
+        for (ch, syl) in [
+            ("乌", "wu"),
+            ("无", "wu"),
+            ("比", "bi"),
+            ("莫", "mo"),
+            ("斯", "si"),
+            ("环", "huan"),
+            ("换", "huan"),
+            ("这", "zhe"),
+            ("个", "ge"),
+            ("好", "hao"),
+            ("沈", "shen"),
+            ("深", "shen"),
+            ("珂", "ke"),
+            ("刻", "ke"),
+            ("和", "he"),
+            ("陆", "lu"),
+            ("路", "lu"),
+            ("屿", "yu"),
+            ("遇", "yu"),
+            ("来", "lai"),
+        ] {
+            r.insert(ch.to_string(), vec![syl.to_string()]);
+        }
+        // 1. Maximal span preserves full 5-char term `乌比莫斯环` (never truncated to `乌比莫斯换`)
+        let units = vec![
+            ("f", "zhe".into()),
+            ("f", "ge".into()),
+            ("f", "wu".into()),
+            ("f", "bi".into()),
+            ("f", "mo".into()),
+            ("f", "si".into()),
+            ("f", "huan".into()),
+            ("f", "hao".into()),
+        ];
+        let base = "这个无比莫斯换好";
+        let props = build_context_entity_proposals(
+            "买了一个乌比莫斯环",
+            &units,
+            base,
+            &[base.to_string()],
+            &r,
+        );
+        assert_eq!(props, vec!["这个乌比莫斯环好".to_string()]);
+
+        // 2. Empty context returns zero proposals
+        assert!(
+            build_context_entity_proposals("", &units, base, &[base.to_string()], &r).is_empty()
+        );
+
+        // 3. Multiple non-overlapping spans produce combined + individual proposals
+        let units2 = vec![
+            ("f", "shen".into()),
+            ("f", "ke".into()),
+            ("f", "he".into()),
+            ("f", "lu".into()),
+            ("f", "yu".into()),
+            ("f", "lai".into()),
+        ];
+        let base2 = "深刻和路遇来";
+        let props2 = build_context_entity_proposals(
+            "刚才沈珂和陆屿都来了",
+            &units2,
+            base2,
+            &[base2.to_string()],
+            &r,
+        );
+        assert_eq!(props2[0], "沈珂和陆屿来");
+
+        // 4. Unverified base character with no reading entry must fail closed (reject splicing)
+        let units_unk = vec![
+            ("f", "shen".into()),
+            ("f", "ke".into()),
+            ("f", "ren".into()),
+        ];
+        let base_unk = "深刻𠮷";
+        assert!(
+            build_context_entity_proposals(
+                "刚才沈珂来了",
+                &units_unk,
+                base_unk,
+                &[base_unk.to_string()],
+                &r,
+            )
+            .is_empty()
         );
     }
 

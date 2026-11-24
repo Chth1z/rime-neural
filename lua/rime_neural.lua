@@ -1,4 +1,4 @@
--- rime-neural (v1.2.1): Universal ONNX neural sentence reranker filter for Rime / Weasel.
+-- rime-neural (v1.3.0): Universal ONNX neural sentence reranker filter for Rime / Weasel.
 -- Loads `neural/rime_neural.dll` in-process via official Weasel's exported Lua 5.4 C API.
 -- Features:
 --   * Zero custom rime.dll required; works on official unmodified Weasel (librime >= 1.17.0).
@@ -348,7 +348,11 @@ local function collect_composition_prefix(context, segment_start)
     return table.concat(out)
 end
 
-local function append_commit_history(parts, context)
+local function append_commit_history(parts, context, max_entries)
+    local limit = math.max(0, math.min(6, max_entries or 6))
+    if limit == 0 then
+        return
+    end
     local hist = context.commit_history
     if not hist then
         return
@@ -356,7 +360,7 @@ local function append_commit_history(parts, context)
     if type(hist.to_table) == "function" then
         local tbl = hist:to_table()
         if type(tbl) == "table" and #tbl > 0 then
-            local start_i = math.max(1, #tbl - 5)
+            local start_i = math.max(1, #tbl - limit + 1)
             for i = start_i, #tbl do
                 local rec = tbl[i]
                 if rec and rec.text and #rec.text > 0 then
@@ -528,9 +532,11 @@ local function get_preceding_context(context, segment_start, first_preedit, raw_
             -- session commit history only while (hwnd, focus_epoch) matches the last commit in
             -- this same control, preventing cross-control bleed on focus moves.
             local prev_commit = env.last_commit_focus
-            if prev_commit and prev_commit.hwnd == hwnd and prev_commit.focus_epoch == focus_epoch then
+            if prev_commit and prev_commit.hwnd == hwnd and prev_commit.focus_epoch == focus_epoch
+                and (prev_commit.count or 0) > 0
+            then
                 local hist_parts = {}
-                append_commit_history(hist_parts, context)
+                append_commit_history(hist_parts, context, prev_commit.count)
                 if #hist_parts > 0 then
                     local history = utf8_tail_bytes(table.concat(hist_parts), 384)
                     base_ctx = normalize_to_simplified(history, is_traditional_mode(context), env)
@@ -915,10 +921,14 @@ function M.init(env)
             then
                 live_status, _, live_hwnd, _, live_epoch = native_mod.query_uia_context("", "", "")
             end
-            if prev_focus and (live_status == "text" or live_status == "fallback")
+            local ctext = ctx:get_commit_text() or ""
+            if prev_focus and #ctext > 0 and (live_status == "text" or live_status == "fallback")
                 and live_hwnd == prev_focus.hwnd and live_epoch == prev_focus.focus_epoch
             then
-                env.last_commit_focus = { hwnd = live_hwnd, focus_epoch = live_epoch }
+                local prev_cf = env.last_commit_focus
+                local cnt = (prev_cf and prev_cf.hwnd == live_hwnd and prev_cf.focus_epoch == live_epoch)
+                    and math.min(6, (prev_cf.count or 0) + 1) or 1
+                env.last_commit_focus = { hwnd = live_hwnd, focus_epoch = live_epoch, count = cnt }
             else
                 env.last_commit_focus = nil
             end
