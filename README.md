@@ -21,12 +21,12 @@
 
 ### 特性
 
-- **与 `.gram` 语言模型协同**：支持单独运行，也支持搭配中文统计语法模型（推荐 [`wanxiang-lts-zh-hans.gram`](https://github.com/amzxyz/rime-wanxiang-data/releases/tag/LTS)）。Rime 借助 `.gram` 生成 Top-8 整句候选，插件通过 Win32 共享内存以只读方式映射同一份 `.gram` 文件（零额外物理内存），按方案独立缓存对应的 `.gram` 与惩罚参数，联合融合神经模型分数、`.gram` 搭配分与候选位置先验，并对高置信度未登录整句执行 KV 缓存 Pass-2 校验合成。
+- **与 `.gram` 语言模型协同**：支持单独运行，也支持搭配中文统计语法模型（推荐 [`wanxiang-lts-zh-hans.gram`](https://github.com/amzxyz/rime-wanxiang-data/releases/tag/LTS)）。Rime 借助 `.gram` 生成 Top-8 整句候选，插件按路径共享只读 `.gram` 映射，按方案应用惩罚参数，联合融合神经模型分数、`.gram` 搭配分与候选位置先验，并对高置信度未登录整句执行 KV 缓存 Pass-2 校验合成。
 - **仅作用于整句候选**：仅重排配置分段标签（默认 `abc`）下 `cand:get_genuine().type == "sentence"` 的整句候选，词典精确词条、用户词典、英文混输、日期、数字与标点保持原序。
 - **全拼与 7 套双拼**：自动识别全拼以及自然码（ZRM）、小鹤（Flypy）、微软（MSPY，含 `; = ing`）、搜狗（Sogou，含 `; = ing`）、智能 ABC、紫光（含 `; = ing`）、拼音加加（PYJJ），适配雾凇、白霜、万象及自定义方案。
 - **本地 CPU 推理与进程内复用**：基于 ONNX Runtime 量化模型与 16 槽前缀 KV-cache 在 CPU 离线运行；启动阶段异步加载模型，模块通过 `GetModuleHandleExA(PIN)` 钉驻小狼毫进程，重新部署时直接复用已加载实例。
 - **多模型自动识别**：启动时读取 ONNX 图结构与 `unified_vocab.json`，同一份 `rime_neural.dll` 支持 12 层 `ML-pumpkin-1103`（默认，约 82 MB）与 8 层 `zhen-feather-preview-1121`（约 38 MB）。
-- **跨应用前文读取与隐私保护**：独立后台 MTA 线程通过 Windows UIA 读取光标前最多 64 字（按键热路径 `< 2 µs`），读取范围严格钳制在当前焦点控件（`RangeFromChild`）与 `U+FFFC` 之内；每次编码会话冻结上文快照，焦点切换或窗口切换时立即隔离旧上文；遇到密码控件、受保护进程、密码管理器、远程会话客户端及本地终端时 fail-closed 返回空上文并停止记录日志。
+- **跨应用前文读取与隐私保护**：独立后台 MTA 线程通过 Windows UIA 读取光标前最多 64 字（按键热路径 `< 2 µs`），读取范围严格钳制在当前焦点控件边界（`RangeFromChild` / `DocumentRange`）与 `U+FFFC` 对象边界之内；每次编码会话冻结上文快照，焦点或窗口切换时立即失效。已确认安全的非 `TextPattern` 控件仅在相同焦点周期（`(HWND, focus_epoch)`）内沿用 Rime 会话历史与已确认前缀。遇到密码控件、受保护进程、密码管理器、远程会话客户端及本地终端时 fail-closed 返回空上文并停止记录日志。
 
 ### 运行要求与限制
 
@@ -233,8 +233,8 @@ Intel Core Ultra 7 255HX，隔离 `rime.dll` 基准实测：
   - 焦点控件报告 `IsPassword == true`，或访问 `IsPassword` 属性时返回访问拒绝，或内容呈掩码圆点 / 星号（`••••••` / `******`）；
   - 前台或焦点进程为受保护进程（`OpenProcess` 返回 `ERROR_ACCESS_DENIED`）或 PID 无法解析；
   - 命中敏感进程名单：密码管理器与验证器（`KeePass*`、`KeePassXC`、`1Password`、`Bitwarden`、`Enpass`、`LastPass`、`Dashlane`、`RoboForm`、`NordPass`、`ProtonPass`、`Keeper`、`PasswordSafe`、`Authy`、`WinAuth`）、系统凭据 / UAC 界面（`CredentialUIBroker`、`consent.exe`、`LockApp`）、远程桌面与 SSH 客户端（`mstsc.exe`、`msrdc.exe`、`PuTTY`、`Xshell`、`MobaXterm*`、`FinalShell`）以及本地终端（`WindowsTerminal`、`conhost`、`cmd`、`powershell`、`pwsh`、`mintty`、`alacritty`、`wezterm-gui`、`kitty`）。
-- **零明文本地日志**：`%APPDATA%\Rime\neural\feedback.jsonl` 仅记录模型数值特征（`logits`、`gram_deltas`、`char_lps`）与候选索引结果（`shown_top1_idx`、`chosen_idx`、`has_ctx`、`has_gram`），不写入用户输入文本、按键串、候选词或屏幕上下文；写入端拒绝符号链接与重解析点，单文件上限 `5 MiB` 并保留 1 份 `.1` 轮转备份（合计至多 `10 MiB`）；设置 `log_feedback: false` 可关闭。
-- **可选个人权重校准**：积累 100 条以上本地选词记录后，可使用 Python 3 + `numpy` 运行 `python scripts\tune-fusion.py`（支持 `--schema`、`--model`、`--has-gram` 筛选及 `--scrub-legacy-inplace` 清理历史格式）；仅在分块 5 折交叉验证、单侧 95% 置信检验（Hajek 稳健标准误）、Top-1 准确率不下降及权重域约束全部通过时输出新权重建议。
+- **零明文本地日志**：`%APPDATA%\Rime\neural\feedback.jsonl` 仅记录模型数值特征（`logits`、`gram_deltas`、`char_lps`）与候选索引结果（`shown_top1_idx`、`chosen_idx`、`has_ctx`、`has_gram`），不写入用户输入文本、按键串、候选词或屏幕上下文；写入端拒绝重解析点，在 `5 MiB` 时轮转并保留一份 `.1` 备份；遇到临时共享锁时，活动文件可增长至 `10 MiB`；设置 `log_feedback: false` 可关闭。
+- **可选个人权重校准**：积累 100 条以上本地选词记录后，可使用 Python 3 + `numpy` 运行 `python scripts\tune-fusion.py`（支持 `--schema`、`--model`、`--has-gram` 筛选及 `--scrub-legacy-inplace` 清理历史格式）；调参器用五个连续留出块评估保留三位小数的权重。仅当加权对数损失下降并通过针对七组先验精度的 Bonferroni 单侧检验（名义显著性水平 5%，Hájek 稳健标准误）、Top-1 准确率不下降且权重满足约束时，才输出建议。
 
 ## 常见问题
 
