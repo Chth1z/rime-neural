@@ -2,12 +2,12 @@
 
 # rime-neural
 
-**Windows Rime / 小狼毫（Weasel）本地 ONNX 神经整句重排插件**
+**Rime / 小狼毫（Weasel）本地 ONNX 神经整句重排、容错与词级修复插件**
 
 [![CI & Release](https://github.com/Chth1z/rime-neural/actions/workflows/ci-release.yml/badge.svg)](https://github.com/Chth1z/rime-neural/actions/workflows/ci-release.yml)
 [![Release](https://img.shields.io/github/v/release/Chth1z/rime-neural?label=release)](https://github.com/Chth1z/rime-neural/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64%20(Weasel%20%E2%89%A5%200.17.4)-0078D6.svg)](https://github.com/rime/weasel)
+[![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20%7C%20macOS%20(librime%20%E2%89%A5%201.17.0)-0078D6.svg)](https://github.com/rime/weasel)
 
 **简体中文** | [English](README.en.md)
 
@@ -17,23 +17,26 @@
 
 ## 简介
 
-`rime-neural` 是面向 Windows 官方小狼毫（Weasel `>= 0.17.4`，`librime >= 1.17.0`）的进程内 ONNX 神经整句重排插件，由 Lua 5.4 滤镜和 Rust 原生模块组成，直接挂载在现有 Rime 输入方案中运行。
+`rime-neural` 是面向官方 Rime（Windows 小狼毫 Weasel `>= 0.17.4` 及具备 Lua 5.4 C API 导出的 Linux / macOS `librime >= 1.17.0` 宿主）的进程内 ONNX 神经整句引擎，由 Lua 5.4 滤镜/处理器与 Rust 原生模块组成，直接挂载在现有 Rime 输入方案中运行。
 
 ### 特性
 
-- **与 `.gram` 语言模型协同与聚焦上文实体拼接**：支持单独运行，也支持搭配中文统计语法模型（推荐 [`wanxiang-lts-zh-hans.gram`](https://github.com/amzxyz/rime-wanxiang-data/releases/tag/LTS)）。Rime 借助 `.gram` 生成 Top-8 整句候选，插件按路径共享只读 `.gram` 映射，按方案应用惩罚参数，联合融合神经模型分数、`.gram` 搭配分与候选位置先验；并对高置信度未登录整句及当前聚焦上文中出现过的 2 字及以上同音专名/术语（如人名、生僻词）执行单次 KV 缓存 Pass-2 交叉编码器与 `.gram` 联合校验合成。
-- **可选提交前词级修复与字面锁定（`lua/rime_neural_repair.lua`）**：作为独立的可选 `lua_processor` 挂载于 `engine/processors` 首位（常态按键仅执行至多 2 次 `KeyEvent:eq` 判断）。支持在不破坏原始拼音串与不移动物理光标的前提下，通过 `Alt+r` 按词边界步进（`Left`/`Right`）完成提交前同音词替换（`1..9`/`Space`）或无损取消（`Escape`/`Alt+r`）；并通过 `Alt+l` 将技术标识符（`GPUv2`、`OAuth2`、`v1.2.1`、`rime-neural`、`CI/CD` 等）以原生 `raw` 已确认分段嵌入中文句内。
+- **与 `.gram` 协同的神经重排与上文实体拼接**：支持单独运行，也支持搭配中文统计语法模型（推荐 [`wanxiang-lts-zh-hans.gram`](https://github.com/amzxyz/rime-wanxiang-data/releases/tag/LTS)）。Rime 借助 `.gram` 生成 Top-8 整句候选，插件按路径共享只读 `.gram`（Windows 采用内核钉驻内存映射，Unix/macOS 采用不可变快照），按方案应用惩罚参数，融合神经模型分数、`.gram` 搭配分与候选位置先验；并对高置信度未登录整句及当前聚焦上文中出现过的 2 字及以上同音专名/术语执行单次 KV 缓存 Pass-2 交叉编码器与 `.gram` 联合校验合成。开启可选 `enable_document_entities: true` 时，可在不增加 ONNX KV 前缀长度的前提下，从当前焦点控件内前 1,024 字跨段检索同音专名。
+- **自动单编辑错键容错（`src/typo.rs` + `lua/rime_neural.lua`）**：支持全拼与全部 7 套双拼布局的 QWERTY 物理邻键误触、相邻换位、连击重复键与漏键自动纠错（`enable_typo_recovery`，默认开启）。严格受 `is_live_pinyin_prefix` 前缀自动机保护：合法拼音串与输入中合法前缀在微秒级直接放行，零额外词典与推理开销；仅对非法死串通过独立只读 `script_translator`、`.gram` 流畅度门控与神经重排完成整句恢复。
+- **可选提交前全词库神经词级修复与字面锁定（`lua/rime_neural_repair.lua`）**：作为独立的可选 `lua_processor` 挂载于 `engine/processors` 首位（常态按键仅执行至多 2 次 `KeyEvent:eq` 判断）。`Alt+r` 在不破坏原始拼音串与不移动物理光标的前提下按词边界步进（`Left`/`Right`），结合只读全词库查询、单编辑错键邻域（如自然码 `gsye -> 公园`、全拼 `jintan -> 今天`）与共享 12 层神经整句上下文排序展示候选，支持提交前连续多词链式修复、自动遵循当前 OpenCC 简繁输出开关及 `Escape`/`Alt+r` 无损回退；`Alt+l` 可将技术标识符（`GPUv2`、`OAuth2`、`v2.0.0`、`rime-neural`、`CI/CD` 等）以原生 `raw` 已确认分段嵌入中文句内。
 - **仅作用于整句候选**：仅重排配置分段标签（默认 `abc`）下 `cand:get_genuine().type == "sentence"` 的整句候选，词典精确词条、用户词典、英文混输、日期、数字与标点保持原序。
 - **全拼与 7 套双拼**：自动识别全拼以及自然码（ZRM）、小鹤（Flypy）、微软（MSPY，含 `; = ing`）、搜狗（Sogou，含 `; = ing`）、智能 ABC、紫光（含 `; = ing`）、拼音加加（PYJJ），适配雾凇、白霜、万象及自定义方案。
-- **本地 CPU 推理与进程内复用**：基于 ONNX Runtime 量化模型与 16 槽前缀 KV-cache 在 CPU 离线运行；启动阶段异步加载模型，模块通过 `GetModuleHandleExA(PIN)` 钉驻小狼毫进程，重新部署时直接复用已加载实例。
-- **多模型自动识别**：启动时读取 ONNX 图结构与 `unified_vocab.json`，同一份 `rime_neural.dll` 支持 12 层 `ML-pumpkin-1103`（默认，约 82 MB）与 8 层 `zhen-feather-preview-1121`（约 38 MB）。
-- **跨应用前文读取与隐私保护**：独立后台 MTA 线程通过 Windows UIA 读取光标前最多 64 字（按键热路径 `< 2 µs`），读取范围严格钳制在当前焦点控件边界（`RangeFromChild` / `DocumentRange`）与 `U+FFFC` 对象边界之内；每次编码会话冻结上文快照，焦点或窗口切换时立即失效。已确认安全的非 `TextPattern` 控件仅在相同焦点周期（`(HWND, focus_epoch)`）内沿用该焦点周期内产生的 Rime 提交历史与已确认前缀。遇到密码控件、受保护进程、密码管理器、远程会话客户端及本地终端时 fail-closed 返回空上文并停止记录日志。
+- **本地 CPU 推理与进程内复用**：基于 ONNX Runtime 量化模型与 16 槽前缀 KV-cache 在 CPU 离线运行；启动阶段异步加载模型，原生库钉驻宿主进程（Windows `GetModuleHandleExA(PIN)` / Unix `dlopen(..., RTLD_NODELETE)`），重新部署时直接复用已加载实例。
+- **多模型自动识别**：启动时读取 ONNX 图结构与 `unified_vocab.json`，同一份原生库支持 12 层 `ML-pumpkin-1103`（默认，约 82 MB）与 8 层 `zhen-feather-preview-1121`（约 38 MB）。
+- **跨应用前文读取与隐私保护（Windows UIA）**：独立后台 MTA 线程通过 Windows UIA 读取光标前当前段落最多 64 字（按键热路径 `< 2 µs`），读取范围严格钳制在当前焦点控件边界（`RangeFromChild` / `DocumentRange`）与 `U+FFFC` 对象边界之内；每次编码会话冻结上文快照，焦点或窗口切换时立即失效。遇到密码控件、受保护进程、掩码口令内容（同时校验全文与光标前 96 字尾部）、密码管理器、远程会话客户端及本地终端时 fail-closed 返回空上文并停止记录日志。
 
 ### 运行要求与限制
 
-- **平台**：Windows 10 / 11 (x64)，官方小狼毫 `>= 0.17.4`（`librime >= 1.17.0`）。暂不支持 macOS（鼠须管）与 Linux。
+- **平台**：
+  - **Windows 10 / 11 (x64)**：官方小狼毫 `>= 0.17.4`（`librime >= 1.17.0`），提供预编译 Release 与自动安装脚本，支持完整 UIA 前文读取。
+  - **Linux / macOS**：Rust 原生核心（`librime_neural.so` / `librime_neural.dylib`）与 Lua 加载器支持 POSIX 单一提供方 Lua 5.4 解析与源码编译（`cargo build --release --locked`），CI 覆盖 `ubuntu-latest` 编译与单测；跨应用屏幕前文读取当前仅支持 Windows UIA。
 - **内存占用**：默认 12 层模型 `ML-pumpkin-1103` 连同 ONNX Runtime 约占用 150–250 MB 内存；对内存或续航敏感的设备可选用 8 层模型 `zhen-feather`（权重约 38 MB）。
-- **上下文窗口**：前文窗口上限 128 字，在 300 字以上的超长前文场景中，准确率低于运行在 GPU 上的 1–2 GB 通用大语言模型。
+- **上下文窗口**：参与 ONNX KV-cache 推理的前文窗口上限为 128 字；开启可选 `enable_document_entities: true` 可额外覆盖当前控件内前 1,024 字的同音专名检索。在 300 字以上的超长篇章语义消歧场景中，准确率仍低于运行在 GPU 上的 1–2 GB 通用大语言模型。
 
 ---
 
@@ -99,7 +102,9 @@ patch:
     max_candidates: 8
     fusion_weights: [1.0, -1.4, 0.05, 0.15, 0.0]
     p2c_verify_margin: 0.20      # <= 0 关闭 Pass-2 P2C 合成
+    enable_typo_recovery: true   # 自动单编辑错键容错（仅作用于非法死串）
     enable_uia_context: true
+    enable_document_entities: false  # 可选：当前焦点控件内前 1,024 字跨段专名检索（零额外 KV token）
     threads: 0                   # 0 = 自动适配 CPU 核数（限幅 4..8）
     log_feedback: true           # 零明文纯数值本地日志（单文件上限 5 MiB + 1 份 .1 轮转）
     sync_init: false             # 异步加载
@@ -190,30 +195,43 @@ patch:
 | *参考：`Qwen3.5-0.8B-8bit`* | *1.0 GB* | *`97.3%` (1164)* | *`87.4%` (380)* | *`94.67%`* | *Apple GPU (mlx)* |
 | *参考：`Qwen3.5-2B-4bit`* | *1.7 GB* | *`97.7%` (1169)* | *`89.7%` (390)* | *`95.59%`* | *Apple GPU (mlx)* |
 
-### 4. 按键延迟
+### 4. 单编辑错键容错基准（500 句真实语料）
+
+语料为 `public_articles_2026-11-19.txt`（200 句）与 `zhihu_hotlist_2026-11-18.txt` 前 300 句共 500 句，在官方小狼毫 `0.17.4` 隔离环境中按 4 类真实单键误触（QWERTY 物理邻键、相邻换位、连击重复、漏键，各 125 句）注入破坏音节结构的单编辑错键，同时在全量 1,000 句无错键语料（含 `zhihu_hold_500` 留出集）上验证无回归：
+
+| 方案与测试集 | 关闭容错（整句 / 字正确率） | 开启容错 `v2.0.0`（整句 / 字正确率） | 净提升 |
+| :--- | :---: | :---: | :---: |
+| 1,000 句无错键对照（自然码双拼） | `80.50%` (`805/1000`) | `80.50%` (`805/1000`) | `+0 / -0`（零回归） |
+| 1,000 句无错键对照（全拼） | `80.00%` (`800/1000`) | `80.00%` (`800/1000`) | `+0 / -0`（零回归） |
+| 500 句单编辑错键（自然码双拼·4 类综合） | `0.00%` / `-0.91%` | **`52.80%` / `86.25%`** | **`+52.80 pp` / `+87.16 pp`** |
+| 500 句单编辑错键（自然码双拼·邻键/换位/连击 375 句） | `0.00%` / `-8.13%` | **`66.13%` / `90.26%`** | **`+66.13 pp` / `+98.39 pp`** |
+| 500 句单编辑错键（全拼·4 类综合） | `13.20%` / `48.12%` | **`54.20%` / `85.59%`** | **`+41.00 pp` / `+37.48 pp`** |
+
+### 5. 按键延迟
 
 Intel Core Ultra 7 255HX，隔离 `rime.dll` 基准实测：
 
 | 模式 | 插电（首键 / 后续键均值 / 长句峰值） | 电池（首键 / 后续键均值 / 长句峰值） |
 | :--- | :---: | :---: |
 | 纯统计（自然码双拼 + 万象 `.gram`） | `0.1 ms / 0.4 ms / 0.9 ms` | `0.4 ms / 1.6 ms / 5.2 ms` |
-| **`rime-neural v1.0.0`（双拼）** | **`0.1 ms / 2.0 ms / 11.5 ms`** | **`0.4 ms / ~4.1 ms / ~22 ms`** |
-| **`rime-neural v1.0.0`（全拼）** | **`0.2 ms / 4.7 ms / 14.7 ms`** | **`0.3 ms / ~9.2 ms / ~28 ms`** |
+| **`rime-neural v2.0.0`（双拼，含容错与 `rime_neural_repair`）** | **`0.1 ms / 1.7 ms / 10.0 ms`** | `0.4 ms / ~4.1 ms / ~22 ms` |
+| **`rime-neural`（全拼）** | **`0.2 ms / 4.7 ms / 14.7 ms`** | `0.3 ms / ~9.2 ms / ~28 ms` |
 
 ---
 
 ## 架构与配置项
 
 ```text
-官方小狼毫 (WeaselServer.exe / rime.dll, librime >= 1.17.0, Lua 5.4)
-  ├── lua/rime_neural.lua            # Lua 滤镜：布局识别、整句/标签门控、聚焦上文冻结、纯数值反馈
-  ├── lua/rime_neural_repair.lua     # 可选 Lua 处理器：提交前词级同音修复 (Alt+r) 与原样字面锁定 (Alt+l)
-  └── neural/rime_neural.dll (Rust)  # 动态解析 Lua 5.4 C API（C-unwind），进程内钉驻，内嵌 PE 版本信息
-        ├── engine.rs                # ONNX 结构自省、选择性输出裁剪、16 槽 KV-cache、Pass-2 P2C 与上文实体拼接、按方案 .gram 缓存
-        ├── gram.rs                  # Win32 共享内存只读映射 Rime::Grammar/1.0（兼容 BMP/非 BMP UTF-8）
+官方 Rime 宿主 (Windows Weasel / Linux / macOS, librime >= 1.17.0, Lua 5.4)
+  ├── lua/rime_neural.lua            # Lua 滤镜：跨平台加载、布局识别、整句/标签门控、自动单编辑容错、上文冻结与纯数值反馈
+  ├── lua/rime_neural_repair.lua     # 可选 Lua 处理器：全词库+错键神经词级链式修复 (Alt+r) 与原样字面锁定 (Alt+l)
+  └── neural/rime_neural.{dll,so,dylib} (Rust) # 动态解析 Lua 5.4 C API（C-unwind），进程内钉驻
+        ├── engine.rs                # ONNX 结构自省、16 槽 KV-cache、Pass-2 P2C 与 1,024 字文档实体拼接、按方案 .gram 缓存
+        ├── typo.rs                  # 合法前缀自动机 + 全拼 / 7 套双拼单编辑物理邻键/换位/连击/漏键容错引擎
+        ├── gram.rs                  # 只读 Rime::Grammar/1.0 单遍双数组 Trie 评分（Win32 内存映射 / Unix 不可变快照）
         ├── pinyin.rs                # 3 阶段记忆化全拼对齐 + DP 切分 + 7 套双拼码表
-        ├── uia.rs                   # 后台 MTA UIA（焦点变更事件 + 控件边界钳制 + 200ms 超时 + 密码/终端屏蔽）
-        └── feedback.rs              # 零明文纯数值本地日志（5 MiB 自动轮转 + 重解析点防护）
+        ├── uia.rs                   # Windows 后台 MTA UIA（焦点变更事件 + 控件边界钳制 + 200ms 超时 + 密码/终端屏蔽）
+        └── feedback.rs              # 零明文纯数值本地日志（5 MiB 自动轮转 + 重解析点 / O_NOFOLLOW 防护）
 ```
 
 实现细节见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
@@ -229,7 +247,9 @@ Intel Core Ultra 7 255HX，隔离 `rime.dll` 基准实测：
 | `p2c_top1_logit_diff` | `2.0` | Pass-2 候选升至首选所需的最小 logit 领先值 |
 | `p2c_top1_min_gram_diff` | `-2.0` | Pass-2 升至首选的 `.gram` 逐字分差底线（插入次选底线为该值减 `1.5`） |
 | `p2c_top2_logit_diff` | `0.5` | Pass-2 候选插入次选所需的最小 logit 领先值 |
+| `enable_typo_recovery` | `true` | 自动单编辑错键容错开关（合法拼音与合法前缀零开销透传） |
 | `enable_uia_context` | `true` | 非阻塞后台 Windows UIA 前文读取（按方案独立生效） |
+| `enable_document_entities` | `false` | 可选：当前焦点控件内前 1,024 字跨段同音专名检索（需 `enable_uia_context: true`，零额外 KV token） |
 | `threads` | `0` | ONNX Runtime CPU 线程数（`0` 自动适配并限幅 `4..8`） |
 | `min_input_len` | 双拼 `4` / 全拼 `6` | 触发神经重排的最小有效拼音按键数（下限 `1`） |
 | `data_dir` | `""`（自动探测） | 可选：显式指定 `neural\` 数据目录（非 ASCII Windows 用户名可指向纯 ASCII 路径，YAML 中建议用单引号或 `/`） |

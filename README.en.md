@@ -2,12 +2,12 @@
 
 # rime-neural
 
-**Local ONNX neural sentence reranker plugin for official Windows Rime / Weasel**
+**Local ONNX neural sentence reranker, typo-tolerant lattice & span repair plugin for official Rime / Weasel**
 
 [![CI & Release](https://github.com/Chth1z/rime-neural/actions/workflows/ci-release.yml/badge.svg)](https://github.com/Chth1z/rime-neural/actions/workflows/ci-release.yml)
 [![Release](https://img.shields.io/github/v/release/Chth1z/rime-neural?label=release)](https://github.com/Chth1z/rime-neural/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64%20(Weasel%20%E2%89%A5%200.17.4)-0078D6.svg)](https://github.com/rime/weasel)
+[![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20%7C%20macOS%20(librime%20%E2%89%A5%201.17.0)-0078D6.svg)](https://github.com/rime/weasel)
 
 [简体中文](README.md) | **English**
 
@@ -17,23 +17,26 @@
 
 ## Overview
 
-`rime-neural` is an in-process ONNX neural sentence reranker plugin for official Windows Weasel (`>= 0.17.4`, `librime >= 1.17.0`), built as a Lua 5.4 filter backed by a Rust native module that mounts directly into existing Rime schemas.
+`rime-neural` is an in-process ONNX neural sentence engine for official Rime hosts (Windows Weasel `>= 0.17.4` and Linux / macOS `librime >= 1.17.0` hosts exporting Lua 5.4 C API symbols), built as Lua 5.4 components backed by a Rust native module that mounts directly into existing Rime schemas.
 
 ### Features
 
-- **Complements `.gram` language models with focus-bound context entity splice**: Works standalone or paired with a Chinese statistical grammar model (such as [`wanxiang-lts-zh-hans.gram`](https://github.com/amzxyz/rime-wanxiang-data/releases/tag/LTS)). Rime uses `.gram` to generate Top-8 sentence candidates; `rime-neural` shares a read-only mapping of the same `.gram` file across schemas and uses each schema’s penalties to fuse neural logits, `.gram` transition scores, and rank priors. A batched KV-cached Pass-2 cross-encoder check verifies both high-confidence OOV `char_logits` candidates and maximal 2+ character homophone entity spans (names, rare terms) present in the active focus-bound context.
-- **Optional pre-commit span repair & literal lock (`lua/rime_neural_repair.lua`)**: An opt-in standalone `lua_processor` mounted at the front of `engine/processors` (idle path costs at most two `KeyEvent:eq` comparisons). Supports word-aligned pre-commit homophone repair (`Alt+r`, `Left`/`Right`, `1..9`/`Space`, exact revert on `Escape`/`Alt+r`) without altering raw spelling or caret position, and verbatim ASCII literal locking (`Alt+l` for `GPUv2`, `OAuth2`, `v1.2.1`, `rime-neural`, `CI/CD`) as a native confirmed `raw` segment inside Chinese compositions.
+- **Complements `.gram` language models with focus-bound context & document entity splice**: Works standalone or paired with a Chinese statistical grammar model (such as [`wanxiang-lts-zh-hans.gram`](https://github.com/amzxyz/rime-wanxiang-data/releases/tag/LTS)). Rime generates Top-8 sentence candidates; `rime-neural` shares a read-only `.gram` reader across schemas (kernel-pinned `MapViewOfFile` on Windows, immutable snapshot on Unix/macOS) and fuses neural logits, `.gram` transition scores, and rank priors. A batched KV-cached Pass-2 cross-encoder check verifies both high-confidence OOV `char_logits` candidates and maximal 2+ character homophone entity spans present in the active focus-bound context. Enabling opt-in `enable_document_entities: true` extends homophone entity scanning to up to 1,024 preceding characters within the same focused control without adding any ONNX KV prefix tokens.
+- **Automatic 1-edit typo-tolerant lattice (`src/typo.rs` + `lua/rime_neural.lua`)**: Recovers staggered QWERTY physical neighbor slips, adjacent transpositions, doubled keys, and dropped keys across Full Pinyin and all 7 Double Pinyin layouts (`enable_typo_recovery`, enabled by default). Strictly gated by `is_live_pinyin_prefix`: clean inputs and valid mid-word prefixes pass through in ~1 µs with zero translator queries or extra ONNX calls; proven-dead keystreams are verified via a dedicated read-only `script_translator`, `.gram` fluency gating, and neural reranking.
+- **Optional full-dictionary neural span repair & literal lock (`lua/rime_neural_repair.lua`)**: An opt-in standalone `lua_processor` mounted at the front of `engine/processors` (idle path costs at most two `KeyEvent:eq` comparisons). `Alt+r` steps across word boundaries (`Left`/`Right`) without moving the physical caret, queries the active schema's full dictionary plus 1-edit typo neighbors (e.g. ZRM `gsye -> 公园`, Full Pinyin `jintan -> 今天`), ranks alternatives in full-sentence context via the shared 12-layer neural model, supports chained multi-word pre-commit repairs, honors active OpenCC Traditional output conversion, and reverts cleanly on `Escape`/`Alt+r`. `Alt+l` locks verbatim ASCII identifiers (`GPUv2`, `OAuth2`, `v2.0.0`, `rime-neural`, `CI/CD`) as native confirmed `raw` segments inside Chinese compositions.
 - **Sentence-only scope**: Reranks candidates with `cand:get_genuine().type == "sentence"` on configured segment tags (default `["abc"]`), preserving original order for exact dictionary words, `userdb` phrases, English words, dates, numbers, and punctuation.
 - **Full Pinyin and 7 Double Pinyin layouts**: Auto-detects Full Pinyin, Natural/ZRM, Flypy, MSPY (`; = ing`), Sogou (`; = ing`), Intelligent ABC, Ziguang (`; = ing`), and Pinyin Jiajia (PYJJ), supporting `rime-ice`, `rime-frost`, `rime-wanxiang`, and custom schemas.
-- **Local CPU inference and in-process reuse**: Runs quantized ONNX Runtime models with a 16-slot prefix KV-cache offline on CPU. Initializes asynchronously on a background thread and pins the DLL in-process via `GetModuleHandleExA(PIN)` so Rime redeploys reuse the loaded engine.
-- **Dynamic model introspection**: Reads ONNX graph geometry and `unified_vocab.json` at startup, supporting both 12-layer `ML-pumpkin-1103` (default, ~82 MB) and 8-layer `zhen-feather-preview-1121` (~38 MB) with the same DLL.
-- **Bounded UIA context and privacy controls**: A dedicated background MTA thread reads up to 64 characters before the caret via Windows UIA (`< 2 µs` hot path), bounded by `RangeFromChild(&focused)` (falling back to `DocumentRange`) and `U+FFFC` object separators. Focus changes immediately invalidate the frozen composition context. Classified non-`TextPattern` controls reuse only commits recorded within the current `(HWND, focus_epoch)`. Password fields, protected processes, password managers, remote-session clients, and local terminals fail closed, returning empty context and suspending feedback logging.
+- **Local CPU inference and in-process reuse**: Runs quantized ONNX Runtime models with a 16-slot prefix KV-cache offline on CPU. Initializes asynchronously on a background thread and pins the native module in-process (Windows `GetModuleHandleExA(PIN)` / Unix `dlopen(..., RTLD_NODELETE)`) so Rime redeploys reuse the loaded engine.
+- **Dynamic model introspection**: Reads ONNX graph geometry and `unified_vocab.json` at startup, supporting both 12-layer `ML-pumpkin-1103` (default, ~82 MB) and 8-layer `zhen-feather-preview-1121` (~38 MB) with the same native binary.
+- **Bounded UIA context and privacy controls (Windows)**: A dedicated background MTA thread reads up to 64 active-paragraph characters before the caret via Windows UIA (`< 2 µs` hot path), bounded by `RangeFromChild(&focused)` (falling back to `DocumentRange`) and `U+FFFC` object separators. Focus changes immediately invalidate the frozen composition context. Password fields, protected processes, masked bullet strings (checked on both full text and the 96-char near-caret tail), password managers, remote-session clients, and local terminals fail closed, returning empty context and suspending feedback logging.
 
 ### Requirements & Limitations
 
-- **Platform**: Windows 10 / 11 (x64) with official Weasel `>= 0.17.4` (`librime >= 1.17.0`). macOS (Squirrel) and Linux are not currently supported.
+- **Platform**:
+  - **Windows 10 / 11 (x64)**: Official Weasel `>= 0.17.4` (`librime >= 1.17.0`), with prebuilt releases, automated installer, and full Windows UIA context support.
+  - **Linux / macOS**: The Rust core (`librime_neural.so` / `librime_neural.dylib`) and Lua loader support POSIX single-provider Lua 5.4 symbol resolution and source builds (`cargo build --release --locked`), verified in CI on `ubuntu-latest`; cross-application surrounding-text reading is currently Windows UIA only.
 - **Memory footprint**: The default 12-layer `ML-pumpkin-1103` model plus ONNX Runtime uses roughly 150–250 MB of RAM. For memory- or battery-constrained machines, use the 8-layer `zhen-feather` model (~38 MB).
-- **Context window**: Limited to 128 characters; on 300+ character contexts, accuracy trails 1–2 GB GPU-hosted LLMs.
+- **Context window**: Short scoring context entering the ONNX KV-cache is capped at 128 characters; opt-in `enable_document_entities: true` extends homophone entity scanning to 1,024 preceding characters within the focused control. On 300+ character semantic disambiguation, accuracy still trails 1–2 GB GPU-hosted LLMs.
 
 ---
 
@@ -99,7 +102,9 @@ patch:
     max_candidates: 8
     fusion_weights: [1.0, -1.4, 0.05, 0.15, 0.0]
     p2c_verify_margin: 0.20      # <= 0 disables Pass-2 P2C synthesis
+    enable_typo_recovery: true   # automatic 1-edit typo recovery (proven-dead spellings only)
     enable_uia_context: true
+    enable_document_entities: false  # opt-in 1,024-char focus-clamped document entity scan (0 extra KV tokens)
     threads: 0                   # 0 = auto (clamped 4..8)
     log_feedback: true           # zero-plaintext numeric local log (5 MiB active + 1 rotated .1)
     sync_init: false             # async background load
@@ -190,30 +195,43 @@ Evaluated by scoring the fixed MSIME candidate pool `eval/sentences-ctx-v1/pool.
 | *Ref: `Qwen3.5-0.8B-8bit`* | *1.0 GB* | *`97.3%` (1164)* | *`87.4%` (380)* | *`94.67%`* | *Apple GPU (mlx)* |
 | *Ref: `Qwen3.5-2B-4bit`* | *1.7 GB* | *`97.7%` (1169)* | *`89.7%` (390)* | *`95.59%`* | *Apple GPU (mlx)* |
 
-### 4. Keystroke Latency
+### 4. 1-Edit Noisy-Typing Recovery (500 Real Sentences)
+
+Evaluated in isolated official Weasel `0.17.4` on 500 sentences (`public_articles_2026-11-19.txt` + first 300 sentences of `zhihu_hotlist_2026-11-18.txt`) with deterministic 1-edit syllable-breaking typos evenly split across 4 classes (QWERTY neighbor, adjacent transposition, doubled key, dropped key; 125 each), paired with a 1,000-sentence clean control (including blind `zhihu_hold_500`):
+
+| Setup & Split | Typo Recovery OFF (Sent / Char) | Typo Recovery `v2.0.0` (Sent / Char) | Delta |
+| :--- | :---: | :---: | :---: |
+| 1,000-sent clean control (ZRM DP) | `80.50%` (`805/1000`) | `80.50%` (`805/1000`) | `+0 / -0` (zero regression) |
+| 1,000-sent clean control (Full Pinyin) | `80.00%` (`800/1000`) | `80.00%` (`800/1000`) | `+0 / -0` (zero regression) |
+| 500-sent 1-edit noisy (ZRM DP, all 4 classes) | `0.00%` / `-0.91%` | **`52.80%` / `86.25%`** | **`+52.80 pp` / `+87.16 pp`** |
+| 500-sent 1-edit noisy (ZRM DP, neighbor/swap/doubled, 375) | `0.00%` / `-8.13%` | **`66.13%` / `90.26%`** | **`+66.13 pp` / `+98.39 pp`** |
+| 500-sent 1-edit noisy (Full Pinyin, all 4 classes) | `13.20%` / `48.12%` | **`54.20%` / `85.59%`** | **`+41.00 pp` / `+37.48 pp`** |
+
+### 5. Keystroke Latency
 
 Intel Core Ultra 7 255HX, isolated `rime.dll` benchmark:
 
 | Mode | AC (1st-key / rest avg / peak) | Battery (1st-key / rest avg / peak) |
 | :--- | :---: | :---: |
 | Statistical baseline (ZRM DP + Wanxiang `.gram`) | `0.1 ms / 0.4 ms / 0.9 ms` | `0.4 ms / 1.6 ms / 5.2 ms` |
-| **`rime-neural v1.0.0` (Double Pinyin)** | **`0.1 ms / 2.0 ms / 11.5 ms`** | **`0.4 ms / ~4.1 ms / ~22 ms`** |
-| **`rime-neural v1.0.0` (Full Pinyin)** | **`0.2 ms / 4.7 ms / 14.7 ms`** | **`0.3 ms / ~9.2 ms / ~28 ms`** |
+| **`rime-neural v2.0.0` (Double Pinyin, with typo + `rime_neural_repair`)** | **`0.1 ms / 1.7 ms / 10.0 ms`** | `0.4 ms / ~4.1 ms / ~22 ms` |
+| **`rime-neural` (Full Pinyin)** | **`0.2 ms / 4.7 ms / 14.7 ms`** | `0.3 ms / ~9.2 ms / ~28 ms` |
 
 ---
 
 ## Architecture & Configuration Reference
 
 ```text
-Official Weasel (WeaselServer.exe / rime.dll, librime >= 1.17.0, Lua 5.4)
-  ├── lua/rime_neural.lua            # Lua filter: layout resolution, sentence/tag gating, focus-scoped context freeze, numeric feedback
-  ├── lua/rime_neural_repair.lua     # Optional Lua processor: pre-commit homophone repair (Alt+r) & literal lock (Alt+l)
-  └── neural/rime_neural.dll (Rust)  # Dynamic Lua 5.4 C API (C-unwind), in-process pin, embedded PE VERSIONINFO
-        ├── engine.rs                # ONNX introspection, selective outputs, 16-slot KV-cache, Pass-2 P2C & context entity splice, per-schema .gram cache
-        ├── gram.rs                  # Zero-extra-RAM Win32 file mapping for Rime::Grammar/1.0 (BMP & non-BMP UTF-8)
+Official Rime Host (Windows Weasel / Linux / macOS, librime >= 1.17.0, Lua 5.4)
+  ├── lua/rime_neural.lua            # Lua filter: cross-platform loader, layout resolution, sentence/tag gating, auto 1-edit typo recovery, focus-scoped context & feedback
+  ├── lua/rime_neural_repair.lua     # Optional Lua processor: full-dict + 1-edit typo neural chained repair (Alt+r) & literal lock (Alt+l)
+  └── neural/rime_neural.{dll,so,dylib} (Rust) # Dynamic Lua 5.4 C API (C-unwind), in-process pin
+        ├── engine.rs                # ONNX introspection, 16-slot KV-cache, Pass-2 P2C & 1,024-char doc entity splice, per-schema .gram cache
+        ├── typo.rs                  # Live-prefix automaton + Full Pinyin / 7 Double Pinyin 1-edit typo-tolerant lattice
+        ├── gram.rs                  # Read-only single-pass Rime::Grammar/1.0 trie scorer (Win32 mmap / Unix immutable snapshot)
         ├── pinyin.rs                # 3-phase memoized Full Pinyin + DP splitter + 7 Double Pinyin layouts
-        ├── uia.rs                   # Background MTA UIA (focus-change events + element-bounds clamp + 200ms timeout + denylist)
-        └── feedback.rs              # Zero-plaintext numeric local commit log (5 MiB rotation + reparse-point guard)
+        ├── uia.rs                   # Windows background MTA UIA (focus-change events + element-bounds clamp + 200ms timeout + denylist)
+        └── feedback.rs              # Zero-plaintext numeric local commit log (5 MiB rotation + reparse-point / O_NOFOLLOW guard)
 ```
 
 Implementation details are documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
@@ -229,7 +247,9 @@ Implementation details are documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECT
 | `p2c_top1_logit_diff` | `2.0` | Min Pass-2 logit lead to promote P2C to #1 |
 | `p2c_top1_min_gram_diff` | `-2.0` | `.gram` per-char score floor for #1 P2C promotion (#2 insertion uses `value - 1.5`) |
 | `p2c_top2_logit_diff` | `0.5` | Min Pass-2 logit lead to insert P2C at #2 |
+| `enable_typo_recovery` | `true` | Automatic 1-edit typo recovery on proven-dead spellings (zero overhead on clean/live-prefix input) |
 | `enable_uia_context` | `true` | Non-blocking background Windows UIA context (per-schema) |
+| `enable_document_entities` | `false` | Opt-in 1,024-char focus-clamped document entity scan (requires `enable_uia_context: true`, zero extra KV tokens) |
 | `threads` | `0` | ONNX Runtime CPU threads (`0` = auto `4..8`) |
 | `min_input_len` | `4` (DP) / `6` (Full) | Min pinyin key count before reranking (clamped `>= 1`) |
 | `data_dir` | `""` (auto) | Optional explicit `neural\` directory path (for non-ASCII Windows profiles; use single quotes or `/` in YAML) |

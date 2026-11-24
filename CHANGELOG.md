@@ -4,6 +4,23 @@ All notable changes to `rime-neural` are documented in this file.
 
 ## [Unreleased]
 
+## [v2.0.0] - 2026-11-25
+
+### Major Features
+- **Full-Dictionary + 1-Edit Typo + Neural-Ranked Chained Pre-Commit Span Repair (`lua/rime_neural_repair.lua`)**:
+  - Upgraded `Alt+r` from native-menu-only lookup to a 3-tier full-dictionary + 1-edit span typo + 12-layer neural-ranked repair engine backed by a lazy read-only `rime_neural_lookup` `script_translator` (`enable_user_dict: false`, `enable_encoder: false`, `enable_correction: false`, copying `dictionary`, `prism`, `packs`, `max_homophones`, `max_sentences`, and `sentence_cutoff_threshold`).
+  - Added two-coordinate word tracking (`lo..hi` immutable typed byte span + mutable `lookup_raw` and `draft_text`) enabling chained multi-word pre-commit repairs within the same sentence, standalone phrase repair, `Alt+r` + `Alt+l` composition, and exact `Escape` rollback to the pre-repair menu/selection.
+  - Scores exact-spelling homophones in full-sentence context with `ML-pumpkin-1103` + `.gram` using session- and focus-epoch-validated context (falling back strictly to composition-local confirmed segments), evaluates competing 1-edit typo spelling groups under their own corrected spellings (recovering valid-syllable slips such as ZRM `gsye -> 公园` and Full Pinyin `jintan -> 今天`), and applies the schema's active OpenCC conversion (e.g. Traditional output) to rendered hints and synthetic candidates.
+- **Automatic 1-Edit Typo-Tolerant Lattice Engine (`src/typo.rs`, `src/engine.rs`, `src/lib.rs`, `lua/rime_neural.lua`)**:
+  - Added `src/typo.rs` implementing staggered QWERTY physical adjacency, `is_live_pinyin_prefix` protection (Full Pinyin syllable prefixes, explicit apostrophe abbreviations, trailing odd Double Pinyin initials, excluding vowelless interjections `m`/`n`/`ng`/`hm`/`hng` inside continuous Full Pinyin), `suggest_broken_input_repairs` (automatic recovery on proven-dead spellings across Full Pinyin and all 7 Double Pinyin layouts covering neighbor substitution, adjacent transposition, doubled-key deduplication, and dropped-key insertion), and `suggest_span_typo_repairs` (explicit `Alt+r` word-span typo neighbors).
+  - Exported `suggest_typo_inputs` and `score_gram` (returning `(scores, has_gram)`) to Lua and integrated `enable_typo_recovery` (default `true`) into `lua/rime_neural.lua` with zero-overhead `~1 µs` clean/live-prefix pass-through, clean partial-segment fallthrough, 48-candidate scan cap, per-candidate `.gram` fluency gating, neural tie-breaking, and feedback exclusion on recovered commits.
+  - Verified live in Weasel `0.17.4`: `0.00%` clean regression (`805/1000` ZRM DP, `800/1000` Full Pinyin; `329/329` `accuracy-test.ps1`; `0.1 ms / 1.7 ms / 10.0 ms` `bench-rime.ps1`) and `+52.80 pp` exact (`+87.16 pp` char) on 500 4-class noisy ZRM DP sentences (`+66.13 pp` on neighbor/swap/doubled) plus `+41.00 pp` exact (`+37.48 pp` char) on 500 4-class noisy Full Pinyin sentences.
+- **Opt-In 1,024-Char Focus-Clamped Document Entity Lexicon (`src/uia.rs`, `src/engine.rs`, `src/lib.rs`, `lua/rime_neural.lua`)**:
+  - Added opt-in `rime_neural/enable_document_entities` (default `false`) capturing up to 1,024 preceding characters across paragraph breaks strictly inside the focused control (`RangeFromChild`/`DocumentRange` and `U+FFFC` bounds) while keeping the ONNX KV prefix strictly capped to the active paragraph (`<= 64-128 chars`, zero extra KV tokens).
+  - Hardened opt-out snapshot invalidation across schema switches / rerank toggles / teardown, enforced masked-password checks on both the full buffer and the 96-char near-caret tail, and verified `+2/-0` net gain on untouched blind `zhihu_hold_500` with `0` regressions across 1,000 rolling-context sentences and `8/8` decoy controls safe.
+- **Cross-Platform Unix / macOS Rust Core & Linux CI (`Cargo.toml`, `src/lua_api.rs`, `src/gram.rs`, `src/feedback.rs`, `src/uia.rs`, `lua/rime_neural.lua`, `.github/workflows/ci-release.yml`)**:
+  - Added `#[cfg(unix)]` single-provider Lua 5.4 symbol resolution (`dlsym` + `dladdr` `dli_fbase` verification + `dlopen(..., RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE)` pinning), `SIGBUS`-proof immutable `.gram` snapshot loading, `O_NOFOLLOW | O_NONBLOCK` + regular-file feedback logging, `UiaContext::Unavailable` on non-Windows hosts, OS-aware `.dll`/`.dylib`/`.so` loading in `lua/rime_neural.lua`, and a `build-linux-x64` (`ubuntu-latest`) CI gate running strict Clippy, unit tests, and release build.
+
 ## [v1.3.0] - 2026-11-25
 
 ### Features
